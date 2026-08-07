@@ -212,10 +212,16 @@ enum CapabilitySubcommands {
         capability_id: String,
     },
 
-    /// Set up a capability
+    /// Interactive capability setup wizard
     Setup {
-        /// Capability ID to set up
-        capability_id: String,
+        /// Catalog capability type to set up (e.g. `agent-model`)
+        capability_type: String,
+
+        /// Nickname for this capability instance. Defaults to
+        /// `capability_type`; pass a distinct value to configure multiple
+        /// named instances of the same catalog type (e.g. `--id chat`).
+        #[arg(long = "id")]
+        instance_id: Option<String>,
     },
 
     /// Remove a configured capability instance
@@ -583,9 +589,10 @@ async fn run_capability_command(
         CapabilitySubcommands::Info { capability_id } => {
             CapabilityCommands::info(ctx, &capability_id)
         }
-        CapabilitySubcommands::Setup { capability_id } => {
-            CapabilityCommands::setup(ctx, &capability_id).await
-        }
+        CapabilitySubcommands::Setup {
+            capability_type,
+            instance_id,
+        } => CapabilityCommands::setup(ctx, &capability_type, instance_id.as_deref()).await,
         CapabilitySubcommands::Remove { capability_id } => {
             CapabilityCommands::remove(ctx, &capability_id)
         }

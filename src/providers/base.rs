@@ -131,6 +131,15 @@ pub trait Provider: ConfigConstructable + Send + Sync {
     /// Returns the API types this provider implementation supports (type-level).
     fn supported_api_types(&self) -> Vec<ApiType>;
 
+    /// Returns the configured base URL for this provider instance.
+    fn base_url(&self) -> &str;
+
+    /// Returns the configured API key for this provider instance, if any.
+    fn api_key(&self) -> Option<&Secret>;
+
+    /// Returns whether this provider instance verifies SSL certificates.
+    fn verify_ssl(&self) -> bool;
+
     // Model support
     fn supported_formats(&self) -> Vec<ModelFormat>;
     fn can_run_model(&self, _variant_format: &str, _variant_precision: &str) -> bool {

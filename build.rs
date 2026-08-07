@@ -56,14 +56,20 @@ fn generate_model_struct(model: &YamlModel) -> String {
     let struct_name = model_id_to_struct_name(&model.id);
     let mut s = String::new();
 
-    // Empty struct
-    s.push_str(&format!("pub struct {struct_name} {{}}\n\n"));
+    // Struct carrying the resolved provider config it was constructed with
+    // (see `ModelSource::from_config`), if any.
+    s.push_str(&format!(
+        "pub struct {struct_name} {{ provider_config: Option<crate::config::ProviderConfig> }}\n\n"
+    ));
 
     // ConfigConstructable implementation
     s.push_str(&format!(
         "impl crate::registry::ConfigConstructable for {struct_name} {{\n"
     ));
-    s.push_str("    fn new(_cfg: &serde_json::Value) -> Self { Self {} }\n");
+    s.push_str("    fn new(cfg: &serde_json::Value) -> Self {\n");
+    s.push_str("        let provider_config = cfg.get(\"provider_config\").and_then(|v| serde_json::from_value(v.clone()).ok());\n");
+    s.push_str("        Self { provider_config }\n");
+    s.push_str("    }\n");
     s.push_str("}\n\n");
 
     // Model trait implementation
@@ -157,6 +163,11 @@ fn generate_model_struct(model: &YamlModel) -> String {
     }
     s.push_str("        ]);\n");
     s.push_str("        &FUNCS\n");
+    s.push_str("    }\n");
+
+    // Resolved provider config, if this instance was constructed from one.
+    s.push_str("    fn provider_config(&self) -> Option<&crate::config::ProviderConfig> {\n");
+    s.push_str("        self.provider_config.as_ref()\n");
     s.push_str("    }\n");
     s.push_str("}\n\n");
 

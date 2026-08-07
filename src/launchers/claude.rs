@@ -1,8 +1,10 @@
+use crate::capabilities::BindingType;
 use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata};
 use crate::registry::ConfigConstructable;
 use crate::utils::resolve_shell_command;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /*-- public --*/
@@ -36,7 +38,7 @@ impl Launcher for ClaudeLauncher {
         self.config.command_path.as_deref().unwrap_or("claude")
     }
 
-    fn supported_capabilities(&self) -> Vec<String> {
+    fn supported_capabilities(&self) -> HashSet<BindingType> {
         Self::metadata().supported_capabilities
     }
 
@@ -55,7 +57,7 @@ impl HasClaudeLauncherMetadata for ClaudeLauncher {
             name: "Claude CLI".to_string(),
             description: "Anthropic's Claude CLI tool".to_string(),
             default_command: "claude".to_string(),
-            supported_capabilities: vec![],
+            supported_capabilities: HashSet::from([BindingType::AgentModel]),
             tags: vec!["claude".to_string(), "anthropic".to_string()],
         }
     }

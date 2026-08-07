@@ -554,17 +554,25 @@ impl ModelCommands {
                             true,
                         )?;
                         if pull_now {
-                            let source = ProviderSource::from_config(&ctx.config);
-                            match source.instances().into_iter().find(|(id, _)| id == pid) {
-                                Some((_, provider)) => {
+                            let source = crate::models::ModelSource::from_config(&ctx.config);
+                            match source
+                                .instances()
+                                .into_iter()
+                                .find(|(id, _)| id == model_id)
+                                .map(|(_, m)| m.provider())
+                            {
+                                Some(Ok(provider)) => {
                                     ensure_model_pulled(
-                                        provider,
+                                        provider.as_ref(),
                                         &model,
                                         selected_variant,
                                         ctx.ui.as_ref(),
                                     )
                                     .await?;
                                 }
+                                Some(Err(e)) => ctx.ui.warn(&format!(
+                                    "Provider '{pid}' is not available; skipping pull: {e}"
+                                )),
                                 None => ctx.ui.warn(&format!(
                                     "Provider '{pid}' is not available; skipping pull."
                                 )),
@@ -633,19 +641,21 @@ impl ModelCommands {
                 )
             })?;
 
-        let source = ProviderSource::from_config(&ctx.config);
-        let instances = source.instances();
-        let provider = instances
-            .iter()
-            .find(|(id, _)| id == &provider_id)
-            .map(|(_, p)| *p)
-            .ok_or_else(|| {
+        let source = crate::models::ModelSource::from_config(&ctx.config);
+        let provider = source
+            .instances()
+            .into_iter()
+            .find(|(id, _)| id == model_id)
+            .ok_or_else(|| anyhow::anyhow!("model '{model_id}' is not configured"))?
+            .1
+            .provider()
+            .map_err(|e| {
                 anyhow::anyhow!(
-                    "Provider '{provider_id}' is not configured or enabled. Run `provider setup` first."
+                    "Provider '{provider_id}' is not configured or enabled. Run `provider setup` first: {e}"
                 )
             })?;
 
-        let result = ensure_model_pulled(provider, &model, variant, ctx.ui.as_ref()).await;
+        let result = ensure_model_pulled(provider.as_ref(), &model, variant, ctx.ui.as_ref()).await;
         match result {
             Ok(PullResult::Success) => {
                 ctx.ui

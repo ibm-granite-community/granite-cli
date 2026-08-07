@@ -40,10 +40,22 @@ impl Default for ProviderConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityConfig {
     pub capability_id: String,
-    pub config: HashMap<String, String>,
+    #[serde(rename = "type")]
+    pub capability_type: String,
+    pub config: serde_json::Value,
+}
+
+impl Default for CapabilityConfig {
+    fn default() -> Self {
+        Self {
+            capability_id: String::new(),
+            capability_type: String::new(),
+            config: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
