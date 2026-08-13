@@ -252,7 +252,12 @@ impl ModelCommands {
         let providers: Option<Vec<std::sync::Arc<dyn Provider>>> = if skip_all {
             None
         } else if providers_arg.is_empty() {
-            Some(instances.iter().map(|(_, p)| std::sync::Arc::clone(p)).collect())
+            Some(
+                instances
+                    .iter()
+                    .map(|(_, p)| std::sync::Arc::clone(p))
+                    .collect(),
+            )
         } else {
             let unknown: Vec<&str> = providers_arg
                 .iter()

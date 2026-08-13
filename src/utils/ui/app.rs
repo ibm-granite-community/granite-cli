@@ -257,8 +257,10 @@ impl App {
             Section::Recommend => {
                 let source = crate::providers::ProviderSource::from_config(&self.ctx.config);
                 let instances = source.instances();
-                let providers: Vec<std::sync::Arc<dyn crate::providers::Provider>> =
-                    instances.iter().map(|(_, p)| std::sync::Arc::clone(p)).collect();
+                let providers: Vec<std::sync::Arc<dyn crate::providers::Provider>> = instances
+                    .iter()
+                    .map(|(_, p)| std::sync::Arc::clone(p))
+                    .collect();
                 ModelCommands::recommend_rows(
                     None,
                     Some(&providers),
@@ -316,7 +318,10 @@ impl App {
                             crate::providers::ProviderSource::from_config(&self.ctx.config);
                         let instances = source.instances();
                         let providers: Vec<std::sync::Arc<dyn crate::providers::Provider>> =
-                            instances.iter().map(|(_, p)| std::sync::Arc::clone(p)).collect();
+                            instances
+                                .iter()
+                                .map(|(_, p)| std::sync::Arc::clone(p))
+                                .collect();
                         ModelCommands::recommend_rows(
                             None,
                             Some(&providers),
@@ -520,8 +525,10 @@ impl App {
             Section::Recommend => {
                 let source = crate::providers::ProviderSource::from_config(&self.ctx.config);
                 let instances = source.instances();
-                let providers: Vec<std::sync::Arc<dyn crate::providers::Provider>> =
-                    instances.iter().map(|(_, p)| std::sync::Arc::clone(p)).collect();
+                let providers: Vec<std::sync::Arc<dyn crate::providers::Provider>> = instances
+                    .iter()
+                    .map(|(_, p)| std::sync::Arc::clone(p))
+                    .collect();
                 let all_rows = ModelCommands::recommend_rows(
                     None,
                     Some(&providers),

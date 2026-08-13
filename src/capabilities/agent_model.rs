@@ -279,10 +279,7 @@ mod tests {
     }
 
     impl crate::dependency::ModelConfigured for FakeSource {
-        fn provider_for(
-            &self,
-            _model: &dyn Model,
-        ) -> anyhow::Result<Box<dyn Provider>> {
+        fn provider_for(&self, _model: &dyn Model) -> anyhow::Result<Box<dyn Provider>> {
             self.provider_result
                 .clone()
                 .map(|p| Box::new(p) as Box<dyn Provider>)
@@ -296,10 +293,7 @@ mod tests {
         }))
     }
 
-    fn models_with(
-        model: FakeModel,
-        provider_result: Result<FakeProvider, String>,
-    ) -> FakeSource {
+    fn models_with(model: FakeModel, provider_result: Result<FakeProvider, String>) -> FakeSource {
         FakeSource {
             instances: vec![(
                 "my-model".to_string(),
@@ -332,7 +326,11 @@ mod tests {
             FakeModel {
                 supported_functions: vec![ModelFunction::Chat],
             },
-            ok_provider(vec![ApiType::OpenAI], ModelFunction::Chat, ApiEndpoint::OpenAIChat),
+            ok_provider(
+                vec![ApiType::OpenAI],
+                ModelFunction::Chat,
+                ApiEndpoint::OpenAIChat,
+            ),
         );
 
         let binding = cap
@@ -377,7 +375,9 @@ mod tests {
     async fn bind_fails_when_model_has_no_provider() {
         let cap = capability();
         let models = models_with(
-            FakeModel { supported_functions: vec![ModelFunction::Chat] },
+            FakeModel {
+                supported_functions: vec![ModelFunction::Chat],
+            },
             Err("no provider configured".to_string()),
         );
 
@@ -397,8 +397,14 @@ mod tests {
     async fn bind_fails_when_provider_lacks_api_type() {
         let cap = capability();
         let models = models_with(
-            FakeModel { supported_functions: vec![ModelFunction::Chat] },
-            ok_provider(vec![ApiType::Ollama], ModelFunction::Chat, ApiEndpoint::OllamaChat),
+            FakeModel {
+                supported_functions: vec![ModelFunction::Chat],
+            },
+            ok_provider(
+                vec![ApiType::Ollama],
+                ModelFunction::Chat,
+                ApiEndpoint::OllamaChat,
+            ),
         );
 
         let err = cap
@@ -417,8 +423,14 @@ mod tests {
     async fn bind_fails_when_model_lacks_function() {
         let cap = capability();
         let models = models_with(
-            FakeModel { supported_functions: vec![ModelFunction::Embeddings] },
-            ok_provider(vec![ApiType::OpenAI], ModelFunction::Chat, ApiEndpoint::OpenAIChat),
+            FakeModel {
+                supported_functions: vec![ModelFunction::Embeddings],
+            },
+            ok_provider(
+                vec![ApiType::OpenAI],
+                ModelFunction::Chat,
+                ApiEndpoint::OpenAIChat,
+            ),
         );
 
         let err = cap
@@ -437,7 +449,9 @@ mod tests {
     async fn bind_fails_when_no_matching_endpoint() {
         let cap = capability();
         let models = models_with(
-            FakeModel { supported_functions: vec![ModelFunction::Chat] },
+            FakeModel {
+                supported_functions: vec![ModelFunction::Chat],
+            },
             ok_provider(
                 vec![ApiType::OpenAI, ApiType::Ollama],
                 ModelFunction::Chat,

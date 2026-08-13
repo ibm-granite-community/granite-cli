@@ -248,8 +248,14 @@ mod tests {
     fn resolution_includes_matching_instances() {
         let shop = PaintShop {
             cans: vec![
-                ("can-1".to_string(), Arc::new(MixedPaint("red")) as Arc<dyn Paint>),
-                ("can-2".to_string(), Arc::new(MixedPaint("blue")) as Arc<dyn Paint>),
+                (
+                    "can-1".to_string(),
+                    Arc::new(MixedPaint("red")) as Arc<dyn Paint>,
+                ),
+                (
+                    "can-2".to_string(),
+                    Arc::new(MixedPaint("blue")) as Arc<dyn Paint>,
+                ),
             ],
             recipes: HashMap::new(),
             recipe_schemas: HashMap::new(),
@@ -264,8 +270,10 @@ mod tests {
     #[test]
     fn resolution_includes_configurable_types_alongside_instances() {
         let mut shop = empty_shop();
-        shop.cans
-            .push(("can-1".to_string(), Arc::new(MixedPaint("blue")) as Arc<dyn Paint>));
+        shop.cans.push((
+            "can-1".to_string(),
+            Arc::new(MixedPaint("blue")) as Arc<dyn Paint>,
+        ));
         shop.recipes.insert(
             "cyan-mix",
             PaintMetadata {
@@ -290,8 +298,10 @@ mod tests {
     #[test]
     fn resolution_is_configurable_only_when_no_instance_matches() {
         let mut shop = empty_shop();
-        shop.cans
-            .push(("can-1".to_string(), Arc::new(MixedPaint("red")) as Arc<dyn Paint>));
+        shop.cans.push((
+            "can-1".to_string(),
+            Arc::new(MixedPaint("red")) as Arc<dyn Paint>,
+        ));
         shop.recipes.insert(
             "cyan-mix",
             PaintMetadata {

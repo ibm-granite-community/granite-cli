@@ -56,9 +56,7 @@ impl ModelSource {
                         model_config.model_id
                     );
                 }
-                result
-                    .ok()
-                    .map(|arc| (model_config.model_id.clone(), arc))
+                result.ok().map(|arc| (model_config.model_id.clone(), arc))
             })
             .collect();
         Self {
@@ -113,7 +111,7 @@ impl ModelConfigured for ModelSource {
             .provider_id()
             .ok_or_else(|| anyhow::anyhow!("model has no configured provider"))?;
         let pc = self.provider_configs.get(pid).ok_or_else(|| {
-            anyhow::anyhow!("provider '{}' referenced by model is not configured", pid)
+            anyhow::anyhow!("provider '{pid}' referenced by model is not configured")
         })?;
         crate::providers::PROVIDER_REGISTRY
             .construct(&pc.provider_type, &pc.config)

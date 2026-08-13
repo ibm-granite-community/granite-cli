@@ -540,8 +540,12 @@ mod tests {
         let mut factory = TestTraitFactory::new();
         factory.register::<TestImpl1>("impl1");
 
-        let arc1 = factory.construct_shared("impl1", &serde_json::json!({ "value": 1 })).unwrap();
-        let arc2 = factory.construct_shared("impl1", &serde_json::json!({ "value": 2 })).unwrap();
+        let arc1 = factory
+            .construct_shared("impl1", &serde_json::json!({ "value": 1 }))
+            .unwrap();
+        let arc2 = factory
+            .construct_shared("impl1", &serde_json::json!({ "value": 2 }))
+            .unwrap();
 
         assert!(
             !std::sync::Arc::ptr_eq(&arc1, &arc2),

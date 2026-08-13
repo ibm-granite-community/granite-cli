@@ -41,9 +41,7 @@ impl LauncherSource {
                         lc.launcher_type
                     );
                 }
-                result
-                    .ok()
-                    .map(|arc| (lc.launcher_id.clone(), arc))
+                result.ok().map(|arc| (lc.launcher_id.clone(), arc))
             })
             .collect();
         Self { constructed }
