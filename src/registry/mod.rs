@@ -82,9 +82,15 @@ macro_rules! define_factory {
                 /// Get metadata describing this implementation
                 fn describe(&self) -> $metadata;
 
-                /// Construct an instance with the given config
+                /// Construct a new boxed instance with the given config.
+                /// Used for one-shot constructions (e.g. command-layer validation).
                 #[allow(unused)]
                 fn construct(&self, cfg: &serde_json::Value) -> Box<dyn $trait>;
+
+                /// Construct a new Arc'd instance with the given config.
+                /// Used by construct_shared for the slow (first-call) path.
+                #[allow(unused)]
+                fn construct_arc(&self, cfg: &serde_json::Value) -> std::sync::Arc<dyn $trait>;
 
                 /// JSON schema of the config this implementation expects
                 #[allow(unused)]
@@ -121,6 +127,10 @@ macro_rules! define_factory {
                     Box::new(T::new(cfg))
                 }
 
+                fn construct_arc(&self, cfg: &serde_json::Value) -> std::sync::Arc<dyn $trait> {
+                    std::sync::Arc::new(T::new(cfg))
+                }
+
                 fn config_schema(&self) -> schemars::Schema {
                     schemars::schema_for!(<T as ConfigConstructable>::Config)
                 }
@@ -136,11 +146,17 @@ macro_rules! define_factory {
             /// The factory maintains a registry of implementations and provides
             /// methods to:
             /// - Register new implementations
-            /// - Construct instances by name
+            /// - Construct instances by name (one-shot Box or memoised Arc)
             /// - Query metadata
             /// - List all registered implementations
+            ///
+            /// `construct_shared` is memoised: calling it twice with the same
+            /// `(name, cfg)` pair returns the same `Arc` — pointer equality holds
+            /// within a single factory instance lifetime.
             pub struct $factory {
                 registry: std::collections::HashMap<&'static str, Box<dyn [<$trait Metadata_>]>>,
+                /// Memoisation cache: (type_name, config_hash) → shared instance.
+                cache: std::sync::Mutex<std::collections::HashMap<(String, u64), std::sync::Arc<dyn $trait>>>,
             }
 
             impl $factory {
@@ -148,6 +164,7 @@ macro_rules! define_factory {
                 pub(crate) fn new() -> Self {
                     Self {
                         registry: std::collections::HashMap::new(),
+                        cache: std::sync::Mutex::new(std::collections::HashMap::new()),
                     }
                 }
 
@@ -174,12 +191,10 @@ macro_rules! define_factory {
                     self.registry.insert(name, Box::new(MetaOf::<T>::new()));
                 }
 
-                /// Construct an instance by name with the given configuration.
+                /// Construct a one-shot boxed instance by name.
                 ///
-                /// # Arguments
-                ///
-                /// * `name` - The name of the implementation to construct
-                /// * `cfg` - Configuration to pass to the constructor
+                /// Does **not** memoize. Use this for command-layer validation
+                /// and any path that intentionally wants a fresh allocation.
                 ///
                 /// # Returns
                 ///
@@ -195,6 +210,48 @@ macro_rules! define_factory {
                         .get(name)
                         .map(|x| x.construct(cfg))
                         .ok_or_else(|| format!("Unknown instance type: {}", name))
+                }
+
+                /// Construct a shared (`Arc`) instance by name, memoised by
+                /// `(name, cfg)`. Calling this twice with identical arguments
+                /// returns the same `Arc` — pointer equality is guaranteed within
+                /// a single factory instance.
+                ///
+                /// # Returns
+                ///
+                /// * `Ok(Arc<dyn Trait>)` - Shared instance (possibly cached)
+                /// * `Err(String)` - Error message if name not found
+                #[allow(unused)]
+                pub(crate) fn construct_shared(
+                    &self,
+                    name: &str,
+                    cfg: &serde_json::Value,
+                ) -> Result<std::sync::Arc<dyn $trait>, String> {
+                    use std::hash::{Hash, Hasher};
+                    use std::collections::hash_map::DefaultHasher;
+
+                    let cfg_hash = {
+                        let mut h = DefaultHasher::new();
+                        cfg.to_string().hash(&mut h);
+                        h.finish()
+                    };
+                    let key = (name.to_string(), cfg_hash);
+
+                    // Fast path: already cached.
+                    {
+                        let cache = self.cache.lock().unwrap();
+                        if let Some(arc) = cache.get(&key) {
+                            return Ok(std::sync::Arc::clone(arc));
+                        }
+                    }
+
+                    // Slow path: construct, cache, return.
+                    let entry = self.registry
+                        .get(name)
+                        .ok_or_else(|| format!("Unknown instance type: {}", name))?;
+                    let arc = entry.construct_arc(cfg);
+                    self.cache.lock().unwrap().insert(key, std::sync::Arc::clone(&arc));
+                    Ok(arc)
                 }
 
                 /// Get metadata for a specific implementation by name.

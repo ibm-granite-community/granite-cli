@@ -16,6 +16,7 @@
 //! that operates on them.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /*-- Catalogued ----------------------------------------------------------------*/
 
@@ -66,7 +67,9 @@ pub trait DependsOn<U: Catalogued + ?Sized> {
 /// knowing anything about `U`'s concrete storage or construction.
 pub trait Configured<U: Catalogued + ?Sized> {
     /// Already-configured instances, keyed by their configured id.
-    fn instances(&self) -> Vec<(String, &U)>;
+    /// Returns `Arc` clones so callers can hold shared ownership without
+    /// borrowing from the source.
+    fn instances(&self) -> Vec<(String, Arc<U>)>;
 
     /// Registered catalog types (type-level metadata), keyed by registry name.
     fn catalog(&self) -> HashMap<&'static str, U::Metadata>;
@@ -104,6 +107,26 @@ impl Resolution {
     }
 }
 
+/*-- ModelConfigured -----------------------------------------------------------*/
+
+/// Extension of `Configured<dyn Model>` that can resolve a live `Provider`
+/// for a model instance using the source's own provider config map.
+///
+/// This keeps provider resolution at call time (not baked into the model
+/// struct at construction time) without breaking the `Model::provider()`
+/// trait signature.
+pub trait ModelConfigured: Configured<dyn crate::models::Model> + Send + Sync {
+    /// Construct a `Provider` for `model` using this source's live provider
+    /// config map. Returns an error if the model has no provider id or the
+    /// referenced provider is not in the config map.
+    fn provider_for(
+        &self,
+        model: &dyn crate::models::Model,
+    ) -> anyhow::Result<Box<dyn crate::providers::Provider>>;
+}
+
+/*-- Resolution ----------------------------------------------------------------*/
+
 /// Resolve `T`'s dependency on `U` against a `Configured<U>` source.
 ///
 /// Pure predicate evaluation -- no I/O, no prompting. Callers turn a
@@ -120,7 +143,7 @@ where
     let existing_instances: Vec<String> = source
         .instances()
         .into_iter()
-        .filter(|(_, instance)| requirement.admits_instance(*instance))
+        .filter(|(_, instance)| requirement.admits_instance(instance.as_ref()))
         .map(|(id, _)| id)
         .collect();
 
@@ -198,16 +221,16 @@ mod tests {
     // Toy `Configured<dyn Paint>` source: a fixed set of already-mixed cans,
     // plus a catalog of "recipes" that could be mixed on demand.
     struct PaintShop {
-        cans: Vec<(String, Box<dyn Paint>)>,
+        cans: Vec<(String, Arc<dyn Paint>)>,
         recipes: HashMap<&'static str, PaintMetadata>,
         recipe_schemas: HashMap<&'static str, schemars::Schema>,
     }
 
     impl Configured<dyn Paint> for PaintShop {
-        fn instances(&self) -> Vec<(String, &(dyn Paint + 'static))> {
+        fn instances(&self) -> Vec<(String, Arc<dyn Paint + 'static>)> {
             self.cans
                 .iter()
-                .map(|(id, p)| (id.clone(), p.as_ref()))
+                .map(|(id, p)| (id.clone(), Arc::clone(p)))
                 .collect()
         }
         fn catalog(&self) -> HashMap<&'static str, PaintMetadata> {
@@ -240,8 +263,8 @@ mod tests {
     fn resolution_includes_matching_instances() {
         let shop = PaintShop {
             cans: vec![
-                ("can-1".to_string(), Box::new(MixedPaint("red"))),
-                ("can-2".to_string(), Box::new(MixedPaint("blue"))),
+                ("can-1".to_string(), Arc::new(MixedPaint("red")) as Arc<dyn Paint>),
+                ("can-2".to_string(), Arc::new(MixedPaint("blue")) as Arc<dyn Paint>),
             ],
             recipes: HashMap::new(),
             recipe_schemas: HashMap::new(),
@@ -257,7 +280,7 @@ mod tests {
     fn resolution_includes_configurable_types_alongside_instances() {
         let mut shop = empty_shop();
         shop.cans
-            .push(("can-1".to_string(), Box::new(MixedPaint("blue"))));
+            .push(("can-1".to_string(), Arc::new(MixedPaint("blue")) as Arc<dyn Paint>));
         shop.recipes.insert(
             "cyan-mix",
             PaintMetadata {
@@ -283,7 +306,7 @@ mod tests {
     fn resolution_is_configurable_only_when_no_instance_matches() {
         let mut shop = empty_shop();
         shop.cans
-            .push(("can-1".to_string(), Box::new(MixedPaint("red"))));
+            .push(("can-1".to_string(), Arc::new(MixedPaint("red")) as Arc<dyn Paint>));
         shop.recipes.insert(
             "cyan-mix",
             PaintMetadata {

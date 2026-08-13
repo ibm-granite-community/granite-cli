@@ -1,6 +1,6 @@
 // Standard
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -26,7 +26,7 @@ pub static PROVIDER_REGISTRY: LazyLock<base::ProviderFactory> = LazyLock::new(||
 /// this is what lets multiple named instances of one catalog type (e.g.
 /// `openai-compatible` backing `llama-cpp`, `ollama`, `lm-studio`) coexist.
 pub struct ProviderSource {
-    constructed: Vec<(String, Box<dyn Provider>)>,
+    constructed: Vec<(String, Arc<dyn Provider>)>,
 }
 
 impl ProviderSource {
@@ -36,7 +36,7 @@ impl ProviderSource {
             .values()
             .filter_map(|provider_config| {
                 let result = PROVIDER_REGISTRY
-                    .construct(&provider_config.provider_type, &provider_config.config);
+                    .construct_shared(&provider_config.provider_type, &provider_config.config);
                 if result.is_err() {
                     alog_channel!(
                         MessageLevel::Warning,
@@ -46,7 +46,7 @@ impl ProviderSource {
                 }
                 result
                     .ok()
-                    .map(|provider| (provider_config.provider_id.clone(), provider))
+                    .map(|arc| (provider_config.provider_id.clone(), arc))
             })
             .collect();
         Self { constructed }
@@ -54,10 +54,10 @@ impl ProviderSource {
 }
 
 impl crate::dependency::Configured<dyn Provider> for ProviderSource {
-    fn instances(&self) -> Vec<(String, &(dyn Provider + 'static))> {
+    fn instances(&self) -> Vec<(String, Arc<dyn Provider + 'static>)> {
         self.constructed
             .iter()
-            .map(|(id, provider)| (id.clone(), provider.as_ref()))
+            .map(|(id, arc)| (id.clone(), Arc::clone(arc)))
             .collect()
     }
 

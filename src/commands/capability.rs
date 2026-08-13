@@ -4,7 +4,7 @@ use anyhow::Result;
 // Local
 use super::{ModelCommands, ProviderCommands};
 use crate::capabilities::{CAPABILITY_REGISTRY, Dependency, ModelRequirement, ProviderRequirement};
-use crate::dependency::{self, Configured};
+use crate::dependency::{self, Configured, ModelConfigured};
 use crate::utils::prompt_from_schema;
 
 pub struct CapabilityCommands;
@@ -363,7 +363,7 @@ impl CapabilityCommands {
                             .supported_functions
                             .iter()
                             .all(|f| model.supported_functions().contains(f));
-                        match model.provider() {
+                        match source.provider_for(model.as_ref()) {
                             Ok(p) => {
                                 model_ok
                                     && requirement

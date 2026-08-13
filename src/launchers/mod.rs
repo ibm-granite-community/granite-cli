@@ -1,6 +1,6 @@
 // Standard
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -24,7 +24,7 @@ pub static LAUNCHER_REGISTRY: LazyLock<base::LauncherFactory> = LazyLock::new(||
 /// this is what lets multiple named instances of one catalog type coexist
 /// (e.g. `claude-local` and `claude-enterprise` both backed by `claude`).
 pub struct LauncherSource {
-    constructed: Vec<(String, Box<dyn Launcher>)>,
+    constructed: Vec<(String, Arc<dyn Launcher>)>,
 }
 
 impl LauncherSource {
@@ -33,7 +33,7 @@ impl LauncherSource {
             .launchers
             .values()
             .filter_map(|lc| {
-                let result = LAUNCHER_REGISTRY.construct(&lc.launcher_type, &lc.config);
+                let result = LAUNCHER_REGISTRY.construct_shared(&lc.launcher_type, &lc.config);
                 if result.is_err() {
                     alog_channel!(
                         MessageLevel::Warning,
@@ -43,7 +43,7 @@ impl LauncherSource {
                 }
                 result
                     .ok()
-                    .map(|launcher| (lc.launcher_id.clone(), launcher))
+                    .map(|arc| (lc.launcher_id.clone(), arc))
             })
             .collect();
         Self { constructed }
@@ -51,10 +51,10 @@ impl LauncherSource {
 }
 
 impl crate::dependency::Configured<dyn Launcher> for LauncherSource {
-    fn instances(&self) -> Vec<(String, &(dyn Launcher + 'static))> {
+    fn instances(&self) -> Vec<(String, Arc<dyn Launcher + 'static>)> {
         self.constructed
             .iter()
-            .map(|(id, l)| (id.clone(), l.as_ref()))
+            .map(|(id, arc)| (id.clone(), Arc::clone(arc)))
             .collect()
     }
 

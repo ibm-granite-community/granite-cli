@@ -1,6 +1,6 @@
 // Standard
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -20,12 +20,20 @@ pub static MODEL_REGISTRY: LazyLock<base::ModelFactory> = LazyLock::new(|| {
 
 /*-- ModelSource ---------------------------------------------------------------*/
 
-/// The real `Configured<dyn Model>`: eagerly constructs a live model instance
-/// for every model referenced by the config's `models` map, keyed by its
-/// catalog id (models have no separate instance nickname -- the config key
-/// *is* the catalog id).
+/// The real `Configured<dyn Model>` + `ModelConfigured`: eagerly constructs a
+/// shared model instance for every model referenced by the config's `models`
+/// map, keyed by its catalog id. Instances are memoised inside `MODEL_REGISTRY`
+/// so repeated construction of the same `(model_id, provider_id)` pair returns
+/// the same `Arc`.
+///
+/// Provider configs are captured from `Config` at construction time so that
+/// `provider_for()` can resolve live provider data at call time rather than
+/// using a snapshot baked into the model struct.
 pub struct ModelSource {
-    constructed: Vec<(String, Box<dyn Model>)>,
+    constructed: Vec<(String, Arc<dyn Model>)>,
+    /// Provider configs captured from `Config` when this source was built.
+    /// `provider_for()` uses this map to resolve provider data at call time.
+    provider_configs: HashMap<String, crate::config::ProviderConfig>,
 }
 
 impl ModelSource {
@@ -34,17 +42,13 @@ impl ModelSource {
             .models
             .values()
             .filter_map(|model_config| {
-                let cfg = match model_config
-                    .provider_id
-                    .as_deref()
-                    .and_then(|pid| config.get_provider(pid))
-                {
-                    Some(provider_config) => {
-                        serde_json::json!({ "provider_config": provider_config })
-                    }
-                    None => serde_json::json!({}),
-                };
-                let result = MODEL_REGISTRY.construct(&model_config.model_id, &cfg);
+                // Pass only the provider_id string — no ProviderConfig blob.
+                // The model struct stores this id; actual provider resolution
+                // happens at call time via provider_for().
+                let cfg = serde_json::json!({
+                    "provider_id": model_config.provider_id,
+                });
+                let result = MODEL_REGISTRY.construct_shared(&model_config.model_id, &cfg);
                 if result.is_err() {
                     alog_channel!(
                         MessageLevel::Warning,
@@ -54,18 +58,21 @@ impl ModelSource {
                 }
                 result
                     .ok()
-                    .map(|model| (model_config.model_id.clone(), model))
+                    .map(|arc| (model_config.model_id.clone(), arc))
             })
             .collect();
-        Self { constructed }
+        Self {
+            constructed,
+            provider_configs: config.providers.clone(),
+        }
     }
 }
 
 impl crate::dependency::Configured<dyn Model> for ModelSource {
-    fn instances(&self) -> Vec<(String, &(dyn Model + 'static))> {
+    fn instances(&self) -> Vec<(String, Arc<dyn Model + 'static>)> {
         self.constructed
             .iter()
-            .map(|(id, model)| (id.clone(), model.as_ref()))
+            .map(|(id, arc)| (id.clone(), Arc::clone(arc)))
             .collect()
     }
 
@@ -75,6 +82,23 @@ impl crate::dependency::Configured<dyn Model> for ModelSource {
 
     fn config_schema(&self, type_name: &str) -> Option<schemars::Schema> {
         MODEL_REGISTRY.config_schema(type_name)
+    }
+}
+
+impl crate::dependency::ModelConfigured for ModelSource {
+    fn provider_for(
+        &self,
+        model: &dyn Model,
+    ) -> anyhow::Result<Box<dyn crate::providers::Provider>> {
+        let pid = model
+            .provider_id()
+            .ok_or_else(|| anyhow::anyhow!("model has no configured provider"))?;
+        let pc = self.provider_configs.get(pid).ok_or_else(|| {
+            anyhow::anyhow!("provider '{}' referenced by model is not configured", pid)
+        })?;
+        crate::providers::PROVIDER_REGISTRY
+            .construct(&pc.provider_type, &pc.config)
+            .map_err(|e| anyhow::anyhow!(e))
     }
 }
 
@@ -134,7 +158,7 @@ mod tests {
     #[test]
     fn model_source_resolves_provider_from_provider_id() {
         use crate::config::{Config, ModelConfig, ProviderConfig};
-        use crate::dependency::Configured;
+        use crate::dependency::{Configured, ModelConfigured};
 
         let mut config = Config::default();
         config.providers.insert(
@@ -160,14 +184,15 @@ mod tests {
             .into_iter()
             .find(|(id, _)| id == "granite-3.1-8b-instruct")
             .unwrap();
-        let provider = model.provider().unwrap();
+        // Resolution goes through the source's live provider_configs map.
+        let provider = source.provider_for(model.as_ref()).unwrap();
         assert_eq!(provider.base_url(), "http://localhost:11434");
     }
 
     #[test]
     fn model_source_provider_errs_when_provider_id_unresolvable() {
         use crate::config::{Config, ModelConfig};
-        use crate::dependency::Configured;
+        use crate::dependency::{Configured, ModelConfigured};
 
         let mut config = Config::default();
         config.models.insert(
@@ -185,7 +210,59 @@ mod tests {
             .into_iter()
             .find(|(id, _)| id == "granite-3.1-8b-instruct")
             .unwrap();
-        assert!(model.provider().is_err());
+        assert!(source.provider_for(model.as_ref()).is_err());
+    }
+
+    #[test]
+    fn model_source_reflects_updated_provider_config_on_rebuild() {
+        use crate::config::{Config, ModelConfig, ProviderConfig};
+        use crate::dependency::{Configured, ModelConfigured};
+
+        let mut config = Config::default();
+        config.providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({ "base_url": "http://localhost:11434" }),
+            },
+        );
+        config.models.insert(
+            "granite-3.1-8b-instruct".to_string(),
+            ModelConfig {
+                model_id: "granite-3.1-8b-instruct".to_string(),
+                provider_id: Some("ollama".to_string()),
+                variant: None,
+            },
+        );
+
+        // First source — old URL
+        let source1 = ModelSource::from_config(&config);
+        let (_, model1) = source1
+            .instances()
+            .into_iter()
+            .find(|(id, _)| id == "granite-3.1-8b-instruct")
+            .unwrap();
+        assert_eq!(
+            source1.provider_for(model1.as_ref()).unwrap().base_url(),
+            "http://localhost:11434"
+        );
+
+        // Simulate user editing the provider config
+        config.providers.get_mut("ollama").unwrap().config =
+            serde_json::json!({ "base_url": "http://localhost:9999" });
+
+        // Rebuilding from the updated config reflects the new URL immediately.
+        let source2 = ModelSource::from_config(&config);
+        let (_, model2) = source2
+            .instances()
+            .into_iter()
+            .find(|(id, _)| id == "granite-3.1-8b-instruct")
+            .unwrap();
+        assert_eq!(
+            source2.provider_for(model2.as_ref()).unwrap().base_url(),
+            "http://localhost:9999"
+        );
     }
 
     #[test]
