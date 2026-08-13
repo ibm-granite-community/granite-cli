@@ -155,8 +155,11 @@ macro_rules! define_factory {
             /// within a single factory instance lifetime.
             pub struct $factory {
                 registry: std::collections::HashMap<&'static str, Box<dyn [<$trait Metadata_>]>>,
-                /// Memoisation cache: (type_name, config_hash) → shared instance.
-                cache: std::sync::Mutex<std::collections::HashMap<(String, u64), std::sync::Arc<dyn $trait>>>,
+                /// Memoisation cache: (type_name, cfg_json) → shared instance.
+                /// The full serialised JSON string is used as the key so that
+                /// there is no possibility of hash collisions producing a false
+                /// cache hit.
+                cache: std::sync::Mutex<std::collections::HashMap<(String, String), std::sync::Arc<dyn $trait>>>,
             }
 
             impl $factory {
@@ -227,30 +230,20 @@ macro_rules! define_factory {
                     name: &str,
                     cfg: &serde_json::Value,
                 ) -> Result<std::sync::Arc<dyn $trait>, String> {
-                    use std::hash::{Hash, Hasher};
-                    use std::collections::hash_map::DefaultHasher;
+                    let key = (name.to_string(), cfg.to_string());
 
-                    let cfg_hash = {
-                        let mut h = DefaultHasher::new();
-                        cfg.to_string().hash(&mut h);
-                        h.finish()
-                    };
-                    let key = (name.to_string(), cfg_hash);
-
-                    // Fast path: already cached.
-                    {
-                        let cache = self.cache.lock().unwrap();
-                        if let Some(arc) = cache.get(&key) {
-                            return Ok(std::sync::Arc::clone(arc));
-                        }
-                    }
-
-                    // Slow path: construct, cache, return.
+                    // Look up or insert under a single lock to avoid TOCTOU races
+                    // where two threads both miss the cache and construct two
+                    // distinct instances, violating the pointer-equality guarantee.
                     let entry = self.registry
                         .get(name)
                         .ok_or_else(|| format!("Unknown instance type: {}", name))?;
-                    let arc = entry.construct_arc(cfg);
-                    self.cache.lock().unwrap().insert(key, std::sync::Arc::clone(&arc));
+                    let arc = self.cache
+                        .lock()
+                        .unwrap()
+                        .entry(key)
+                        .or_insert_with(|| entry.construct_arc(cfg))
+                        .clone();
                     Ok(arc)
                 }
 
@@ -525,5 +518,52 @@ mod tests {
     fn test_default_config_unknown() {
         let factory = TestTraitFactory::new();
         assert!(factory.default_config("unknown").is_none());
+    }
+
+    #[test]
+    fn construct_shared_returns_same_arc_for_identical_inputs() {
+        let mut factory = TestTraitFactory::new();
+        factory.register::<TestImpl1>("impl1");
+        let cfg = serde_json::json!({ "value": 7 });
+
+        let arc1 = factory.construct_shared("impl1", &cfg).unwrap();
+        let arc2 = factory.construct_shared("impl1", &cfg).unwrap();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&arc1, &arc2),
+            "construct_shared must return the same Arc for the same (name, cfg)"
+        );
+    }
+
+    #[test]
+    fn construct_shared_returns_different_arcs_for_different_configs() {
+        let mut factory = TestTraitFactory::new();
+        factory.register::<TestImpl1>("impl1");
+
+        let arc1 = factory.construct_shared("impl1", &serde_json::json!({ "value": 1 })).unwrap();
+        let arc2 = factory.construct_shared("impl1", &serde_json::json!({ "value": 2 })).unwrap();
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&arc1, &arc2),
+            "construct_shared must return distinct Arcs for different configs"
+        );
+    }
+
+    #[test]
+    fn construct_shared_caches_are_independent_across_factory_instances() {
+        let mut factory_a = TestTraitFactory::new();
+        factory_a.register::<TestImpl1>("impl1");
+
+        let mut factory_b = TestTraitFactory::new();
+        factory_b.register::<TestImpl1>("impl1");
+
+        let cfg = serde_json::json!({ "value": 42 });
+        let arc_a = factory_a.construct_shared("impl1", &cfg).unwrap();
+        let arc_b = factory_b.construct_shared("impl1", &cfg).unwrap();
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&arc_a, &arc_b),
+            "different factory instances must maintain independent caches"
+        );
     }
 }

@@ -107,23 +107,8 @@ impl Resolution {
     }
 }
 
-/*-- ModelConfigured -----------------------------------------------------------*/
-
-/// Extension of `Configured<dyn Model>` that can resolve a live `Provider`
-/// for a model instance using the source's own provider config map.
-///
-/// This keeps provider resolution at call time (not baked into the model
-/// struct at construction time) without breaking the `Model::provider()`
-/// trait signature.
-pub trait ModelConfigured: Configured<dyn crate::models::Model> + Send + Sync {
-    /// Construct a `Provider` for `model` using this source's live provider
-    /// config map. Returns an error if the model has no provider id or the
-    /// referenced provider is not in the config map.
-    fn provider_for(
-        &self,
-        model: &dyn crate::models::Model,
-    ) -> anyhow::Result<Box<dyn crate::providers::Provider>>;
-}
+// Re-export from the models layer where it lives alongside its only implementor.
+pub use crate::models::ModelConfigured;
 
 /*-- Resolution ----------------------------------------------------------------*/
 

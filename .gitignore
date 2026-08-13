@@ -6,3 +6,6 @@ tmp
 .bob
 .claude
 .codegraph
+
+# Build-generated source (written to OUT_DIR by build.rs, included via include!())
+src/version.rs

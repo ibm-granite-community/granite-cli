@@ -68,6 +68,25 @@ impl ModelSource {
     }
 }
 
+/*-- ModelConfigured -----------------------------------------------------------*/
+
+/// Extension of [`crate::dependency::Configured<dyn Model>`] that resolves a
+/// live `Provider` for a model instance using the source's own provider config
+/// map.
+///
+/// Keeping provider resolution here (rather than in the generic `dependency`
+/// module) avoids a downward coupling from the foundation layer back into the
+/// model and provider domain layers.
+pub trait ModelConfigured: crate::dependency::Configured<dyn Model> + Send + Sync {
+    /// Construct a `Provider` for `model` using this source's live provider
+    /// config map. Returns an error if the model has no provider id or the
+    /// referenced provider is not in the config map.
+    fn provider_for(
+        &self,
+        model: &dyn Model,
+    ) -> anyhow::Result<Box<dyn crate::providers::Provider>>;
+}
+
 impl crate::dependency::Configured<dyn Model> for ModelSource {
     fn instances(&self) -> Vec<(String, Arc<dyn Model + 'static>)> {
         self.constructed
@@ -85,7 +104,7 @@ impl crate::dependency::Configured<dyn Model> for ModelSource {
     }
 }
 
-impl crate::dependency::ModelConfigured for ModelSource {
+impl ModelConfigured for ModelSource {
     fn provider_for(
         &self,
         model: &dyn Model,
