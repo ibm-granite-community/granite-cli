@@ -1,8 +1,6 @@
 use crate::capabilities::requirement::{
     ModelRequirement, ProviderRequirement, ShellCommandRequirement,
 };
-use crate::dependency::Configured;
-use crate::models::Model;
 use crate::providers::ApiType;
 use crate::registry::{ConfigConstructable, Secret};
 use async_trait::async_trait;
@@ -117,12 +115,13 @@ pub trait Capability: Send + Sync {
     fn binding_types(&self) -> HashSet<BindingType>;
 
     /// Resolve a `BindingRequest` into a concrete `Binding`, looking up this
-    /// capability's model dependency from the given source. A model's own
-    /// provider is reached via `Model::provider()`.
+    /// capability's model dependency from the given source. Provider resolution
+    /// goes through `models.provider_for(model)` so it uses the live config map
+    /// rather than any value baked into the model struct at construction time.
     async fn bind(
         &self,
         request: BindingRequest,
-        models: &(dyn Configured<dyn Model> + Sync),
+        models: &(dyn crate::dependency::ModelConfigured + Sync),
     ) -> anyhow::Result<Binding>;
 
     // Execution hooks (all optional with NoOp defaults)

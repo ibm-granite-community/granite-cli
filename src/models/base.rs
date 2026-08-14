@@ -158,23 +158,24 @@ pub trait Model: Send + Sync {
         )
     }
 
-    /// Resolved provider-construction data this instance was built with (see
-    /// `ModelSource::from_config`). `None` for bare catalog instances that
-    /// weren't constructed from a configured model.
-    fn provider_config(&self) -> Option<&crate::config::ProviderConfig> {
+    /// The configured provider instance id this model was built with, if any.
+    /// `None` for bare catalog instances that weren't constructed from a
+    /// configured model. Used by `ModelSource::provider_for()` to resolve
+    /// provider data at call time rather than baking a value copy into the struct.
+    fn provider_id(&self) -> Option<&str> {
         None
     }
 
-    /// Construct this model's provider from its resolved `provider_config`.
-    /// Consolidates the provider_id -> Provider construction that used to be
-    /// duplicated at each call site in `commands/model.rs`.
+    /// Construct this model's provider.
+    ///
+    /// For models constructed within a `ModelSource`, prefer
+    /// `ModelSource::provider_for(model)` which resolves from the source's
+    /// live provider config map. This default impl always returns an error;
+    /// concrete impls that manage their own provider may override it.
     fn provider(&self) -> anyhow::Result<Box<dyn crate::providers::Provider>> {
-        let pc = self
-            .provider_config()
-            .ok_or_else(|| anyhow::anyhow!("model has no configured provider"))?;
-        crate::providers::PROVIDER_REGISTRY
-            .construct(&pc.provider_type, &pc.config)
-            .map_err(|e| anyhow::anyhow!(e))
+        Err(anyhow::anyhow!(
+            "model has no configured provider — use ModelSource::provider_for(model)"
+        ))
     }
 }
 

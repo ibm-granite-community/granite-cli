@@ -1,6 +1,6 @@
 // Standard
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -20,7 +20,7 @@ pub static CAPABILITY_REGISTRY: LazyLock<base::CapabilityFactory> = LazyLock::ne
 /// instance nickname (`capability_id`) rather than its catalog type
 /// (`capability_type`).
 pub struct CapabilitySource {
-    constructed: Vec<(String, Box<dyn Capability>)>,
+    constructed: Vec<(String, Arc<dyn Capability>)>,
 }
 
 impl CapabilitySource {
@@ -29,7 +29,7 @@ impl CapabilitySource {
             .capabilities
             .values()
             .filter_map(|capability_config| {
-                let result = CAPABILITY_REGISTRY.construct(
+                let result = CAPABILITY_REGISTRY.construct_shared(
                     &capability_config.capability_type,
                     &capability_config.config,
                 );
@@ -42,7 +42,7 @@ impl CapabilitySource {
                 }
                 result
                     .ok()
-                    .map(|capability| (capability_config.capability_id.clone(), capability))
+                    .map(|arc| (capability_config.capability_id.clone(), arc))
             })
             .collect();
         Self { constructed }
@@ -50,10 +50,10 @@ impl CapabilitySource {
 }
 
 impl crate::dependency::Configured<dyn Capability> for CapabilitySource {
-    fn instances(&self) -> Vec<(String, &(dyn Capability + 'static))> {
+    fn instances(&self) -> Vec<(String, Arc<dyn Capability + 'static>)> {
         self.constructed
             .iter()
-            .map(|(id, capability)| (id.clone(), capability.as_ref()))
+            .map(|(id, arc)| (id.clone(), Arc::clone(arc)))
             .collect()
     }
 

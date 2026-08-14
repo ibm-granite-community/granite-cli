@@ -82,9 +82,15 @@ macro_rules! define_factory {
                 /// Get metadata describing this implementation
                 fn describe(&self) -> $metadata;
 
-                /// Construct an instance with the given config
+                /// Construct a new boxed instance with the given config.
+                /// Used for one-shot constructions (e.g. command-layer validation).
                 #[allow(unused)]
                 fn construct(&self, cfg: &serde_json::Value) -> Box<dyn $trait>;
+
+                /// Construct a new Arc'd instance with the given config.
+                /// Used by construct_shared for the slow (first-call) path.
+                #[allow(unused)]
+                fn construct_arc(&self, cfg: &serde_json::Value) -> std::sync::Arc<dyn $trait>;
 
                 /// JSON schema of the config this implementation expects
                 #[allow(unused)]
@@ -121,6 +127,10 @@ macro_rules! define_factory {
                     Box::new(T::new(cfg))
                 }
 
+                fn construct_arc(&self, cfg: &serde_json::Value) -> std::sync::Arc<dyn $trait> {
+                    std::sync::Arc::new(T::new(cfg))
+                }
+
                 fn config_schema(&self) -> schemars::Schema {
                     schemars::schema_for!(<T as ConfigConstructable>::Config)
                 }
@@ -136,11 +146,20 @@ macro_rules! define_factory {
             /// The factory maintains a registry of implementations and provides
             /// methods to:
             /// - Register new implementations
-            /// - Construct instances by name
+            /// - Construct instances by name (one-shot Box or memoised Arc)
             /// - Query metadata
             /// - List all registered implementations
+            ///
+            /// `construct_shared` is memoised: calling it twice with the same
+            /// `(name, cfg)` pair returns the same `Arc` — pointer equality holds
+            /// within a single factory instance lifetime.
             pub struct $factory {
                 registry: std::collections::HashMap<&'static str, Box<dyn [<$trait Metadata_>]>>,
+                /// Memoisation cache: (type_name, cfg_json) → shared instance.
+                /// The full serialised JSON string is used as the key so that
+                /// there is no possibility of hash collisions producing a false
+                /// cache hit.
+                cache: std::sync::Mutex<std::collections::HashMap<(String, String), std::sync::Arc<dyn $trait>>>,
             }
 
             impl $factory {
@@ -148,6 +167,7 @@ macro_rules! define_factory {
                 pub(crate) fn new() -> Self {
                     Self {
                         registry: std::collections::HashMap::new(),
+                        cache: std::sync::Mutex::new(std::collections::HashMap::new()),
                     }
                 }
 
@@ -174,12 +194,10 @@ macro_rules! define_factory {
                     self.registry.insert(name, Box::new(MetaOf::<T>::new()));
                 }
 
-                /// Construct an instance by name with the given configuration.
+                /// Construct a one-shot boxed instance by name.
                 ///
-                /// # Arguments
-                ///
-                /// * `name` - The name of the implementation to construct
-                /// * `cfg` - Configuration to pass to the constructor
+                /// Does **not** memoize. Use this for command-layer validation
+                /// and any path that intentionally wants a fresh allocation.
                 ///
                 /// # Returns
                 ///
@@ -195,6 +213,38 @@ macro_rules! define_factory {
                         .get(name)
                         .map(|x| x.construct(cfg))
                         .ok_or_else(|| format!("Unknown instance type: {}", name))
+                }
+
+                /// Construct a shared (`Arc`) instance by name, memoised by
+                /// `(name, cfg)`. Calling this twice with identical arguments
+                /// returns the same `Arc` — pointer equality is guaranteed within
+                /// a single factory instance.
+                ///
+                /// # Returns
+                ///
+                /// * `Ok(Arc<dyn Trait>)` - Shared instance (possibly cached)
+                /// * `Err(String)` - Error message if name not found
+                #[allow(unused)]
+                pub(crate) fn construct_shared(
+                    &self,
+                    name: &str,
+                    cfg: &serde_json::Value,
+                ) -> Result<std::sync::Arc<dyn $trait>, String> {
+                    let key = (name.to_string(), cfg.to_string());
+
+                    // Look up or insert under a single lock to avoid TOCTOU races
+                    // where two threads both miss the cache and construct two
+                    // distinct instances, violating the pointer-equality guarantee.
+                    let entry = self.registry
+                        .get(name)
+                        .ok_or_else(|| format!("Unknown instance type: {}", name))?;
+                    let arc = self.cache
+                        .lock()
+                        .unwrap()
+                        .entry(key)
+                        .or_insert_with(|| entry.construct_arc(cfg))
+                        .clone();
+                    Ok(arc)
                 }
 
                 /// Get metadata for a specific implementation by name.
@@ -468,5 +518,56 @@ mod tests {
     fn test_default_config_unknown() {
         let factory = TestTraitFactory::new();
         assert!(factory.default_config("unknown").is_none());
+    }
+
+    #[test]
+    fn construct_shared_returns_same_arc_for_identical_inputs() {
+        let mut factory = TestTraitFactory::new();
+        factory.register::<TestImpl1>("impl1");
+        let cfg = serde_json::json!({ "value": 7 });
+
+        let arc1 = factory.construct_shared("impl1", &cfg).unwrap();
+        let arc2 = factory.construct_shared("impl1", &cfg).unwrap();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&arc1, &arc2),
+            "construct_shared must return the same Arc for the same (name, cfg)"
+        );
+    }
+
+    #[test]
+    fn construct_shared_returns_different_arcs_for_different_configs() {
+        let mut factory = TestTraitFactory::new();
+        factory.register::<TestImpl1>("impl1");
+
+        let arc1 = factory
+            .construct_shared("impl1", &serde_json::json!({ "value": 1 }))
+            .unwrap();
+        let arc2 = factory
+            .construct_shared("impl1", &serde_json::json!({ "value": 2 }))
+            .unwrap();
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&arc1, &arc2),
+            "construct_shared must return distinct Arcs for different configs"
+        );
+    }
+
+    #[test]
+    fn construct_shared_caches_are_independent_across_factory_instances() {
+        let mut factory_a = TestTraitFactory::new();
+        factory_a.register::<TestImpl1>("impl1");
+
+        let mut factory_b = TestTraitFactory::new();
+        factory_b.register::<TestImpl1>("impl1");
+
+        let cfg = serde_json::json!({ "value": 42 });
+        let arc_a = factory_a.construct_shared("impl1", &cfg).unwrap();
+        let arc_b = factory_b.construct_shared("impl1", &cfg).unwrap();
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&arc_a, &arc_b),
+            "different factory instances must maintain independent caches"
+        );
     }
 }

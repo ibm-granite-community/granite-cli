@@ -3,7 +3,7 @@ use anyhow::Result;
 
 // Local
 use crate::commands::ProviderCommands;
-use crate::dependency::{self, Configured, DependsOn, Requirement};
+use crate::dependency::{self, Configured, DependsOn, ModelConfigured, Requirement};
 use crate::models::{ContextFit, MODEL_REGISTRY, ModelMetadata, ModelType, ModelVariant};
 use crate::providers::{
     PROVIDER_REGISTRY, Provider, ProviderMetadata, ProviderSource, ProviderType, PullResult,
@@ -134,8 +134,8 @@ impl ModelCommands {
     /// `--providers` narrowing applied via `filter_providers`.
     pub(crate) fn recommend_rows(
         filter_type: Option<&ModelType>,
-        filter_providers: Option<&[&dyn Provider]>,
-        display_providers: &[(String, &dyn Provider)],
+        filter_providers: Option<&[std::sync::Arc<dyn Provider>]>,
+        display_providers: &[(String, std::sync::Arc<dyn Provider>)],
         wide: bool,
         ui: &dyn crate::utils::ui::base::Ui,
     ) -> Vec<Vec<String>> {
@@ -249,10 +249,15 @@ impl ModelCommands {
             anyhow::bail!("--providers all cannot be combined with specific provider ids");
         }
 
-        let providers: Option<Vec<&dyn Provider>> = if skip_all {
+        let providers: Option<Vec<std::sync::Arc<dyn Provider>>> = if skip_all {
             None
         } else if providers_arg.is_empty() {
-            Some(instances.iter().map(|(_, p)| *p).collect())
+            Some(
+                instances
+                    .iter()
+                    .map(|(_, p)| std::sync::Arc::clone(p))
+                    .collect(),
+            )
         } else {
             let unknown: Vec<&str> = providers_arg
                 .iter()
@@ -279,7 +284,7 @@ impl ModelCommands {
                 instances
                     .iter()
                     .filter(|(iid, _)| providers_arg.contains(iid))
-                    .map(|(_, p)| *p)
+                    .map(|(_, p)| std::sync::Arc::clone(p))
                     .collect(),
             )
         };
@@ -559,7 +564,7 @@ impl ModelCommands {
                                 .instances()
                                 .into_iter()
                                 .find(|(id, _)| id == model_id)
-                                .map(|(_, m)| m.provider())
+                                .map(|(_, m)| source.provider_for(m.as_ref()))
                             {
                                 Some(Ok(provider)) => {
                                     ensure_model_pulled(
@@ -642,13 +647,13 @@ impl ModelCommands {
             })?;
 
         let source = crate::models::ModelSource::from_config(&ctx.config);
-        let provider = source
+        let (_, model_arc) = source
             .instances()
             .into_iter()
             .find(|(id, _)| id == model_id)
-            .ok_or_else(|| anyhow::anyhow!("model '{model_id}' is not configured"))?
-            .1
-            .provider()
+            .ok_or_else(|| anyhow::anyhow!("model '{model_id}' is not configured"))?;
+        let provider = source
+            .provider_for(model_arc.as_ref())
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Provider '{provider_id}' is not configured or enabled. Run `provider setup` first: {e}"
