@@ -128,7 +128,7 @@ impl Capability for SubAgentCapability {
                 endpoint_path: endpoint.path().to_string(),
                 api_key: provider.api_key().cloned(),
                 verify_ssl: provider.verify_ssl(),
-                context_length: self.configured_model.model.context_length(),
+                context_length: Some(self.configured_model.model.context_length()),
             },
         }))
     }

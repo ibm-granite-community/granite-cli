@@ -539,7 +539,7 @@ mod tests {
                 endpoint_path: "/v1/messages".to_string(),
                 api_key: None,
                 verify_ssl: true,
-                context_length: 4096,
+                context_length: Some(4096),
             },
         }
     }
@@ -645,7 +645,7 @@ mod tests {
             endpoint_path: "/v1/messages".to_string(),
             api_key: Some(crate::registry::Secret("real-key".to_string())),
             verify_ssl: true,
-            context_length: 4096,
+            context_length: Some(4096),
         };
         let l = launcher_with(Some(main_model), vec![]);
         let target = l.default_upstream_target(Some("http://corporate-gateway.internal"));
