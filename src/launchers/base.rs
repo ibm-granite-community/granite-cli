@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 // Local
-use crate::capabilities::BindingType;
+use crate::capabilities::{BindingType, ToolName};
 use crate::define_factory;
 use crate::registry::ConfigConstructable;
 use crate::utils::ui::Ui;
@@ -54,6 +54,20 @@ pub trait Launcher: crate::registry::Named + Send + Sync {
     /// override this once capability hooks are wired up.
     async fn env_overlay(&self, _ctx: &LaunchContext) -> anyhow::Result<Vec<EnvBinding>> {
         Ok(vec![])
+    }
+
+    /// Maps a canonical `ToolName` to this launcher's own native tool-name
+    /// string, if it has an equivalent. Only meaningful for launchers
+    /// implementing `BindingType::SubAgent`; the default handles the escape
+    /// hatch (`ToolName::Other`, passed through verbatim) and returns `None`
+    /// for every canonical/MCP variant, mirroring `env_overlay`'s "no-op
+    /// until you actually support the feature" default -- a launcher that
+    /// hasn't implemented sub-agent support needs no changes.
+    fn map_tool_name(&self, tool: &ToolName) -> Option<String> {
+        match tool {
+            ToolName::Other(raw) => Some(raw.clone()),
+            _ => None,
+        }
     }
 
     /// Exec the tool as a subprocess with the env overlay applied.
@@ -318,6 +332,27 @@ pub(crate) mod tests {
         };
         let overlay = launcher.env_overlay(&ctx).await.unwrap();
         assert!(overlay.is_empty());
+    }
+
+    #[test]
+    fn map_tool_name_default_passes_through_other_and_returns_none_for_everything_else() {
+        let launcher = FakeLauncher::new(
+            "my-fake",
+            &serde_json::json!({}),
+            &crate::config::Config::default(),
+        );
+        assert_eq!(
+            launcher.map_tool_name(&ToolName::Other("SomeRawTool".to_string())),
+            Some("SomeRawTool".to_string())
+        );
+        assert_eq!(launcher.map_tool_name(&ToolName::FileRead), None);
+        assert_eq!(
+            launcher.map_tool_name(&ToolName::Mcp {
+                server: "vision".to_string(),
+                tool: None,
+            }),
+            None
+        );
     }
 
     #[test]
