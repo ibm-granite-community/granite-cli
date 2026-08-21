@@ -11,6 +11,7 @@ pub static CAPABILITY_REGISTRY: LazyLock<base::CapabilityFactory> = LazyLock::ne
     let mut factory = base::CapabilityFactory::new();
     factory.register::<agent_model::AgentModelCapability>("agent-model");
     factory.register::<vision_mcp::VisionMCPCapability>("vision-mcp");
+    factory.register::<sub_agent::SubAgentCapability>("sub-agent");
     factory
 });
 
@@ -150,5 +151,10 @@ mod tests {
     #[test]
     fn capability_registry_has_agent_model() {
         assert!(CAPABILITY_REGISTRY.get("agent-model").is_some());
+    }
+
+    #[test]
+    fn capability_registry_has_sub_agent() {
+        assert!(CAPABILITY_REGISTRY.get("sub-agent").is_some());
     }
 }
