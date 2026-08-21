@@ -15,6 +15,7 @@ pub static LAUNCHER_REGISTRY: LazyLock<base::LauncherFactory> = LazyLock::new(||
     factory.register::<bob::BobLauncher>("bob");
     factory.register::<pi::PiLauncher>("pi");
     factory.register::<opencode::OpenCodeLauncher>("opencode");
+    factory.register::<hermes::HermesLauncher>("hermes");
     factory
 });
 
@@ -79,12 +80,14 @@ impl crate::dependency::Configured<dyn Launcher> for LauncherSource {
 mod base;
 pub mod bob;
 pub mod claude;
+pub mod hermes;
 pub mod opencode;
 pub mod pi;
 
 pub use base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata};
 pub use bob::{BobLauncher, BobLauncherConfig};
 pub use claude::{ClaudeLauncher, ClaudeLauncherConfig};
+pub use hermes::{HermesLauncher, HermesLauncherConfig};
 pub use opencode::{OpenCodeLauncher, OpenCodeLauncherConfig};
 pub use pi::{PiLauncher, PiLauncherConfig};
 
@@ -114,11 +117,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_claude_bob_pi_and_opencode() {
+    fn registry_contains_claude_bob_pi_opencode_and_hermes() {
         assert!(LAUNCHER_REGISTRY.get("claude").is_some());
         assert!(LAUNCHER_REGISTRY.get("bob").is_some());
         assert!(LAUNCHER_REGISTRY.get("pi").is_some());
         assert!(LAUNCHER_REGISTRY.get("opencode").is_some());
+        assert!(LAUNCHER_REGISTRY.get("hermes").is_some());
         assert!(LAUNCHER_REGISTRY.get("nonexistent").is_none());
     }
 
@@ -163,6 +167,7 @@ mod tests {
         assert!(catalog.contains_key("bob"));
         assert!(catalog.contains_key("pi"));
         assert!(catalog.contains_key("opencode"));
+        assert!(catalog.contains_key("hermes"));
     }
 
     #[test]
@@ -173,6 +178,7 @@ mod tests {
         assert!(source.config_schema("bob").is_some());
         assert!(source.config_schema("pi").is_some());
         assert!(source.config_schema("opencode").is_some());
+        assert!(source.config_schema("hermes").is_some());
         assert!(source.config_schema("nonexistent").is_none());
     }
 }

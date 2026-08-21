@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_contains_claude_bob_pi_and_opencode() {
+    fn catalog_contains_claude_bob_pi_opencode_and_hermes() {
         let ctx = test_ctx();
         LauncherCommands::catalog(&ctx).unwrap();
         let tables = tables!(ctx);
@@ -437,6 +437,7 @@ mod tests {
         assert!(rows.iter().any(|r| r[0] == "bob"));
         assert!(rows.iter().any(|r| r[0] == "pi"));
         assert!(rows.iter().any(|r| r[0] == "opencode"));
+        assert!(rows.iter().any(|r| r[0] == "hermes"));
     }
 
     // -- list ------------------------------------------------------------------
