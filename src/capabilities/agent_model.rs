@@ -7,13 +7,12 @@ use crate::capabilities::base::{
     CapabilityMetadata, Dependency, HasCapabilityMetadata,
 };
 use crate::capabilities::requirement::ModelRequirement;
-use crate::models::{Model, ModelFunction};
+use crate::models::{ConfiguredModel, ModelFunction};
 use crate::registry::ConfigConstructable;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /*-- AgentModelCapabilityConfig ---------------------------------------------------*/
 
@@ -29,20 +28,17 @@ pub struct AgentModelCapabilityConfig {
 pub struct AgentModelCapability {
     instance_id: String,
     config: AgentModelCapabilityConfig,
-    model: Arc<dyn Model>,
-    /// The raw `"format/precision"` string from `ModelConfig.variant`, if the
-    /// user configured a specific variant. Used at bind time to resolve the
-    /// provider-specific model alias.
-    configured_variant: Option<String>,
+    configured_model: ConfiguredModel,
 }
 
 impl ConfigConstructable for AgentModelCapability {
     type Config = AgentModelCapabilityConfig;
 
     /// Constructs the capability by resolving its model through
-    /// `ModelSource`, which handles provider resolution (so `model.provider()`
-    /// works at bind time) and, when a usage-tracking session is active,
-    /// transparently wraps the model in a local tracking proxy.
+    /// `ConfiguredModel`, which handles provider resolution (so
+    /// `model.provider()` works at bind time) and, when a usage-tracking
+    /// session is active, transparently wraps the model in a local tracking
+    /// proxy.
     ///
     /// `cfg` contains the capability's instance config (e.g. `{"model_id": "my-model"}`)
     /// where `model_id` is the key into `global_config.models`. The resolved
@@ -54,22 +50,11 @@ impl ConfigConstructable for AgentModelCapability {
     ) -> Self {
         let config: AgentModelCapabilityConfig =
             serde_json::from_value(cfg.clone()).unwrap_or_default();
-        let mut source = crate::models::ModelSource::from_config(global_config);
-        let model = source.take(&config.model_id).unwrap_or_else(|| {
-            panic!(
-                "Configured model '{}' not found or could not be constructed",
-                config.model_id
-            )
-        });
-        let configured_variant = global_config
-            .models
-            .get(&config.model_id)
-            .and_then(|mc| mc.variant.clone());
+        let configured_model = ConfiguredModel::resolve(&config.model_id, global_config);
         Self {
             instance_id: instance_id.to_string(),
             config,
-            model,
-            configured_variant,
+            configured_model,
         }
     }
 }
@@ -83,17 +68,6 @@ impl crate::registry::Named for AgentModelCapability {
 impl AgentModelCapability {
     pub fn configured_model_id(&self) -> &str {
         &self.config.model_id
-    }
-
-    /// Resolves `configured_variant` (stored as `"format/precision"`) to the
-    /// matching `ModelVariant` in the model's catalog variants, using the same
-    /// case-insensitive lookup as the pull command.
-    fn resolve_variant<'a>(&self, model: &'a dyn Model) -> Option<&'a crate::models::ModelVariant> {
-        let variant_str = self.configured_variant.as_deref()?;
-        let (format, precision) = variant_str.split_once('/')?;
-        model.variants().iter().find(|v| {
-            v.format.eq_ignore_ascii_case(format) && v.precision.eq_ignore_ascii_case(precision)
-        })
     }
 }
 
@@ -134,42 +108,12 @@ impl Capability for AgentModelCapability {
         };
         let model_id = &self.config.model_id;
 
-        let provider = self
-            .model
-            .provider()
-            .map_err(|e| anyhow::anyhow!("model '{model_id}' has no usable provider: {e}"))?;
-
-        // Primary check -- which ApiType a launcher wants is only known here.
-        anyhow::ensure!(
-            provider.supported_api_types().contains(&api_type),
-            "provider for model '{model_id}' does not support {api_type}"
-        );
-        // Defensive only: setup-time resolution already guarantees these.
-        anyhow::ensure!(
-            self.model
-                .supported_functions()
-                .contains(&ModelFunction::Chat),
-            "model '{model_id}' does not support Chat"
-        );
-        anyhow::ensure!(
-            provider.supports_function(&ModelFunction::Chat),
-            "provider for model '{model_id}' does not support Chat"
-        );
-
-        let endpoint = provider
-            .endpoints_for_function(&ModelFunction::Chat)
-            .into_iter()
-            .find(|e| e.api_type() == api_type)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "provider for model '{model_id}' has no {api_type} endpoint for Chat"
-                )
-            })?;
-
-        let resolved_variant = self.resolve_variant(self.model.as_ref());
-        let model_name = provider
-            .model_alias(resolved_variant)
-            .unwrap_or_else(|| model_id.to_string());
+        let (provider, endpoint, model_name) = self.configured_model.resolve_provider_endpoint(
+            model_id,
+            api_type.clone(),
+            ModelFunction::Chat,
+            ModelFunction::Chat,
+        )?;
 
         Ok(Binding::AgentModel(AgentModelBinding {
             api_type,
@@ -179,7 +123,7 @@ impl Capability for AgentModelCapability {
             endpoint_path: endpoint.path().to_string(),
             api_key: provider.api_key().cloned(),
             verify_ssl: provider.verify_ssl(),
-            context_length: Some(self.model.context_length()),
+            context_length: Some(self.configured_model.model.context_length()),
         }))
     }
 }
@@ -210,6 +154,7 @@ impl HasCapabilityMetadata for AgentModelCapability {
 mod tests {
     use super::*;
     use crate::config::{Config, ModelConfig};
+    use crate::models::Model;
     use crate::providers::{
         ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError,
     };
@@ -335,12 +280,14 @@ mod tests {
         AgentModelCapability {
             instance_id: cap.instance_id,
             config: cap.config,
-            configured_variant: variant_str,
-            model: Arc::new(TestModelWithVariants {
-                supported_functions: functions,
-                provider,
-                variants,
-            }),
+            configured_model: crate::models::ConfiguredModel::for_test(
+                Arc::new(TestModelWithVariants {
+                    supported_functions: functions,
+                    provider,
+                    variants,
+                }),
+                variant_str,
+            ),
         }
     }
 
@@ -439,7 +386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_fails_when_model_has_no_provider() {
+    async fn bind_fails_when_provider_has_no_endpoints_for_function() {
         let cap = capability_with_test_model(
             vec![ModelFunction::Chat],
             FakeProvider {
@@ -459,7 +406,7 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("does not support"));
+        assert!(err.to_string().contains("has no OpenAI endpoint for Chat"));
     }
 
     #[tokio::test]

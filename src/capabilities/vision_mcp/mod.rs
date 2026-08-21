@@ -22,7 +22,7 @@ use crate::capabilities::base::{
     HasCapabilityMetadata, LaunchContext, McpBinding, McpBindingRequest, McpTransportKind,
 };
 use crate::capabilities::requirement::ModelRequirement;
-use crate::models::{Model, ModelFunction, ModelType};
+use crate::models::{ConfiguredModel, ModelFunction, ModelType};
 use crate::providers::ApiType;
 use crate::registry::ConfigConstructable;
 use crate::utils::subserver::SubServer;
@@ -80,11 +80,7 @@ impl Default for VisionMCPCapabilityConfig {
 pub struct VisionMCPCapability {
     instance_id: String,
     config: VisionMCPCapabilityConfig,
-    model: Arc<dyn Model>,
-    /// The raw `"format/precision"` string from `ModelConfig.variant`, if the
-    /// user configured a specific variant. Used at bind time to resolve the
-    /// provider-specific model alias, mirroring `AgentModelCapability`.
-    configured_variant: Option<String>,
+    configured_model: ConfiguredModel,
     /// The in-process Streamable HTTP server started by `bind()`. `None`
     /// before `bind()` runs.
     http_server: Mutex<Option<SubServer>>,
@@ -94,7 +90,7 @@ impl ConfigConstructable for VisionMCPCapability {
     type Config = VisionMCPCapabilityConfig;
 
     /// Constructs the capability by resolving its model through
-    /// `ModelSource`, exactly like `AgentModelCapability::new` -- so
+    /// `ConfiguredModel`, exactly like `AgentModelCapability::new` -- so
     /// `model.provider()` works at bind time and, when a usage-tracking
     /// session is active, the model is transparently tracked.
     fn new(
@@ -104,22 +100,11 @@ impl ConfigConstructable for VisionMCPCapability {
     ) -> Self {
         let config: VisionMCPCapabilityConfig =
             serde_json::from_value(cfg.clone()).unwrap_or_default();
-        let mut source = crate::models::ModelSource::from_config(global_config);
-        let model = source.take(&config.model_id).unwrap_or_else(|| {
-            panic!(
-                "Configured model '{}' not found or could not be constructed",
-                config.model_id
-            )
-        });
-        let configured_variant = global_config
-            .models
-            .get(&config.model_id)
-            .and_then(|mc| mc.variant.clone());
+        let configured_model = ConfiguredModel::resolve(&config.model_id, global_config);
         Self {
             instance_id: instance_id.to_string(),
             config,
-            model,
-            configured_variant,
+            configured_model,
             http_server: Mutex::new(None),
         }
     }
@@ -128,19 +113,6 @@ impl ConfigConstructable for VisionMCPCapability {
 impl crate::registry::Named for VisionMCPCapability {
     fn instance_id(&self) -> &str {
         &self.instance_id
-    }
-}
-
-impl VisionMCPCapability {
-    /// Resolves `configured_variant` (stored as `"format/precision"`) to the
-    /// matching `ModelVariant` in the model's catalog variants -- identical
-    /// to `AgentModelCapability::resolve_variant`.
-    fn resolve_variant<'a>(&self, model: &'a dyn Model) -> Option<&'a crate::models::ModelVariant> {
-        let variant_str = self.configured_variant.as_deref()?;
-        let (format, precision) = variant_str.split_once('/')?;
-        model.variants().iter().find(|v| {
-            v.format.eq_ignore_ascii_case(format) && v.precision.eq_ignore_ascii_case(precision)
-        })
     }
 }
 
@@ -188,37 +160,18 @@ impl Capability for VisionMCPCapability {
         );
 
         let model_id = &self.config.model_id;
-        let provider = self
-            .model
-            .provider()
-            .map_err(|e| anyhow::anyhow!("model '{model_id}' has no usable provider: {e}"))?;
-
         // The vision backend speaks the OpenAI-compatible chat/vision
         // dialect, the one every granite-cli provider can serve -- same
-        // rationale as `pi`/`opencode`'s AgentModel binding.
-        anyhow::ensure!(
-            provider.supported_api_types().contains(&ApiType::OpenAI),
-            "provider for model '{model_id}' does not support an OpenAI-compatible API"
-        );
-        anyhow::ensure!(
-            self.model
-                .supported_functions()
-                .contains(&ModelFunction::ImageUnderstanding),
-            "model '{model_id}' does not support ImageUnderstanding"
-        );
-
-        let endpoint = provider
-            .endpoints_for_function(&ModelFunction::Chat)
-            .into_iter()
-            .find(|e| e.api_type() == ApiType::OpenAI)
-            .ok_or_else(|| {
-                anyhow::anyhow!("provider for model '{model_id}' has no OpenAI endpoint for Chat")
-            })?;
-
-        let resolved_variant = self.resolve_variant(self.model.as_ref());
-        let model_name = provider
-            .model_alias(resolved_variant)
-            .unwrap_or_else(|| model_id.to_string());
+        // rationale as `pi`/`opencode`'s AgentModel binding. The model must
+        // support ImageUnderstanding, but the endpoint is looked up via
+        // Chat, since that's the endpoint that actually serves vision
+        // requests.
+        let (provider, endpoint, model_name) = self.configured_model.resolve_provider_endpoint(
+            model_id,
+            ApiType::OpenAI,
+            ModelFunction::ImageUnderstanding,
+            ModelFunction::Chat,
+        )?;
 
         let vlm = OpenAiCompatibleVlm::new(
             vlm_base_url(provider.base_url(), endpoint.path()),
@@ -293,7 +246,7 @@ fn vlm_base_url(base_url: &str, endpoint_path: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{Config, ModelConfig};
-    use crate::models::ModelVariant;
+    use crate::models::{Model, ModelVariant};
     use crate::providers::{ApiEndpoint, HealthStatus, ModelFormat, Provider, ProviderError};
     use crate::registry::Secret;
     use std::collections::HashMap as StdHashMap;
@@ -451,11 +404,13 @@ mod tests {
         VisionMCPCapability {
             instance_id: cap.instance_id,
             config: cap.config,
-            configured_variant: cap.configured_variant,
-            model: Arc::new(TestVisionModel {
-                supported_functions: functions,
-                provider,
-            }),
+            configured_model: ConfiguredModel::for_test(
+                Arc::new(TestVisionModel {
+                    supported_functions: functions,
+                    provider,
+                }),
+                None,
+            ),
             http_server: Mutex::new(None),
         }
     }
@@ -549,7 +504,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains("does not support ImageUnderstanding")
+                .contains("does not support Image Understanding")
         );
     }
 
@@ -566,10 +521,7 @@ mod tests {
             .bind(request([McpTransportKind::Http]))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("does not support an OpenAI-compatible API")
-        );
+        assert!(err.to_string().contains("does not support OpenAI"));
     }
 
     #[tokio::test]
