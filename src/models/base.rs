@@ -198,23 +198,45 @@ pub struct ConfiguredModel {
     configured_variant: Option<String>,
 }
 
+/// Resolves a `"format/precision"` variant string (as stored in
+/// `ModelConfig.variant`) to the matching `ModelVariant` in `variants`,
+/// case-insensitively. Shared by `ConfiguredModel::resolve_variant` and
+/// `ModelSource::take` (which needs the same lookup, on the model's real
+/// unwrapped variants, to compute the provider alias used as a proxy route
+/// key) so the matching rule lives in exactly one place.
+pub(crate) fn find_variant<'a>(
+    variants: &'a [ModelVariant],
+    configured: Option<&str>,
+) -> Option<&'a ModelVariant> {
+    let variant_str = configured?;
+    let (format, precision) = variant_str.split_once('/')?;
+    variants.iter().find(|v| {
+        v.format.eq_ignore_ascii_case(format) && v.precision.eq_ignore_ascii_case(precision)
+    })
+}
+
 impl ConfiguredModel {
     /// Resolves `model_id` through `ModelSource::from_config`, which handles
     /// provider resolution (so `model.provider()` works at bind time) and,
-    /// when a usage-tracking session is active, transparently wraps the
-    /// model in a local tracking proxy. Panics if the model isn't
-    /// found/constructible -- capabilities' `ConfigConstructable::new` is
-    /// infallible by trait signature, so this preserves that contract
-    /// exactly.
+    /// when a session proxy is active, registers this model's route and
+    /// transparently wraps it to point at the proxy. `configured_variant` is
+    /// computed first (rather than after, as it used to be) so it can be
+    /// passed into `take`, which needs it to compute the same provider alias
+    /// `resolve_provider_endpoint` will use later as the route's dispatch
+    /// key. Panics if the model isn't found/constructible -- capabilities'
+    /// `ConfigConstructable::new` is infallible by trait signature, so this
+    /// preserves that contract exactly.
     pub fn resolve(model_id: &str, global_config: &crate::config::Config) -> Self {
-        let mut source = crate::models::ModelSource::from_config(global_config);
-        let model = source.take(model_id).unwrap_or_else(|| {
-            panic!("Configured model '{model_id}' not found or could not be constructed")
-        });
         let configured_variant = global_config
             .models
             .get(model_id)
             .and_then(|mc| mc.variant.clone());
+        let mut source = crate::models::ModelSource::from_config(global_config);
+        let model = source
+            .take(model_id, configured_variant.as_deref())
+            .unwrap_or_else(|| {
+                panic!("Configured model '{model_id}' not found or could not be constructed")
+            });
         Self {
             model,
             configured_variant,
@@ -238,11 +260,7 @@ impl ConfiguredModel {
     /// matching `ModelVariant` in the model's catalog variants, using the
     /// same case-insensitive lookup as the pull command.
     pub fn resolve_variant(&self) -> Option<&ModelVariant> {
-        let variant_str = self.configured_variant.as_deref()?;
-        let (format, precision) = variant_str.split_once('/')?;
-        self.model.variants().iter().find(|v| {
-            v.format.eq_ignore_ascii_case(format) && v.precision.eq_ignore_ascii_case(precision)
-        })
+        find_variant(self.model.variants(), self.configured_variant.as_deref())
     }
 
     /// The common core of every model-backed `Capability::bind()`: resolves

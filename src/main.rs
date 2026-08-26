@@ -659,8 +659,7 @@ async fn run_launch(
     use crate::capabilities::CAPABILITY_REGISTRY;
     use crate::launchers::LAUNCHER_REGISTRY;
     use crate::launchers::LaunchContext;
-    use crate::proxy::{ProxyServer, UsageTracker, UsageTrackingContext};
-    use std::sync::Mutex;
+    use crate::proxy::ProxyServer;
 
     // Load config fresh so we always pick up the latest saved state.
     let mut config = crate::config::Config::new()?;
@@ -675,20 +674,31 @@ async fn run_launch(
         })?
         .clone();
 
-    // Usage tracking is skipped under `dry_run`: there's no subprocess to
+    // The session proxy boots whenever usage tracking was requested OR a
+    // bound capability needs sub-agent routing (that routing is structurally
+    // required for sub-agents to reach their own providers through Claude
+    // Code's single base-URL env var, independent of whether `-u` was
+    // passed). Skipped entirely under `dry_run`: there's no subprocess to
     // point a proxy at, and showing the real upstream URL in the overlay is
-    // more useful than a not-yet-running one. When active, this session is
-    // threaded through `config.usage_tracking` so that any capability which
-    // resolves its model through `ModelSource` (see `AgentModelCapability::new`)
-    // is transparently tracked -- no per-capability wrapping needed here.
-    let track_usage = usage_tracking && !dry_run;
-    let tracker = Arc::new(UsageTracker::new());
-    let proxy_servers: Arc<Mutex<Vec<ProxyServer>>> = Arc::new(Mutex::new(Vec::new()));
-    if track_usage {
-        config.usage_tracking = Some(UsageTrackingContext {
-            tracker: Arc::clone(&tracker),
-            servers: Arc::clone(&proxy_servers),
-        });
+    // more useful than a not-yet-running one. When booted, it's threaded
+    // through `config.model_proxy` so that any capability which resolves its
+    // model through `ModelSource` (see `AgentModelCapability::new`) is
+    // transparently routed through it (and tracked, if a tracker is active)
+    // -- no per-capability wrapping needed here.
+    let needs_sub_agent_routing = lc.enabled_capabilities.iter().any(|id| {
+        config
+            .get_capability(id)
+            .map(|c| c.capability_type == "sub-agent")
+            .unwrap_or(false)
+    });
+    let boot_proxy = (usage_tracking || needs_sub_agent_routing) && !dry_run;
+    let proxy_server = if boot_proxy {
+        Some(ProxyServer::start()?)
+    } else {
+        None
+    };
+    if let Some(server) = &proxy_server {
+        config.model_proxy = Some(server.handle.clone());
     }
 
     let mut launcher = LAUNCHER_REGISTRY
@@ -755,12 +765,11 @@ async fn run_launch(
 
     let status = launch_result?;
 
-    if track_usage {
-        let started: Vec<ProxyServer> = proxy_servers.lock().unwrap().drain(..).collect();
-        for server in started {
-            server.shutdown().await;
+    if let Some(server) = proxy_server {
+        if usage_tracking {
+            print_usage_summary(ui, &server.handle.tracker());
         }
-        print_usage_summary(ui, &tracker);
+        server.shutdown().await;
     }
 
     if !status.success() {

@@ -1,5 +1,28 @@
+//! A session-scoped localhost reverse-proxy: dispatches each request to one
+//! of several upstream targets based on the top-level `"model"` field in its
+//! JSON body -- a known model routes to its own resolved provider; anything
+//! else (parse failure, missing field, no match) falls through to a
+//! `default` target. Every response streamed back is scanned for usage
+//! accounting fields and recorded into a shared `UsageTracker`, regardless of
+//! which target served it -- including the `default`/passthrough leg, so the
+//! main session's own traffic is tracked too, not just traffic explicitly
+//! routed to a resolved model.
+//!
+//! Boots at most once per `granite-cli launch` invocation (see
+//! `ProxyServer::start`). Models and sub-agent bindings register their own
+//! routes into the already-running proxy via `ProxyHandle::register_route`/
+//! `set_default` rather than each spinning up a dedicated server -- this
+//! works whether the caller registers before or after the proxy starts
+//! accepting connections. See `docs/specs/0020-usage-tracking-proxy.md` and
+//! `docs/specs/0021-sub-agent-capability.md`.
+//!
+//! Deliberately not Anthropic-specific in its request-body dispatch: it only
+//! reads a top-level JSON `"model"` string, a shape OpenAI/Ollama-style
+//! request bodies share too.
+
 // Standard
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -20,46 +43,153 @@ use_channel!("PRXY");
 
 /*-- public --*/
 
-/// A running reverse-proxy for one upstream model endpoint. Forwards every
-/// request to the real upstream, injecting the real credentials and
-/// recording token usage under `label` as responses pass through.
-pub struct ProxyServer {
+/// One destination the proxy can forward a request to.
+pub struct UpstreamTarget {
+    pub base_url: String,
+    pub verify_ssl: bool,
+    pub auth: UpstreamAuth,
+}
+
+/// How the proxy should handle auth headers when forwarding to a target.
+#[derive(Clone)]
+pub enum UpstreamAuth {
+    /// Strip whatever auth the client sent and inject this instead (or send
+    /// no auth at all if `None`) -- for a known granite-cli-resolved
+    /// provider, whose credentials are unrelated to whatever the client
+    /// attached.
+    Inject(Option<Secret>),
+    /// Forward the client's auth headers byte-for-byte -- for the real
+    /// upstream, so the client's own credential precedence (subscription
+    /// OAuth, API key, bearer token, etc.) keeps working untouched.
+    Passthrough,
+}
+
+/// A cheap, `Clone`-able handle to a running session proxy. `local_base_url`
+/// is constant for the whole session -- every registered route shares the
+/// one listening port; dispatch happens purely by the request's own
+/// `"model"` field.
+#[derive(Clone)]
+pub struct ProxyHandle {
     pub local_base_url: String,
+    state: ProxyState,
+}
+
+impl std::fmt::Debug for ProxyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyHandle")
+            .field("local_base_url", &self.local_base_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProxyHandle {
+    /// Registers (or replaces) the target for one model-name route, and
+    /// records usage under `label` for traffic dispatched to it. Works
+    /// whether the proxy is already serving traffic or not. Fails only if
+    /// `target`'s TLS client can't be built.
+    pub fn register_route(
+        &self,
+        model_name: String,
+        target: UpstreamTarget,
+        label: String,
+    ) -> anyhow::Result<()> {
+        let resolved = ResolvedTarget::build(target)?;
+        let mut table = self.state.routing.write().unwrap();
+        table.routes.insert(model_name.clone(), resolved);
+        table.labels.insert(model_name, label);
+        Ok(())
+    }
+
+    /// Sets (or replaces) the fallback target used for requests whose
+    /// `"model"` field doesn't match any registered route.
+    pub fn set_default(&self, target: UpstreamTarget, label: String) -> anyhow::Result<()> {
+        let resolved = ResolvedTarget::build(target)?;
+        let mut table = self.state.routing.write().unwrap();
+        table.default = resolved;
+        table.default_label = label;
+        Ok(())
+    }
+
+    /// Points the default (fallback) target at whatever is already
+    /// registered under `model_name`, rather than needing fresh connection
+    /// details. Use this when the caller's only view of a model's
+    /// connection info may itself already be wrapped to point at this same
+    /// proxy (e.g. a capability whose model went through
+    /// `ModelSource::take`) -- reusing the real target that was registered
+    /// eagerly at that time avoids re-deriving (and getting wrong) an
+    /// `UpstreamTarget` from already-proxied data. Fails if `model_name`
+    /// has no registered route.
+    pub fn set_default_from_route(&self, model_name: &str) -> anyhow::Result<()> {
+        let mut table = self.state.routing.write().unwrap();
+        let target = table
+            .routes
+            .get(model_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no route registered for model '{model_name}'"))?;
+        let label = table
+            .labels
+            .get(model_name)
+            .cloned()
+            .unwrap_or_else(|| model_name.to_string());
+        table.default = target;
+        table.default_label = label;
+        Ok(())
+    }
+
+    /// The shared tracker every route (including the default target)
+    /// records usage into.
+    pub fn tracker(&self) -> Arc<UsageTracker> {
+        Arc::clone(&self.state.tracker)
+    }
+}
+
+/// A running session proxy. Bind an ephemeral localhost port and start
+/// dispatching/tracking immediately; routes and the default target may be
+/// registered at any time via `handle`, before or after real traffic starts
+/// arriving.
+pub struct ProxyServer {
+    pub handle: ProxyHandle,
     inner: SubServer,
 }
 
 impl ProxyServer {
-    /// Bind an ephemeral localhost port and start proxying to `base_url`.
-    /// Usage observed in responses is recorded into `tracker` under `label`
-    /// (e.g. the capability id).
+    /// The built-in default target forwards to the ambient
+    /// `ANTHROPIC_BASE_URL` (or the well-known Anthropic API if unset) with
+    /// the client's own auth passed through untouched -- callers override
+    /// this via `handle.set_default` once a specific main model is known.
     ///
-    /// Synchronous -- see [`SubServer::spawn`] -- so this can be called from
-    /// inside sync code (e.g. `ConfigConstructable::new`) as long as a
-    /// runtime is already running somewhere up the call stack.
-    pub fn start(
-        base_url: String,
-        api_key: Option<Secret>,
-        verify_ssl: bool,
-        tracker: Arc<UsageTracker>,
-        label: String,
-    ) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(!verify_ssl)
-            .build()?;
-        let state = Arc::new(UpstreamState {
-            client,
-            base_url,
-            api_key,
-            tracker,
-            label: label.clone(),
-        });
+    /// Synchronous -- see `SubServer::spawn` -- so this can be called from
+    /// inside sync code as long as a Tokio runtime is already running
+    /// somewhere up the call stack.
+    pub fn start() -> anyhow::Result<Self> {
+        let ambient_base_url = std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+        let default = ResolvedTarget::build(UpstreamTarget {
+            base_url: ambient_base_url,
+            verify_ssl: true,
+            auth: UpstreamAuth::Passthrough,
+        })?;
+        let routing = Arc::new(RwLock::new(RoutingTable {
+            default,
+            default_label: "default".to_string(),
+            routes: HashMap::new(),
+            labels: HashMap::new(),
+        }));
+        let tracker = Arc::new(UsageTracker::new());
+        let state = ProxyState { routing, tracker };
 
-        let app = Router::new().fallback(any(proxy_handler)).with_state(state);
-        let inner = SubServer::spawn(app, &format!("usage-tracking proxy ({label})"))?;
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(state.clone());
+        let inner = SubServer::spawn(app, "session proxy")?;
         let local_base_url = format!("http://{}", inner.local_addr);
 
         Ok(Self {
-            local_base_url,
+            handle: ProxyHandle {
+                local_base_url,
+                state,
+            },
             inner,
         })
     }
@@ -73,24 +203,93 @@ impl ProxyServer {
 
 /*-- private --*/
 
-struct UpstreamState {
-    client: reqwest::Client,
+struct ResolvedTarget {
     base_url: String,
-    api_key: Option<Secret>,
-    tracker: Arc<UsageTracker>,
-    label: String,
+    auth: UpstreamAuth,
+    client: reqwest::Client,
 }
 
-/// Request headers that must not be blindly forwarded upstream: hop-by-hop
-/// headers are connection-specific, and the auth headers are replaced with
-/// the real credentials so the launched agent never needs to see (or send)
-/// them.
-fn is_forbidden_request_header(name: &str) -> bool {
+impl Clone for ResolvedTarget {
+    fn clone(&self) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            auth: self.auth.clone(),
+            client: self.client.clone(),
+        }
+    }
+}
+
+impl ResolvedTarget {
+    fn build(target: UpstreamTarget) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(!target.verify_ssl)
+            .build()?;
+        Ok(Self {
+            base_url: target.base_url,
+            auth: target.auth,
+            client,
+        })
+    }
+}
+
+struct RoutingTable {
+    default: ResolvedTarget,
+    default_label: String,
+    routes: HashMap<String, ResolvedTarget>,
+    labels: HashMap<String, String>,
+}
+
+impl RoutingTable {
+    /// Picks the target and tracking label for one request body. Returns
+    /// owned values so the caller can drop the read lock before doing any
+    /// `.await`-ing forward work.
+    ///
+    /// A matched route uses its own registered label (typically a
+    /// sub-agent/capability name). Traffic that falls through to the
+    /// default target is labeled by the request's own `"model"` field when
+    /// one is present, rather than the generic `default_label` -- so
+    /// several distinct upstream models sharing the default/passthrough
+    /// target (e.g. the main session's model plus Claude Code's own
+    /// background-model calls) still show up as separate rows in the usage
+    /// summary instead of being lumped into one "default" bucket.
+    /// `default_label` is used only when the body has no identifiable
+    /// model name at all (non-JSON body, or a missing/non-string `"model"`
+    /// field).
+    fn target_and_label_for(&self, body: &[u8]) -> (ResolvedTarget, String) {
+        let model = model_from_body(body);
+        if let Some(model) = &model
+            && let Some(target) = self.routes.get(model)
+        {
+            let label = self
+                .labels
+                .get(model)
+                .cloned()
+                .unwrap_or_else(|| model.clone());
+            return (target.clone(), label);
+        }
+        let label = model.unwrap_or_else(|| self.default_label.clone());
+        (self.default.clone(), label)
+    }
+}
+
+/// Reads the top-level `"model"` string out of a JSON request body. A
+/// non-JSON body, or one without a string `"model"` field, yields `None` --
+/// not an error -- so the caller falls through to the default target.
+fn model_from_body(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let model = value.get("model")?.as_str().map(str::to_string);
+    alog_channel!(MessageLevel::Debug4, "Found model: {:#?}", model);
+    model
+}
+
+/// Headers that must not be blindly forwarded in either direction:
+/// connection-specific framing that's re-derived for the new connection.
+/// Auth headers (`authorization`/`x-api-key`) are handled separately per
+/// `UpstreamAuth`, not covered by this list.
+fn is_hop_by_hop_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "host"
-            | "authorization"
-            | "x-api-key"
             | "content-length"
             | "connection"
             | "keep-alive"
@@ -103,17 +302,21 @@ fn is_forbidden_request_header(name: &str) -> bool {
     )
 }
 
-/// Response headers dropped when relaying upstream's response back to the
-/// client: framing is re-derived from the `Body` we construct, not copied.
-fn is_forbidden_response_header(name: &str) -> bool {
+fn is_auth_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "connection" | "keep-alive" | "transfer-encoding" | "content-length"
+        "authorization" | "x-api-key"
     )
 }
 
+#[derive(Clone)]
+struct ProxyState {
+    routing: Arc<RwLock<RoutingTable>>,
+    tracker: Arc<UsageTracker>,
+}
+
 async fn proxy_handler(
-    State(state): State<Arc<UpstreamState>>,
+    State(state): State<ProxyState>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -122,37 +325,53 @@ async fn proxy_handler(
     match forward(&state, method, uri, headers, body).await {
         Ok(response) => response,
         Err(e) => {
-            alog_channel!(
-                MessageLevel::Warning,
-                "usage-tracking proxy forward failed: {e}"
-            );
+            alog_channel!(MessageLevel::Warning, "session proxy forward failed: {e}");
             (StatusCode::BAD_GATEWAY, format!("proxy error: {e}")).into_response()
         }
     }
 }
 
 async fn forward(
-    state: &UpstreamState,
+    state: &ProxyState,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Body,
 ) -> anyhow::Result<Response> {
-    let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let url = format!("{}{}", state.base_url.trim_end_matches('/'), path_and_query);
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await?;
+    let (target, label) = {
+        let table = state.routing.read().unwrap();
+        table.target_and_label_for(&body_bytes)
+    };
+
+    let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let url = format!(
+        "{}{}",
+        target.base_url.trim_end_matches('/'),
+        path_and_query
+    );
 
     let outbound_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut outbound = state.client.request(outbound_method, &url);
+    alog_channel!(
+        MessageLevel::Debug4,
+        "Routing to {:#?} (label {:#?})",
+        &url,
+        &label
+    );
+    let mut outbound = target.client.request(outbound_method, &url);
+    let strip_client_auth = matches!(target.auth, UpstreamAuth::Inject(_));
     for (name, value) in headers.iter() {
-        if is_forbidden_request_header(name.as_str()) {
+        if is_hop_by_hop_header(name.as_str()) {
+            continue;
+        }
+        if strip_client_auth && is_auth_header(name.as_str()) {
             continue;
         }
         if let Ok(v) = value.to_str() {
             outbound = outbound.header(name.as_str(), v);
         }
     }
-    if let Some(key) = &state.api_key {
+    if let UpstreamAuth::Inject(Some(key)) = &target.auth {
         // No `ApiType` is available at this layer, so send both header
         // schemes a provider might expect -- harmless, since a real
         // upstream only reads the one it understands.
@@ -163,7 +382,7 @@ async fn forward(
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())?;
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_resp.headers().iter() {
-        if is_forbidden_response_header(name.as_str()) {
+        if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -177,7 +396,7 @@ async fn forward(
     let body = Body::from_stream(scan_and_forward(
         upstream_resp.bytes_stream(),
         Arc::clone(&state.tracker),
-        state.label.clone(),
+        label,
     ));
     Ok(builder.body(body)?)
 }
@@ -291,7 +510,438 @@ fn finalize_leftover(buffer: &str, running: &mut UsageStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use axum::routing::post;
+    use std::net::SocketAddr;
+
+    async fn echo_model_and_auth(headers: HeaderMap, body: axum::body::Bytes) -> Response {
+        let model = model_from_body(&body).unwrap_or_default();
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let api_key = headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        axum::Json(
+            serde_json::json!({ "model": model, "authorization": auth, "x_api_key": api_key }),
+        )
+        .into_response()
+    }
+
+    async fn echo_usage(body: axum::body::Bytes) -> Response {
+        let model = model_from_body(&body).unwrap_or_default();
+        axum::Json(serde_json::json!({
+            "model": model,
+            "usage": { "input_tokens": 3, "output_tokens": 5 }
+        }))
+        .into_response()
+    }
+
+    async fn spawn_echo_server() -> SocketAddr {
+        let app = Router::new()
+            .route("/v1/messages", post(echo_model_and_auth))
+            .route("/v1/usage", post(echo_usage));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    fn target(base_url: String, auth: UpstreamAuth) -> UpstreamTarget {
+        UpstreamTarget {
+            base_url,
+            verify_ssl: true,
+            auth,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatches_known_model_to_its_own_route_with_injected_auth() {
+        let known_addr = spawn_echo_server().await;
+        let default_addr = spawn_echo_server().await;
+
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+        server
+            .handle
+            .register_route(
+                "granite-4.1-8b".to_string(),
+                target(
+                    format!("http://{known_addr}"),
+                    UpstreamAuth::Inject(Some(Secret("known-key".to_string()))),
+                ),
+                "sub-agent".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .header("authorization", "Bearer client-token")
+            .json(&serde_json::json!({ "model": "granite-4.1-8b" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["model"], "granite-4.1-8b");
+        // Client auth was stripped and replaced with the route's own key.
+        assert_eq!(body["authorization"], "Bearer known-key");
+        assert_eq!(body["x_api_key"], "known-key");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_default_for_unknown_model() {
+        let default_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "claude-sonnet-5" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["model"], "claude-sonnet-5");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn passthrough_default_leaves_client_auth_headers_untouched() {
+        let default_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .header("authorization", "Bearer subscription-session-token")
+            .json(&serde_json::json!({ "model": "claude-sonnet-5" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["authorization"], "Bearer subscription-session-token");
+        assert_eq!(body["x_api_key"], "");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_default_for_non_json_body() {
+        let default_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_route_after_boot_is_immediately_live() {
+        let default_addr = spawn_echo_server().await;
+        let known_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        // Before registration, this model falls through to default.
+        let resp = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "granite-4.1-8b" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // Register the route while the server is already accepting traffic.
+        server
+            .handle
+            .register_route(
+                "granite-4.1-8b".to_string(),
+                target(
+                    format!("http://{known_addr}"),
+                    UpstreamAuth::Inject(Some(Secret("known-key".to_string()))),
+                ),
+                "sub-agent".to_string(),
+            )
+            .unwrap();
+
+        let resp = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "granite-4.1-8b" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["x_api_key"], "known-key");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_default_after_boot_overrides_routing_for_unmatched_models() {
+        let real_addr = spawn_echo_server().await;
+        let overridden_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        // The overridden default won't be used once we call set_default.
+        server
+            .handle
+            .set_default(
+                target(
+                    format!("http://{overridden_addr}"),
+                    UpstreamAuth::Passthrough,
+                ),
+                "default".to_string(),
+            )
+            .unwrap();
+        server
+            .handle
+            .set_default(
+                target(
+                    format!("http://{real_addr}"),
+                    UpstreamAuth::Inject(Some(Secret("main-key".to_string()))),
+                ),
+                "main".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "some-internal-model" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["x_api_key"], "main-key");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_default_from_route_aliases_default_to_an_already_registered_route() {
+        let main_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .register_route(
+                "main-model".to_string(),
+                target(
+                    format!("http://{main_addr}"),
+                    UpstreamAuth::Inject(Some(Secret("main-key".to_string()))),
+                ),
+                "main".to_string(),
+            )
+            .unwrap();
+
+        server.handle.set_default_from_route("main-model").unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "some-unregistered-internal-model" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["x_api_key"], "main-key");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_default_from_route_fails_for_an_unregistered_model_name() {
+        let server = ProxyServer::start().unwrap();
+        assert!(
+            server
+                .handle
+                .set_default_from_route("no-such-model")
+                .is_err()
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn usage_is_tracked_for_both_routed_and_default_traffic() {
+        let default_addr = spawn_echo_server().await;
+        let routed_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+        server
+            .handle
+            .register_route(
+                "granite-4.1-8b".to_string(),
+                target(format!("http://{routed_addr}"), UpstreamAuth::Passthrough),
+                "reviewer".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "claude-sonnet-5" }))
+            .send()
+            .await
+            .unwrap();
+        client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "granite-4.1-8b" }))
+            .send()
+            .await
+            .unwrap();
+
+        let snapshot = server.handle.tracker().snapshot();
+        // Default traffic is labeled by its own observed model name, not the
+        // generic default label.
+        assert_eq!(snapshot.get("claude-sonnet-5").unwrap().input_tokens, 3);
+        assert_eq!(snapshot.get("reviewer").unwrap().input_tokens, 3);
+        assert!(!snapshot.contains_key("default"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn default_traffic_naming_several_upstream_models_is_tracked_per_model_name() {
+        let default_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        for model in ["claude-sonnet-5", "claude-haiku-4-5", "claude-sonnet-5"] {
+            client
+                .post(format!("{}/v1/usage", server.handle.local_base_url))
+                .json(&serde_json::json!({ "model": model }))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let snapshot = server.handle.tracker().snapshot();
+        let sonnet = snapshot.get("claude-sonnet-5").unwrap();
+        assert_eq!(sonnet.requests, 2);
+        assert_eq!(sonnet.input_tokens, 6);
+        let haiku = snapshot.get("claude-haiku-4-5").unwrap();
+        assert_eq!(haiku.requests, 1);
+        assert_eq!(haiku.input_tokens, 3);
+        assert!(!snapshot.contains_key("default"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn default_traffic_without_an_identifiable_model_name_falls_back_to_default_label() {
+        let default_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+
+        let snapshot = server.handle.tracker().snapshot();
+        assert!(snapshot.contains_key("default"));
+
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn model_from_body_reads_top_level_model_field() {
+        assert_eq!(
+            model_from_body(br#"{"model": "granite-4.1-8b", "messages": []}"#),
+            Some("granite-4.1-8b".to_string())
+        );
+    }
+
+    #[test]
+    fn model_from_body_returns_none_for_missing_field() {
+        assert_eq!(model_from_body(br#"{"messages": []}"#), None);
+    }
+
+    #[test]
+    fn model_from_body_returns_none_for_non_json() {
+        assert_eq!(model_from_body(b"not json"), None);
+    }
+
+    #[test]
+    fn hop_by_hop_headers_are_filtered_but_auth_headers_are_not() {
+        assert!(is_hop_by_hop_header("Host"));
+        assert!(is_hop_by_hop_header("Transfer-Encoding"));
+        assert!(!is_hop_by_hop_header("Authorization"));
+        assert!(!is_hop_by_hop_header("Content-Type"));
+        assert!(is_auth_header("X-Api-Key"));
+        assert!(is_auth_header("Authorization"));
+        assert!(!is_auth_header("Content-Type"));
+    }
 
     #[test]
     fn scan_line_anthropic_sse_data_event() {
@@ -354,16 +1004,5 @@ mod tests {
         assert_eq!(chat.requests, 1);
         assert_eq!(chat.input_tokens, 5);
         assert_eq!(chat.output_tokens, 9);
-    }
-
-    #[test]
-    fn forbidden_headers_are_filtered_in_both_directions() {
-        assert!(is_forbidden_request_header("Authorization"));
-        assert!(is_forbidden_request_header("X-Api-Key"));
-        assert!(is_forbidden_request_header("Host"));
-        assert!(!is_forbidden_request_header("Content-Type"));
-
-        assert!(is_forbidden_response_header("Transfer-Encoding"));
-        assert!(!is_forbidden_response_header("Content-Type"));
     }
 }

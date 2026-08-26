@@ -1,5 +1,5 @@
 // Standard
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 // Third Party
@@ -16,7 +16,7 @@ use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetada
 use crate::launchers::shared::mcp_cli::{
     mcp_binding_request, register_mcp_server, remove_mcp_server,
 };
-use crate::launchers::shared::model_router::{ModelRouter, UpstreamAuth, UpstreamTarget};
+use crate::proxy::ProxyHandle;
 use crate::registry::ConfigConstructable;
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
@@ -42,10 +42,16 @@ pub struct ClaudeLauncher {
     bound_mcp_bindings: Vec<(String, McpBinding)>,
     /// `(name, binding)` for every `SubAgentCapability` bound to this
     /// launcher -- `name` is the capability's own `instance_id`, used as the
-    /// sub-agent's name in the `--agents` JSON map. When non-empty, `launch()`
-    /// starts a `ModelRouter` in front of `ANTHROPIC_BASE_URL` so each
-    /// sub-agent's model reaches its own resolved provider.
+    /// sub-agent's name in the `--agents` JSON map. Each sub-agent's route
+    /// was already registered on `model_proxy` by `ModelSource::take`; when
+    /// non-empty, `launch()` (via `wire_model_proxy`) points
+    /// `ANTHROPIC_BASE_URL` at that proxy so each sub-agent's model reaches
+    /// its own resolved provider.
     bound_sub_agents: Vec<(String, SubAgentBinding)>,
+    /// The session-scoped model proxy, if one was booted for this launch
+    /// (see `run_launch`) -- present whenever usage tracking or sub-agent
+    /// routing is needed.
+    model_proxy: Option<ProxyHandle>,
 }
 
 impl ConfigConstructable for ClaudeLauncher {
@@ -54,7 +60,7 @@ impl ConfigConstructable for ClaudeLauncher {
     fn new(
         instance_id: &str,
         cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
+        global_config: &crate::config::Config,
     ) -> Self {
         let config: ClaudeLauncherConfig = serde_json::from_value(cfg.clone()).unwrap_or_default();
         Self {
@@ -63,6 +69,7 @@ impl ConfigConstructable for ClaudeLauncher {
             bound_agent_model: None,
             bound_mcp_bindings: vec![],
             bound_sub_agents: vec![],
+            model_proxy: global_config.model_proxy.clone(),
         }
     }
 }
@@ -221,7 +228,7 @@ impl Launcher for ClaudeLauncher {
     ) -> anyhow::Result<std::process::ExitStatus> {
         let binary = self.validate_command()?;
         let mut overlay = self.env_overlay(ctx).await?;
-        let router = self.start_sub_agent_router(ctx, &mut overlay)?;
+        self.wire_model_proxy(ctx, &mut overlay)?;
         alog_channel!(MessageLevel::Debug4, "Env overlay: {:#?}", overlay);
 
         let mut full_args = Vec::new();
@@ -244,87 +251,83 @@ impl Launcher for ClaudeLauncher {
             remove_mcp_server(&binary, name, SCOPE, ctx, ui);
         }
 
-        if let Some(router) = router {
-            router.shutdown().await;
-        }
-
         result
     }
 }
 
 impl ClaudeLauncher {
-    /// If any `SubAgentCapability` is bound, starts a `ModelRouter` in front
-    /// of whatever `ANTHROPIC_BASE_URL` would otherwise be and overrides
-    /// `overlay`'s `ANTHROPIC_BASE_URL` entry to point at it, so a sub-agent's
-    /// model reaches its own resolved provider while everything else (the
-    /// main session's own traffic) keeps reaching the normal upstream. Under
-    /// `--dry-run`, no socket is started, but `overlay` still gets a
-    /// placeholder value so the dry-run output stays informative.
-    fn start_sub_agent_router(
+    /// Whenever the shared session proxy is running -- `-u`/`--usage-tracking`
+    /// was requested, or any `SubAgentCapability` is bound (which forces the
+    /// proxy on regardless of `-u`) -- overrides `overlay`'s
+    /// `ANTHROPIC_BASE_URL` entry to point at it. This runs unconditionally,
+    /// not just when sub-agents are bound: with `-u` alone and no
+    /// `AgentModelCapability` configured, `env_overlay()` never sets
+    /// `ANTHROPIC_BASE_URL` at all (there's no bound model to read it from),
+    /// so without this override the launched process would talk straight to
+    /// the real upstream on its own ambient environment and the proxy would
+    /// never see any traffic to track -- the point of routing everything
+    /// through the proxy is that its built-in default (ambient
+    /// `ANTHROPIC_BASE_URL`/real Anthropic passthrough) still tracks that
+    /// traffic, now labeled per the actual model name observed on each
+    /// request (see `RoutingTable::target_and_label_for`).
+    ///
+    /// If any `SubAgentCapability` is also bound, points the proxy's default
+    /// at whatever route was already registered under the main model's own
+    /// name (if `AgentModelCapability` is bound too), so Claude Code's
+    /// other, non-sub-agent traffic keeps reaching the user's configured
+    /// main model rather than leaking to the real upstream. Note this does
+    /// NOT register a route for each sub-agent's model itself --
+    /// `ModelSource::take` already did that, using each model's real
+    /// (unwrapped) provider, at the point `SubAgentCapability::new` resolved
+    /// it. By the time a binding reaches here, `binding.model.base_url`/
+    /// `api_key` have already been redirected to point at this same proxy
+    /// (since the model went through `ModelSource::take` too) --
+    /// re-deriving a route from them would register the proxy as its own
+    /// upstream, an infinite loop; the same reasoning is why the main
+    /// model's default is looked up by name rather than rebuilt from
+    /// `bound_agent_model` directly.
+    ///
+    /// Under `--dry-run` (where `run_launch` never boots a proxy) with
+    /// sub-agents bound, `overlay` still gets a placeholder value so the
+    /// dry-run output stays informative.
+    fn wire_model_proxy(
         &self,
         ctx: &LaunchContext,
         overlay: &mut Vec<EnvBinding>,
-    ) -> anyhow::Result<Option<ModelRouter>> {
-        if self.bound_sub_agents.is_empty() {
-            return Ok(None);
+    ) -> anyhow::Result<()> {
+        match &self.model_proxy {
+            Some(handle) => {
+                if let Some(main) = &self.bound_agent_model
+                    && let Err(e) = handle.set_default_from_route(&main.model_name)
+                {
+                    alog_channel!(MessageLevel::Warning, "failed to set default route: {e}");
+                }
+                set_env_binding(overlay, "ANTHROPIC_BASE_URL", handle.local_base_url.clone());
+            }
+            None if !self.bound_sub_agents.is_empty() && ctx.dry_run => {
+                set_env_binding(
+                    overlay,
+                    "ANTHROPIC_BASE_URL",
+                    "<sub-agent router: not started under --dry-run>".to_string(),
+                );
+            }
+            None if !self.bound_sub_agents.is_empty() => {
+                // `run_launch` boots a proxy whenever any sub-agent
+                // capability is enabled, so this should be unreachable
+                // outside dry-run; degrade gracefully rather than failing
+                // the whole launch over a routing bug.
+                alog_channel!(
+                    MessageLevel::Warning,
+                    "sub-agents bound but no proxy handle available; sub-agent routing disabled for this launch"
+                );
+            }
+            // No proxy running and no sub-agents bound: nothing to wire up
+            // (either `-u` wasn't passed, or this is a dry run) -- leave
+            // `overlay` exactly as `env_overlay()` produced it.
+            None => {}
         }
 
-        let router = if ctx.dry_run {
-            None
-        } else {
-            let routes = self
-                .bound_sub_agents
-                .iter()
-                .map(|(_, binding)| {
-                    (
-                        binding.model.model_name.clone(),
-                        UpstreamTarget {
-                            base_url: binding.model.base_url.clone(),
-                            verify_ssl: binding.model.verify_ssl,
-                            auth: UpstreamAuth::Inject(binding.model.api_key.clone()),
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            let ambient_base_url = std::env::var("ANTHROPIC_BASE_URL").ok();
-            Some(ModelRouter::start(
-                self.default_upstream_target(ambient_base_url.as_deref()),
-                routes,
-            )?)
-        };
-
-        let base_url_override = match &router {
-            Some(router) => router.local_base_url.clone(),
-            None => "<sub-agent router: not started under --dry-run>".to_string(),
-        };
-        set_env_binding(overlay, "ANTHROPIC_BASE_URL", base_url_override);
-
-        Ok(router)
-    }
-
-    /// The default target a sub-agent router forwards non-matching (main
-    /// session) traffic to: the main model's provider if `AgentModelCapability`
-    /// is also bound, or the real Anthropic API otherwise -- using
-    /// `ambient_anthropic_base_url` (the caller's own `ANTHROPIC_BASE_URL`,
-    /// read from `start_sub_agent_router`'s process environment) if set,
-    /// falling back to the well-known default. Taking this as a parameter
-    /// rather than reading the environment directly here keeps the fallback
-    /// logic deterministically testable.
-    fn default_upstream_target(&self, ambient_anthropic_base_url: Option<&str>) -> UpstreamTarget {
-        match &self.bound_agent_model {
-            Some(binding) => UpstreamTarget {
-                base_url: binding.base_url.clone(),
-                verify_ssl: binding.verify_ssl,
-                auth: UpstreamAuth::Inject(binding.api_key.clone()),
-            },
-            None => UpstreamTarget {
-                base_url: ambient_anthropic_base_url
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
-                verify_ssl: true,
-                auth: UpstreamAuth::Passthrough,
-            },
-        }
+        Ok(())
     }
 
     /// Builds the `--agents` JSON: `{ name: { description, prompt, model,
@@ -573,6 +576,15 @@ mod tests {
         l
     }
 
+    fn test_launch_context(dry_run: bool) -> LaunchContext {
+        LaunchContext {
+            launcher_id: "my-claude".to_string(),
+            working_dir: std::env::current_dir().unwrap(),
+            base_env: std::collections::HashMap::new(),
+            dry_run,
+        }
+    }
+
     #[test]
     fn build_agents_json_includes_description_prompt_and_model_but_omits_empty_tools() {
         let ui = crate::utils::ui::backends::plain::PlainOutput;
@@ -635,37 +647,190 @@ mod tests {
     }
 
     #[test]
-    fn default_upstream_target_falls_back_to_well_known_default_without_a_main_model() {
+    fn wire_model_proxy_is_a_noop_without_a_handle_or_sub_agents() {
         let l = launcher_with(None, vec![]);
-        let target = l.default_upstream_target(None);
-        assert_eq!(target.base_url, "https://api.anthropic.com");
-        assert!(matches!(target.auth, UpstreamAuth::Passthrough));
+        let mut overlay = vec![];
+        l.wire_model_proxy(&test_launch_context(false), &mut overlay)
+            .unwrap();
+        assert!(overlay.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wire_model_proxy_points_at_the_proxy_even_with_no_bound_model_or_sub_agents() {
+        // The scenario this covers: `-u`/`--usage-tracking` alone, with no
+        // `AgentModelCapability` or `SubAgentCapability` configured at all.
+        // `env_overlay()` never sets `ANTHROPIC_BASE_URL` in that case (no
+        // bound model to read it from), so without this, the launched
+        // process would never reach the proxy and nothing would ever be
+        // tracked.
+        let server = crate::proxy::ProxyServer::start().unwrap();
+        let mut l = launcher_with(None, vec![]);
+        l.model_proxy = Some(server.handle.clone());
+
+        let mut overlay = vec![];
+        l.wire_model_proxy(&test_launch_context(false), &mut overlay)
+            .unwrap();
+        assert_eq!(overlay.len(), 1);
+        assert_eq!(overlay[0].key, "ANTHROPIC_BASE_URL");
+        assert_eq!(overlay[0].value, server.handle.local_base_url);
+
+        server.shutdown().await;
     }
 
     #[test]
-    fn default_upstream_target_uses_ambient_base_url_without_a_main_model() {
-        let l = launcher_with(None, vec![]);
-        let target = l.default_upstream_target(Some("http://corporate-gateway.internal"));
-        assert_eq!(target.base_url, "http://corporate-gateway.internal");
-        assert!(matches!(target.auth, UpstreamAuth::Passthrough));
+    fn wire_model_proxy_sets_placeholder_under_dry_run_without_a_handle() {
+        let l = launcher_with(
+            None,
+            vec![(
+                "reviewer".to_string(),
+                sub_agent_binding("Reviews code", "granite-3.1-8b-instruct", vec![]),
+            )],
+        );
+        let mut overlay = vec![];
+        l.wire_model_proxy(&test_launch_context(true), &mut overlay)
+            .unwrap();
+        assert_eq!(overlay.len(), 1);
+        assert_eq!(overlay[0].key, "ANTHROPIC_BASE_URL");
+        assert_eq!(
+            overlay[0].value,
+            "<sub-agent router: not started under --dry-run>"
+        );
     }
 
     #[test]
-    fn default_upstream_target_prefers_bound_main_model_over_ambient_env() {
-        let main_model = crate::capabilities::AgentModelBinding {
-            api_type: crate::providers::ApiType::Anthropic,
-            provider_name: "my-ollama".to_string(),
-            base_url: "http://localhost:11434".to_string(),
-            model_name: "granite-3.1-8b-instruct".to_string(),
-            endpoint_path: "/v1/messages".to_string(),
-            api_key: Some(crate::registry::Secret("real-key".to_string())),
-            verify_ssl: true,
-            context_length: Some(4096),
-        };
-        let l = launcher_with(Some(main_model), vec![]);
-        let target = l.default_upstream_target(Some("http://corporate-gateway.internal"));
-        assert_eq!(target.base_url, "http://localhost:11434");
-        assert!(matches!(target.auth, UpstreamAuth::Inject(Some(_))));
+    fn wire_model_proxy_warns_and_leaves_overlay_untouched_without_a_handle_outside_dry_run() {
+        let l = launcher_with(
+            None,
+            vec![(
+                "reviewer".to_string(),
+                sub_agent_binding("Reviews code", "granite-3.1-8b-instruct", vec![]),
+            )],
+        );
+        let mut overlay = vec![];
+        l.wire_model_proxy(&test_launch_context(false), &mut overlay)
+            .unwrap();
+        assert!(overlay.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wire_model_proxy_points_default_at_the_main_models_registered_route() {
+        async fn echo(
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let api_key = headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            axum::Json(serde_json::json!({ "model": value.get("model"), "x_api_key": api_key }))
+                .into_response()
+        }
+
+        async fn spawn_echo_server() -> std::net::SocketAddr {
+            let app = axum::Router::new().route("/v1/messages", axum::routing::post(echo));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            addr
+        }
+
+        let sub_agent_addr = spawn_echo_server().await;
+        let main_addr = spawn_echo_server().await;
+
+        let server = crate::proxy::ProxyServer::start().unwrap();
+        // Simulates what `ModelSource::take` already did for each model at
+        // capability-construction time, using each one's real (unwrapped)
+        // provider -- this is the ONLY place routes get registered; the
+        // launcher itself must not try to re-derive them from bindings,
+        // since those already point back at this same proxy once wrapped.
+        server
+            .handle
+            .register_route(
+                "granite-3.1-8b-instruct".to_string(),
+                crate::proxy::UpstreamTarget {
+                    base_url: format!("http://{sub_agent_addr}"),
+                    verify_ssl: true,
+                    auth: crate::proxy::UpstreamAuth::Inject(Some(crate::registry::Secret(
+                        "sub-key".to_string(),
+                    ))),
+                },
+                "reviewer".to_string(),
+            )
+            .unwrap();
+        server
+            .handle
+            .register_route(
+                "main-model".to_string(),
+                crate::proxy::UpstreamTarget {
+                    base_url: format!("http://{main_addr}"),
+                    verify_ssl: true,
+                    auth: crate::proxy::UpstreamAuth::Inject(Some(crate::registry::Secret(
+                        "main-key".to_string(),
+                    ))),
+                },
+                "main-model".to_string(),
+            )
+            .unwrap();
+
+        let mut l = launcher_with(
+            // As it would look once wrapped: base_url points at the proxy,
+            // api_key is cleared -- neither is used by the fix, only
+            // `model_name` is (to look up the already-registered route).
+            Some(crate::capabilities::AgentModelBinding {
+                api_type: crate::providers::ApiType::Anthropic,
+                provider_name: "main".to_string(),
+                base_url: server.handle.local_base_url.clone(),
+                model_name: "main-model".to_string(),
+                endpoint_path: "/v1/messages".to_string(),
+                api_key: None,
+                verify_ssl: true,
+                context_length: Some(4096),
+            }),
+            vec![(
+                "reviewer".to_string(),
+                sub_agent_binding("Reviews code", "granite-3.1-8b-instruct", vec![]),
+            )],
+        );
+        l.model_proxy = Some(server.handle.clone());
+
+        let mut overlay = vec![];
+        l.wire_model_proxy(&test_launch_context(false), &mut overlay)
+            .unwrap();
+        assert_eq!(overlay[0].key, "ANTHROPIC_BASE_URL");
+        assert_eq!(overlay[0].value, server.handle.local_base_url);
+
+        let client = reqwest::Client::new();
+        // The sub-agent's own registered route is untouched.
+        let sub_resp: serde_json::Value = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .json(&serde_json::json!({"model": "granite-3.1-8b-instruct"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sub_resp["x_api_key"], "sub-key");
+
+        // An unmatched model now falls through to the main model's own
+        // already-registered route, not back into the proxy itself.
+        let main_resp: serde_json::Value = client
+            .post(format!("{}/v1/messages", server.handle.local_base_url))
+            .json(&serde_json::json!({"model": "some-other-internal-model"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(main_resp["x_api_key"], "main-key");
+
+        server.shutdown().await;
     }
 
     #[test]

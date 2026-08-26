@@ -26,7 +26,7 @@ pub static MODEL_REGISTRY: LazyLock<base::ModelFactory> = LazyLock::new(|| {
 /// *is* the catalog id).
 pub struct ModelSource {
     constructed: Vec<(String, Box<dyn Model>)>,
-    usage_tracking: Option<crate::proxy::UsageTrackingContext>,
+    model_proxy: Option<crate::proxy::ProxyHandle>,
 }
 
 impl ModelSource {
@@ -65,37 +65,64 @@ impl ModelSource {
             .collect();
         Self {
             constructed,
-            usage_tracking: config.usage_tracking.clone(),
+            model_proxy: config.model_proxy.clone(),
         }
     }
 
     /// Removes and returns the constructed model for `model_id` (the catalog
     /// id -- matches `ModelConfig.model_id`, which config loading enforces
-    /// equals the outer `config.models` key). When a usage-tracking session
-    /// is active, wraps the model in a local tracking proxy first; if the
-    /// proxy fails to start, falls back to the untracked model with a
-    /// warning rather than failing construction over an accounting feature.
-    pub fn take(&mut self, model_id: &str) -> Option<Arc<dyn Model>> {
+    /// equals the outer `config.models` key). `configured_variant` is the
+    /// caller's already-resolved `"format/precision"` string, used (on the
+    /// real, unwrapped provider) to compute the same alias
+    /// `resolve_provider_endpoint` will use later, so the route registered
+    /// here is keyed exactly how the launched process will address it.
+    ///
+    /// When a session proxy is active, registers this model's real
+    /// connection details as a route on it (best-effort -- a registration
+    /// failure is logged and the model is returned untracked/unrouted rather
+    /// than failing construction over an accounting/routing feature) and
+    /// returns a model wrapped to point at the proxy instead of the real
+    /// upstream.
+    pub fn take(
+        &mut self,
+        model_id: &str,
+        configured_variant: Option<&str>,
+    ) -> Option<Arc<dyn Model>> {
         let idx = self.constructed.iter().position(|(id, _)| id == model_id)?;
         let (_, model) = self.constructed.remove(idx);
         let model: Arc<dyn Model> = Arc::from(model);
-        let Some(ctx) = &self.usage_tracking else {
+        let Some(handle) = &self.model_proxy else {
             return Some(model);
         };
-        match crate::proxy::UsageTrackingModel::wrap(
-            Arc::clone(&model),
-            model_id.to_string(),
-            ctx.clone(),
-        ) {
-            Ok(wrapped) => Some(Arc::new(wrapped)),
+        match model.provider() {
+            Ok(provider) => {
+                let variant = base::find_variant(model.variants(), configured_variant);
+                let route_key = provider
+                    .model_alias(variant)
+                    .unwrap_or_else(|| model_id.to_string());
+                let target = crate::proxy::UpstreamTarget {
+                    base_url: provider.base_url().to_string(),
+                    verify_ssl: provider.verify_ssl(),
+                    auth: crate::proxy::UpstreamAuth::Inject(provider.api_key().cloned()),
+                };
+                if let Err(e) = handle.register_route(route_key, target, model_id.to_string()) {
+                    alog_channel!(
+                        MessageLevel::Warning,
+                        "failed to register proxy route for model '{model_id}': {e}"
+                    );
+                }
+            }
             Err(e) => {
                 alog_channel!(
                     MessageLevel::Warning,
-                    "usage-tracking proxy failed to start for model '{model_id}', continuing untracked: {e}"
+                    "model '{model_id}' has no usable provider, skipping proxy route: {e}"
                 );
-                Some(model)
             }
         }
+        Some(Arc::new(crate::proxy::ProxiedModel::wrap(
+            model,
+            handle.local_base_url.clone(),
+        )))
     }
 }
 
@@ -260,8 +287,8 @@ mod tests {
         );
 
         let mut source = ModelSource::from_config(&config);
-        assert!(source.take("granite-3.1-8b-instruct").is_some());
-        assert!(source.take("granite-3.1-8b-instruct").is_none());
+        assert!(source.take("granite-3.1-8b-instruct", None).is_some());
+        assert!(source.take("granite-3.1-8b-instruct", None).is_none());
     }
 
     #[test]
@@ -269,14 +296,25 @@ mod tests {
         use crate::config::Config;
 
         let mut source = ModelSource::from_config(&Config::default());
-        assert!(source.take("not-configured").is_none());
+        assert!(source.take("not-configured", None).is_none());
     }
 
     #[tokio::test]
-    async fn take_wraps_model_when_usage_tracking_is_active() {
+    async fn take_routes_through_proxy_and_registers_a_route_when_a_handle_is_active() {
         use crate::config::{Config, ModelConfig, ProviderConfig};
-        use crate::proxy::{ProxyServer, UsageTracker, UsageTrackingContext};
-        use std::sync::Mutex;
+        use crate::proxy::ProxyServer;
+
+        async fn echo_model(body: axum::body::Bytes) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            axum::Json(serde_json::json!({ "model": value.get("model") })).into_response()
+        }
+        let app = axum::Router::new().route("/echo", axum::routing::post(echo_model));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
         let mut config = Config::default();
         config.providers.insert(
@@ -284,7 +322,7 @@ mod tests {
             ProviderConfig {
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
-                config: serde_json::json!({ "base_url": "http://localhost:11434" }),
+                config: serde_json::json!({ "base_url": format!("http://{addr}") }),
             },
         );
         config.models.insert(
@@ -295,22 +333,31 @@ mod tests {
                 variant: None,
             },
         );
-        let servers: Arc<Mutex<Vec<ProxyServer>>> = Arc::new(Mutex::new(Vec::new()));
-        config.usage_tracking = Some(UsageTrackingContext {
-            tracker: Arc::new(UsageTracker::new()),
-            servers: Arc::clone(&servers),
-        });
+        let server = ProxyServer::start().unwrap();
+        config.model_proxy = Some(server.handle.clone());
 
         let mut source = ModelSource::from_config(&config);
-        let model = source.take("granite-3.1-8b-instruct").unwrap();
+        let model = source.take("granite-3.1-8b-instruct", None).unwrap();
         let provider = model.provider().unwrap();
-        assert!(provider.base_url().starts_with("http://127.0.0.1:"));
+        assert_eq!(provider.base_url(), server.handle.local_base_url);
+        assert!(provider.api_key().is_none());
 
-        let started: Vec<_> = servers.lock().unwrap().drain(..).collect();
-        assert_eq!(started.len(), 1);
-        for server in started {
-            server.shutdown().await;
-        }
+        // The real route (to the un-proxied fake upstream) was registered
+        // under the model's catalog id (no alias, so it falls back to that)
+        // -- prove it's actually live by round-tripping through the proxy.
+        let client = reqwest::Client::new();
+        let resp: serde_json::Value = client
+            .post(format!("{}/echo", provider.base_url()))
+            .json(&serde_json::json!({ "model": "granite-3.1-8b-instruct" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp["model"], "granite-3.1-8b-instruct");
+
+        server.shutdown().await;
     }
 
     #[test]

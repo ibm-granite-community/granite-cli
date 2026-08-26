@@ -1,5 +1,5 @@
 // Standard
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // Third Party
 use async_trait::async_trait;
@@ -14,69 +14,37 @@ use crate::providers::{
 use crate::registry::Secret;
 use crate::utils::ui::Ui;
 
-use super::{ProxyServer, UsageTracker};
-
 /*-- public --*/
 
-/// Per-launch usage-tracking session, threaded through
-/// `ModelSource::from_config` via `Config::usage_tracking`. Cheap to clone --
-/// every field is an `Arc`.
-#[derive(Clone)]
-pub struct UsageTrackingContext {
-    pub tracker: Arc<UsageTracker>,
-    pub servers: Arc<Mutex<Vec<ProxyServer>>>,
-}
-
-impl std::fmt::Debug for UsageTrackingContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UsageTrackingContext")
-            .finish_non_exhaustive()
-    }
-}
-
-/// A `Model` decorator whose `provider()` points at a local reverse proxy
+/// A `Model` decorator whose `provider()` points at the shared session proxy
 /// instead of the real upstream. Every other method delegates straight to
 /// `inner`, so any caller resolving connection details via
-/// `model.provider()` gets tracked transparently.
-pub struct UsageTrackingModel {
+/// `model.provider()` gets routed through (and, when a tracker is active,
+/// tracked by) the proxy transparently. Unlike the per-model proxy this
+/// replaces, wrapping has no side effects and cannot fail -- the caller
+/// (`ModelSource::take`) already registered the real route with the proxy
+/// before wrapping.
+pub struct ProxiedModel {
     inner: Arc<dyn Model>,
     local_base_url: String,
 }
 
-impl UsageTrackingModel {
-    /// Starts a `ProxyServer` for `inner`'s real provider and registers it
-    /// into `ctx.servers`. Synchronous: `ProxyServer::start` binds a
-    /// non-blocking `std::net::TcpListener` and hands it to `tokio::spawn`,
-    /// which only needs an ambient Tokio runtime, not an `.await`.
-    pub fn wrap(
-        inner: Arc<dyn Model>,
-        label: String,
-        ctx: UsageTrackingContext,
-    ) -> anyhow::Result<Self> {
-        let real_provider = inner.provider()?;
-        let server = ProxyServer::start(
-            real_provider.base_url().to_string(),
-            real_provider.api_key().cloned(),
-            real_provider.verify_ssl(),
-            Arc::clone(&ctx.tracker),
-            label,
-        )?;
-        let local_base_url = server.local_base_url.clone();
-        ctx.servers.lock().unwrap().push(server);
-        Ok(Self {
+impl ProxiedModel {
+    pub fn wrap(inner: Arc<dyn Model>, local_base_url: String) -> Self {
+        Self {
             inner,
             local_base_url,
-        })
+        }
     }
 }
 
-impl crate::registry::Named for UsageTrackingModel {
+impl crate::registry::Named for ProxiedModel {
     fn instance_id(&self) -> &str {
         self.inner.instance_id()
     }
 }
 
-impl Model for UsageTrackingModel {
+impl Model for ProxiedModel {
     fn family(&self) -> &str {
         self.inner.family()
     }
@@ -115,7 +83,7 @@ impl Model for UsageTrackingModel {
     }
 
     fn provider(&self) -> anyhow::Result<Box<dyn Provider>> {
-        Ok(Box::new(UsageTrackingProvider {
+        Ok(Box::new(ProxiedProvider {
             inner: self.inner.provider()?,
             local_base_url: self.local_base_url.clone(),
         }))
@@ -124,22 +92,24 @@ impl Model for UsageTrackingModel {
 
 /*-- private --*/
 
-/// A `Provider` decorator that redirects connection details at the local
-/// proxy while delegating everything else -- including the real upstream
-/// call made by `health_check`/`pull_model` -- to `inner`.
-struct UsageTrackingProvider {
+/// A `Provider` decorator that redirects connection details at the shared
+/// session proxy while delegating everything else -- including
+/// `model_alias` (so the alias used to register the route and the one
+/// `resolve_provider_endpoint` computes later stay consistent) and the real
+/// upstream call made by `health_check`/`pull_model` -- to `inner`.
+struct ProxiedProvider {
     inner: Box<dyn Provider>,
     local_base_url: String,
 }
 
-impl crate::registry::Named for UsageTrackingProvider {
+impl crate::registry::Named for ProxiedProvider {
     fn instance_id(&self) -> &str {
         self.inner.instance_id()
     }
 }
 
 #[async_trait]
-impl Provider for UsageTrackingProvider {
+impl Provider for ProxiedProvider {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -281,12 +251,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn wrap_points_provider_at_local_proxy_and_clears_api_key() {
-        let ctx = UsageTrackingContext {
-            tracker: Arc::new(UsageTracker::new()),
-            servers: Arc::new(Mutex::new(Vec::new())),
-        };
+    #[test]
+    fn wrap_points_provider_at_local_proxy_and_clears_api_key() {
         let model: Arc<dyn Model> = Arc::new(FakeModel {
             provider: FakeProvider {
                 base_url: "https://api.example.com".to_string(),
@@ -294,45 +260,27 @@ mod tests {
             },
         });
 
-        let wrapped =
-            UsageTrackingModel::wrap(Arc::clone(&model), "chat".to_string(), ctx.clone()).unwrap();
+        let wrapped = ProxiedModel::wrap(Arc::clone(&model), "http://127.0.0.1:9999".to_string());
 
         let provider = wrapped.provider().unwrap();
-        assert!(provider.base_url().starts_with("http://127.0.0.1:"));
-        assert_ne!(provider.base_url(), "https://api.example.com");
+        assert_eq!(provider.base_url(), "http://127.0.0.1:9999");
         assert!(provider.api_key().is_none());
         assert!(provider.verify_ssl());
-
-        assert_eq!(ctx.servers.lock().unwrap().len(), 1);
-
-        let servers: Vec<_> = ctx.servers.lock().unwrap().drain(..).collect();
-        for server in servers {
-            server.shutdown().await;
-        }
     }
 
-    #[tokio::test]
-    async fn metadata_methods_delegate_to_inner() {
-        let ctx = UsageTrackingContext {
-            tracker: Arc::new(UsageTracker::new()),
-            servers: Arc::new(Mutex::new(Vec::new())),
-        };
+    #[test]
+    fn metadata_methods_delegate_to_inner() {
         let model: Arc<dyn Model> = Arc::new(FakeModel {
             provider: FakeProvider {
                 base_url: "https://api.example.com".to_string(),
                 api_key: None,
             },
         });
-        let wrapped = UsageTrackingModel::wrap(model, "chat".to_string(), ctx.clone()).unwrap();
+        let wrapped = ProxiedModel::wrap(model, "http://127.0.0.1:9999".to_string());
 
         assert_eq!(wrapped.family(), "Test");
         assert_eq!(wrapped.version(), "1.0");
         assert_eq!(wrapped.context_length(), 4096);
         assert_eq!(wrapped.huggingface_repo(), "test/test");
-
-        let servers: Vec<_> = ctx.servers.lock().unwrap().drain(..).collect();
-        for server in servers {
-            server.shutdown().await;
-        }
     }
 }
