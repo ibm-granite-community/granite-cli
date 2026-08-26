@@ -16,6 +16,7 @@ pub static PROVIDER_REGISTRY: LazyLock<base::ProviderFactory> = LazyLock::new(||
     factory.register::<llamacpp::LlamaCppProvider>("llama-cpp");
     factory.register::<lmstudio::LMStudioProvider>("lm-studio");
     factory.register::<openrouter::OpenRouterProvider>("openrouter");
+    factory.register::<vllm::VllmProvider>("vllm");
     factory
 });
 
@@ -97,6 +98,9 @@ pub use lmstudio::{LMStudioProvider, LMStudioProviderConfig};
 
 mod openrouter;
 pub use openrouter::{OpenRouterProvider, OpenRouterProviderConfig};
+
+mod vllm;
+pub use vllm::{VllmProvider, VllmProviderConfig};
 
 /*-- tests ---------------------------------------------------------------------*/
 
