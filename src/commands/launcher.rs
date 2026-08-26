@@ -178,15 +178,7 @@ impl LauncherCommands {
             .unwrap_or_else(|| serde_json::json!({}));
         alog_channel!(MessageLevel::Debug3, "Defaults: {:#?}", defaults);
 
-        let mut config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
-
-        // Normalize: an empty string for command_path means "use PATH" — treat
-        // it the same as absent so validate_command does a PATH lookup.
-        if config.get("command_path").and_then(|v| v.as_str()) == Some("") {
-            config
-                .as_object_mut()
-                .map(|m| m.insert("command_path".to_string(), serde_json::Value::Null));
-        }
+        let config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
 
         // Validate the binary now so the user gets immediate feedback.
         // validate_command respects command_path when set; falls back to PATH.
