@@ -283,28 +283,23 @@ impl Launcher for OpenCodeLauncher {
                 granite_providers.insert(binding.provider_name.clone(), entry);
             }
 
-            // Discover and register user providers for usage tracking
+            // Discover and register user providers for usage tracking.
+            // Every provider merged into the generated config must also be
+            // registered on the proxy: a provider path the proxy doesn't
+            // recognize is rejected rather than forwarded (see
+            // `target_and_label_for`), so an entry in one set but not the
+            // other would break that provider outright.
             if let Some(proxy_handle) = &self.model_proxy {
-                // Discover user's configured providers from their config files
-                if let Some(user_providers) = Self::discover_user_providers(ctx) {
-                    // Register on proxy so the proxy can route and track them
+                let user_providers = Self::discover_user_providers(ctx).unwrap_or_default();
+                let env_providers = Self::discover_env_providers();
+                if !user_providers.is_empty() || !env_providers.is_empty() {
+                    self.register_user_providers_on_proxy(proxy_handle, &env_providers);
                     self.register_user_providers_on_proxy(proxy_handle, &user_providers);
                     granite_providers = self.merge_user_providers_into_config(
                         &user_providers,
-                        &Self::discover_env_providers(),
+                        &env_providers,
                         &granite_providers,
                     );
-                } else {
-                    // No user config providers — discover env-based ones
-                    let env_providers = Self::discover_env_providers();
-                    if !env_providers.is_empty() {
-                        self.register_user_providers_on_proxy(proxy_handle, &env_providers);
-                        granite_providers = self.merge_user_providers_into_config(
-                            &serde_json::Map::new(),
-                            &env_providers,
-                            &granite_providers,
-                        );
-                    }
                 }
             }
 
@@ -652,24 +647,25 @@ impl OpenCodeLauncher {
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
         let mut providers = serde_json::Map::new();
 
-        // Load global config (~/.config/opencode/opencode.json)
-        if let Some(global_config) = Self::load_global_opencode_config() {
-            let resolved = Self::resolve_env_vars(&global_config);
-            if let Some(global_providers) = Self::extract_providers(&resolved) {
-                for (key, value) in global_providers {
-                    providers.insert(key.clone(), value.clone());
-                }
+        // Load global config (~/.config/opencode/opencode.json). Entries are
+        // kept verbatim -- `{env:VAR}` references included -- so secrets
+        // never land in the generated config; only `baseURL` is resolved,
+        // at proxy-registration time.
+        if let Some(global_config) = Self::load_global_opencode_config()
+            && let Some(global_providers) = Self::extract_providers(&global_config)
+        {
+            for (key, value) in global_providers {
+                providers.insert(key.clone(), value.clone());
             }
         }
 
         // Load project config (overwrites global for conflicting keys)
         let project_path = ctx.working_dir.join("opencode.json");
-        if let Some(project_config) = Self::load_user_config(&project_path) {
-            let resolved = Self::resolve_env_vars(&project_config);
-            if let Some(project_providers) = Self::extract_providers(&resolved) {
-                for (key, value) in project_providers {
-                    providers.insert(key.clone(), value.clone());
-                }
+        if let Some(project_config) = Self::load_user_config(&project_path)
+            && let Some(project_providers) = Self::extract_providers(&project_config)
+        {
+            for (key, value) in project_providers {
+                providers.insert(key.clone(), value.clone());
             }
         }
 
@@ -715,7 +711,8 @@ impl OpenCodeLauncher {
                 continue;
             };
 
-            let Some(base_url) = options.get("baseURL").and_then(|b| b.as_str()) else {
+            let resolved_base_url = options.get("baseURL").map(Self::resolve_env_vars);
+            let Some(base_url) = resolved_base_url.as_ref().and_then(|b| b.as_str()) else {
                 continue;
             };
 
@@ -2076,7 +2073,10 @@ mod tests {
         let user: serde_json::Map<String, serde_json::Value> = serde_json::json!({
             "openrouter": {
                 "npm": "@ai-sdk/openai-compatible",
-                "options": { "baseURL": "https://openrouter.ai/api/v1" }
+                "options": {
+                    "baseURL": "https://openrouter.ai/api/v1",
+                    "apiKey": "{env:OPENROUTER_API_KEY}"
+                }
             },
             "local-vllm": {
                 "options": { "baseURL": "http://localhost:8000/v1" }
@@ -2113,6 +2113,10 @@ mod tests {
         assert_eq!(
             merged["openrouter"]["options"]["baseURL"],
             format!("{proxy}/providers/openrouter")
+        );
+        assert_eq!(
+            merged["openrouter"]["options"]["apiKey"],
+            "{env:OPENROUTER_API_KEY}"
         );
         assert_eq!(
             merged["anthropic"]["options"]["baseURL"],

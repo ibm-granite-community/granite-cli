@@ -290,16 +290,17 @@ impl RoutingTable {
         &self,
         path_and_query: &str,
         body: &[u8],
-    ) -> (ResolvedTarget, String, String) {
+    ) -> anyhow::Result<(ResolvedTarget, String, String)> {
         let model = model_from_body(body);
-        if let Some((name, rest)) = split_provider_path(path_and_query)
-            && let Some((target, label)) = self.providers.get(name)
-        {
+        if let Some((name, rest)) = split_provider_path(path_and_query) {
+            let Some((target, label)) = self.providers.get(name) else {
+                anyhow::bail!("no provider registered under '/providers/{name}'");
+            };
             let label = match &model {
                 Some(model) => format!("{label}/{model}"),
                 None => label.clone(),
             };
-            return (target.clone(), label, rest.to_string());
+            return Ok((target.clone(), label, rest.to_string()));
         }
         if let Some(model) = &model
             && let Some(target) = self.routes.get(model)
@@ -309,10 +310,10 @@ impl RoutingTable {
                 .get(model)
                 .cloned()
                 .unwrap_or_else(|| model.clone());
-            return (target.clone(), label, path_and_query.to_string());
+            return Ok((target.clone(), label, path_and_query.to_string()));
         }
         let label = model.unwrap_or_else(|| self.default_label.clone());
-        (self.default.clone(), label, path_and_query.to_string())
+        Ok((self.default.clone(), label, path_and_query.to_string()))
     }
 }
 
@@ -399,7 +400,7 @@ async fn forward(
     let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let (target, label, forward_path) = {
         let table = state.routing.read().unwrap();
-        table.target_and_label_for(path_and_query, &body_bytes)
+        table.target_and_label_for(path_and_query, &body_bytes)?
     };
 
     let url = format!("{}{}", target.base_url.trim_end_matches('/'), forward_path);
@@ -1107,8 +1108,8 @@ mod tests {
             .unwrap();
         assert!(resp.status().is_success());
 
-        // An unregistered provider path falls through to the default target
-        // with the path untouched, which the echo server rejects.
+        // An unregistered provider path is refused outright rather than
+        // forwarded to the default target with the caller's credentials.
         let resp = client
             .post(format!(
                 "{}/providers/unknown/v1/usage",
@@ -1118,7 +1119,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(!resp.status().is_success());
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
         server.shutdown().await;
     }
