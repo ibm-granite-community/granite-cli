@@ -620,11 +620,9 @@ impl OpenCodeLauncher {
                         // Block comment: skip to */
                         chars.next(); // consume '*'
                         while let Some(ch) = chars.next() {
-                            if ch == '*' {
-                                if chars.peek() == Some(&'/') {
-                                    chars.next();
-                                    break;
-                                }
+                            if ch == '*' && chars.peek() == Some(&'/') {
+                                chars.next();
+                                break;
                             }
                         }
                         continue;
@@ -638,7 +636,9 @@ impl OpenCodeLauncher {
 
     /// Extracts the `provider` object from a parsed OpenCode config. Returns
     /// `None` if the config has no provider key or it's not an object.
-    fn extract_providers(config: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    fn extract_providers(
+        config: &serde_json::Value,
+    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
         config.get("provider").and_then(|v| v.as_object())
     }
 
@@ -647,7 +647,9 @@ impl OpenCodeLauncher {
     /// (global) and `{working_dir}/opencode.json` (project), extracts
     /// `provider` entries, and returns the merged provider map (project
     /// overrides global for conflicting keys).
-    fn discover_user_providers(ctx: &LaunchContext) -> Option<serde_json::Map<String, serde_json::Value>> {
+    fn discover_user_providers(
+        ctx: &LaunchContext,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
         let mut providers = serde_json::Map::new();
 
         // Load global config (~/.config/opencode/opencode.json)
@@ -678,18 +680,16 @@ impl OpenCodeLauncher {
         }
     }
 
-    /// Returns the path to OpenCode's global config file.
+    /// Returns the path to OpenCode's global config file:
+    /// `$XDG_CONFIG_HOME/opencode/opencode.json`, falling back to
+    /// `~/.config/opencode/opencode.json`.
     fn global_opencode_config_path() -> Option<PathBuf> {
-        let home = std::env::var("XDG_CONFIG_HOME").ok().or_else(|| {
-            std::env::var("HOME").ok()
-        });
-        let path = match home.as_deref() {
-            Some(xdg) if !xdg.is_empty() => format!("{xdg}/opencode/opencode.json"),
-            _ => format!("/.config/opencode/opencode.json"),
-        };
-        let path = format!("%s{}", path.trim_start_matches('/'));
-        let home_path = home.map(|h| format!("{h}{path}"));
-        home_path.map(PathBuf::from)
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+            && !xdg.is_empty()
+        {
+            return Some(PathBuf::from(xdg).join("opencode").join("opencode.json"));
+        }
+        dirs::home_dir().map(|home| home.join(".config").join("opencode").join("opencode.json"))
     }
 
     /// Loads OpenCode's global config file and returns parsed JSON, or None.
@@ -699,29 +699,23 @@ impl OpenCodeLauncher {
     }
 
     /// Registers discovered user providers on the session proxy so the proxy
-    /// can route and track traffic for them. For each provider with a
-    /// `baseURL`, registers the provider with its known model names and a
-    /// prefix-based fallback route. The prefix is derived from the base URL
-    /// (e.g. "api.openai.com" -> "gpt" prefix, "api.anthropic.com" -> "claude"
-    /// prefix) so that unknown model names from this provider still route
-    /// correctly. Also sets the proxy's default target to the first discovered
-    /// provider if no other default is set.
+    /// can route and track traffic for them. Each provider with a `baseURL`
+    /// is registered under the proxy's `/providers/{name}` path prefix; the
+    /// generated config points the provider's `baseURL` at that prefix (see
+    /// `merge_user_providers_into_config`), so the proxy knows the upstream
+    /// from the URL alone and any model the provider serves routes and
+    /// tracks correctly without granite-cli knowing its name.
     fn register_user_providers_on_proxy(
         &self,
         proxy_handle: &ProxyHandle,
         user_providers: &serde_json::Map<String, serde_json::Value>,
     ) {
         for (provider_name, provider_entry) in user_providers {
-            let Some(options) = provider_entry
-                .get("options")
-                .and_then(|o| o.as_object())
-            else {
+            let Some(options) = provider_entry.get("options").and_then(|o| o.as_object()) else {
                 continue;
             };
 
-            let Some(base_url) = options.get("baseURL")
-                .and_then(|b| b.as_str())
-            else {
+            let Some(base_url) = options.get("baseURL").and_then(|b| b.as_str()) else {
                 continue;
             };
 
@@ -730,25 +724,10 @@ impl OpenCodeLauncher {
                 continue;
             }
 
-            // Compute a model-name prefix from the base URL for fallback routing
-            let prefix = model_prefix_from_url(base_url);
-
-            // Extract model names from the provider's models map
-            let model_names: Vec<String> = provider_entry
-                .get("models")
-                .and_then(|m| m.as_object())
-                .map(|models| {
-                    models.keys().cloned().collect()
-                })
-                .unwrap_or_default();
-
-            let label = format!("user-provider-{}", provider_name);
-            if let Err(e) = proxy_handle.register_provider(
-                &prefix,
-                base_url.to_string(),
-                model_names,
-                label,
-            ) {
+            let label = format!("user-provider-{provider_name}");
+            if let Err(e) =
+                proxy_handle.register_provider(provider_name, base_url.to_string(), label)
+            {
                 alog_channel!(
                     MessageLevel::Debug3,
                     "failed to register provider '{}' on proxy: {}",
@@ -829,7 +808,9 @@ impl OpenCodeLauncher {
             let mut options = serde_json::Map::new();
             options.insert(
                 "baseURL".to_string(),
-                serde_json::Value::String("https://generativelanguage.googleapis.com/v1beta".to_string()),
+                serde_json::Value::String(
+                    "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                ),
             );
             options.insert(
                 "apiKey".to_string(),
@@ -947,6 +928,20 @@ impl OpenCodeLauncher {
     /// Granite-cli provider entries (built from bindings) take precedence: if a
     /// user also has a provider with the same name, our granite-cli entry
     /// wins (since it's added to the map after the user entries).
+    /// The proxy URL a discovered provider's `baseURL` is rewritten to:
+    /// the session proxy's `/providers/{name}` path prefix, from which the
+    /// proxy resolves the real upstream registered in
+    /// `register_user_providers_on_proxy`.
+    fn provider_proxy_url(&self, provider_name: &str) -> Option<String> {
+        self.model_proxy.as_ref().map(|handle| {
+            format!(
+                "{}/providers/{}",
+                handle.local_base_url.trim_end_matches('/'),
+                provider_name
+            )
+        })
+    }
+
     fn merge_user_providers_into_config(
         &self,
         user_providers: &serde_json::Map<String, serde_json::Value>,
@@ -959,22 +954,15 @@ impl OpenCodeLauncher {
         for (name, entry) in user_providers {
             if let Some(entry_value) = entry.as_object() {
                 let mut proxied = entry_value.clone();
-                if let Some(options) = proxied.get_mut("options") {
-                    if let Some(options_obj) = options.as_object_mut() {
-                        if let Some(real_url) = options_obj.get("baseURL").and_then(|b| b.as_str()) {
-                            // Only redirect if it's a real external URL (not already proxy)
-                            if !real_url.contains("127.0.0.1") && !real_url.contains("localhost") {
-                                options_obj.insert(
-                                    "baseURL".to_string(),
-                                    serde_json::Value::String(
-                                        self.model_proxy.as_ref()
-                                            .map(|h| h.local_base_url.clone())
-                                            .unwrap_or_else(|| real_url.to_string()),
-                                    ),
-                                );
-                            }
-                        }
-                    }
+                if let Some(options_obj) = proxied
+                    .get_mut("options")
+                    .and_then(|options| options.as_object_mut())
+                    && let Some(real_url) = options_obj.get("baseURL").and_then(|b| b.as_str())
+                    && !real_url.contains("127.0.0.1")
+                    && !real_url.contains("localhost")
+                    && let Some(proxy_url) = self.provider_proxy_url(name)
+                {
+                    options_obj.insert("baseURL".to_string(), serde_json::Value::String(proxy_url));
                 }
                 merged.insert(name.clone(), serde_json::Value::Object(proxied));
             }
@@ -984,22 +972,12 @@ impl OpenCodeLauncher {
         for (name, entry) in env_providers {
             if let Some(entry_value) = entry.as_object() {
                 let mut proxied = entry_value.clone();
-                if let Some(options) = proxied.get_mut("options") {
-                    if let Some(options_obj) = options.as_object_mut() {
-                        let proxy_url = self.model_proxy
-                            .as_ref()
-                            .map(|h| h.local_base_url.clone())
-                            .unwrap_or_else(|| {
-                                options_obj.get("baseURL")
-                                    .and_then(|b| b.as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string()
-                            });
-                        options_obj.insert(
-                            "baseURL".to_string(),
-                            serde_json::Value::String(proxy_url),
-                        );
-                    }
+                if let Some(options_obj) = proxied
+                    .get_mut("options")
+                    .and_then(|options| options.as_object_mut())
+                    && let Some(proxy_url) = self.provider_proxy_url(name)
+                {
+                    options_obj.insert("baseURL".to_string(), serde_json::Value::String(proxy_url));
                 }
                 merged.insert(name.clone(), serde_json::Value::Object(proxied));
             }
@@ -1011,36 +989,6 @@ impl OpenCodeLauncher {
         }
 
         merged
-    }
-}
-
-/// Derives a model-name prefix from a provider's base URL for use in proxy
-/// prefix-based fallback routing. The prefix is the shortest recognizable
-/// substring that uniquely identifies the provider's models, e.g. "gpt" for
-/// OpenAI, "claude" for Anthropic. This allows the proxy to route unknown
-/// model names (e.g. "gpt-4o-turbo") to the correct provider even when the
-/// exact model name wasn't registered in the user's config.
-fn model_prefix_from_url(base_url: &str) -> String {
-    let url = base_url.to_lowercase();
-    if url.contains("openai") || url.contains("api.openai.com") {
-        "gpt".to_string()
-    } else if url.contains("anthropic") || url.contains("api.anthropic.com") {
-        "claude".to_string()
-    } else if url.contains("google") || url.contains("generativelanguage") {
-        "gemini".to_string()
-    } else if url.contains("groq") {
-        "llama".to_string() // Groq commonly hosts Llama models
-    } else if url.contains("openrouter") {
-        "gpt".to_string() // OpenRouter hosts many models; default to gpt prefix
-    } else if url.contains("cohere") {
-        "command".to_string() // Cohere's models start with "command"
-    } else if url.contains("mistral") {
-        "mistral".to_string()
-    } else {
-        // Default: use a common model prefix or the hostname itself
-        url.split('/').find(|s| !s.is_empty() && !s.contains('.') && s.len() <= 20)
-            .unwrap_or("model")
-            .to_string()
     }
 }
 
@@ -1910,10 +1858,7 @@ mod tests {
         let server = crate::proxy::ProxyServer::start().unwrap();
         let mut l = launcher(serde_json::json!({}));
         l.model_proxy = Some(server.handle.clone());
-        assert_eq!(
-            l.proxy_base_url(&b),
-            server.handle.local_base_url
-        );
+        assert_eq!(l.proxy_base_url(&b), server.handle.local_base_url);
         server.shutdown().await;
     }
 
@@ -1955,8 +1900,7 @@ mod tests {
         let ui = CaptureUi::default();
         l.launch(&[], &ctx(true), &ui).await.unwrap();
 
-        let infos = ui.infos.borrow();
-        let dump = infos.join("\n");
+        let dump = ui.infos.borrow().join("\n");
         assert!(dump.contains(&server.handle.local_base_url), "{dump}");
         server.shutdown().await;
     }
@@ -2009,16 +1953,22 @@ mod tests {
 
     #[test]
     fn resolve_env_vars_resolves_string_placeholders() {
-        unsafe { std::env::set_var("TEST_VAR_123", "resolved_value"); }
+        unsafe {
+            std::env::set_var("TEST_VAR_123", "resolved_value");
+        }
         let input = serde_json::json!({ "url": "{env:TEST_VAR_123}" });
         let result = OpenCodeLauncher::resolve_env_vars(&input);
         assert_eq!(result["url"], "resolved_value");
-        unsafe { std::env::remove_var("TEST_VAR_123"); }
+        unsafe {
+            std::env::remove_var("TEST_VAR_123");
+        }
     }
 
     #[test]
     fn resolve_env_vars_uses_empty_string_for_unset_vars() {
-        unsafe { std::env::remove_var("NONEXISTENT_VAR_XYZ"); }
+        unsafe {
+            std::env::remove_var("NONEXISTENT_VAR_XYZ");
+        }
         let input = serde_json::json!({ "url": "{env:NONEXISTENT_VAR_XYZ}" });
         let result = OpenCodeLauncher::resolve_env_vars(&input);
         assert_eq!(result["url"], "");
@@ -2033,7 +1983,9 @@ mod tests {
 
     #[test]
     fn resolve_env_vars_recurses_into_objects() {
-        unsafe { std::env::set_var("TEST_URL_456", "https://resolved.com/v1"); }
+        unsafe {
+            std::env::set_var("TEST_URL_456", "https://resolved.com/v1");
+        }
         let input = serde_json::json!({
             "provider": {
                 "options": {
@@ -2042,8 +1994,13 @@ mod tests {
             }
         });
         let result = OpenCodeLauncher::resolve_env_vars(&input);
-        assert_eq!(result["provider"]["options"]["baseURL"], "https://resolved.com/v1");
-        unsafe { std::env::remove_var("TEST_URL_456"); }
+        assert_eq!(
+            result["provider"]["options"]["baseURL"],
+            "https://resolved.com/v1"
+        );
+        unsafe {
+            std::env::remove_var("TEST_URL_456");
+        }
     }
 
     #[test]
@@ -2067,7 +2024,9 @@ mod tests {
         ];
         // Clear the env vars
         for (key, _) in &saved {
-            unsafe { std::env::remove_var(key); }
+            unsafe {
+                std::env::remove_var(key);
+            }
         }
 
         let providers = OpenCodeLauncher::discover_env_providers();
@@ -2087,7 +2046,9 @@ mod tests {
         // Restore original values
         for (key, orig) in &saved {
             if let Some(val) = orig {
-                unsafe { std::env::set_var(key, val); }
+                unsafe {
+                    std::env::set_var(key, val);
+                }
             }
         }
     }
@@ -2104,6 +2065,66 @@ mod tests {
     fn extract_providers_returns_none_for_non_object_provider() {
         let config = serde_json::json!({ "provider": "invalid" });
         assert!(OpenCodeLauncher::extract_providers(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn merge_user_providers_rewrites_base_urls_to_provider_paths() {
+        let server = crate::proxy::ProxyServer::start().unwrap();
+        let mut l = launcher(serde_json::json!({}));
+        l.model_proxy = Some(server.handle.clone());
+
+        let user: serde_json::Map<String, serde_json::Value> = serde_json::json!({
+            "openrouter": {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": { "baseURL": "https://openrouter.ai/api/v1" }
+            },
+            "local-vllm": {
+                "options": { "baseURL": "http://localhost:8000/v1" }
+            },
+            "my-ollama": {
+                "options": { "baseURL": "https://should-be.overridden" }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let env: serde_json::Map<String, serde_json::Value> = serde_json::json!({
+            "anthropic": {
+                "options": { "baseURL": "https://api.anthropic.com" }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let granite: serde_json::Map<String, serde_json::Value> = serde_json::json!({
+            "my-ollama": { "options": { "baseURL": "granite-entry" } }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let merged = l.merge_user_providers_into_config(&user, &env, &granite);
+
+        let proxy = server
+            .handle
+            .local_base_url
+            .trim_end_matches('/')
+            .to_string();
+        assert_eq!(
+            merged["openrouter"]["options"]["baseURL"],
+            format!("{proxy}/providers/openrouter")
+        );
+        assert_eq!(
+            merged["anthropic"]["options"]["baseURL"],
+            format!("{proxy}/providers/anthropic")
+        );
+        assert_eq!(
+            merged["local-vllm"]["options"]["baseURL"],
+            "http://localhost:8000/v1"
+        );
+        assert_eq!(merged["my-ollama"]["options"]["baseURL"], "granite-entry");
+
+        server.shutdown().await;
     }
 
     #[test]
