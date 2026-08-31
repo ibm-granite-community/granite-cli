@@ -100,8 +100,40 @@ impl ProxyHandle {
         Ok(())
     }
 
+    /// Registers a provider with its known model names and a prefix-based
+    /// fallback route. When a request's `"model"` field doesn't match any
+    /// exact route, the proxy checks if the model name starts with the
+    /// provider's prefix (e.g. "gpt" for OpenAI, "claude" for Anthropic) and
+    /// routes to this provider's target. This ensures traffic for unknown
+    /// models from a known provider still reaches the right upstream and gets
+    /// tracked. Works whether the proxy is already serving traffic or not.
+    pub fn register_provider(
+        &self,
+        provider_name: &str,
+        base_url: String,
+        models: Vec<String>,
+        label: String,
+    ) -> anyhow::Result<()> {
+        let resolved = ResolvedTarget::build(UpstreamTarget {
+            base_url,
+            verify_ssl: true,
+            auth: UpstreamAuth::Passthrough,
+        })?;
+        let mut table = self.state.routing.write().unwrap();
+        // Register known models as exact routes
+        for model in &models {
+            table.routes.insert(model.clone(), resolved.clone());
+            table.labels.insert(model.clone(), label.clone());
+        }
+        // Register the provider prefix for fallback matching
+        table
+            .provider_prefixes
+            .push((provider_name.to_string(), resolved, label));
+        Ok(())
+    }
+
     /// Sets (or replaces) the fallback target used for requests whose
-    /// `"model"` field doesn't match any registered route.
+    /// `"model"` field doesn't match any registered route or provider prefix.
     pub fn set_default(&self, target: UpstreamTarget, label: String) -> anyhow::Result<()> {
         let resolved = ResolvedTarget::build(target)?;
         let mut table = self.state.routing.write().unwrap();
@@ -175,6 +207,7 @@ impl ProxyServer {
             default_label: "default".to_string(),
             routes: HashMap::new(),
             labels: HashMap::new(),
+            provider_prefixes: Vec::new(),
         }));
         let tracker = Arc::new(UsageTracker::new());
         let state = ProxyState { routing, tracker };
@@ -237,6 +270,11 @@ struct RoutingTable {
     default_label: String,
     routes: HashMap<String, ResolvedTarget>,
     labels: HashMap<String, String>,
+    /// Provider prefixes for fallback routing: when a request's model doesn't
+    /// match any exact route, check if it starts with a registered provider's
+    /// prefix (e.g. "gpt" matches OpenAI, "claude" matches Anthropic). The
+    /// first matching provider in insertion order is used.
+    provider_prefixes: Vec<(String, ResolvedTarget, String)>,
 }
 
 impl RoutingTable {
@@ -266,6 +304,16 @@ impl RoutingTable {
                 .cloned()
                 .unwrap_or_else(|| model.clone());
             return (target.clone(), label);
+        }
+        // No exact model match — check provider prefixes as fallback.
+        // E.g. "gpt-4o" matches the "gpt" prefix for OpenAI providers,
+        // "claude-sonnet-4-5" matches "claude" for Anthropic, etc.
+        if let Some(model) = &model {
+            for (prefix, target, label) in &self.provider_prefixes {
+                if model.starts_with(prefix) {
+                    return (target.clone(), label.clone());
+                }
+            }
         }
         let label = model.unwrap_or_else(|| self.default_label.clone());
         (self.default.clone(), label)
@@ -1004,5 +1052,160 @@ mod tests {
         assert_eq!(chat.requests, 1);
         assert_eq!(chat.input_tokens, 5);
         assert_eq!(chat.output_tokens, 9);
+    }
+
+    #[tokio::test]
+    async fn register_provider_registers_known_models_and_prefix_fallback() {
+        let provider_addr = spawn_echo_server().await;
+        let default_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+
+        // Register a provider with known models and prefix fallback using "gpt" prefix
+        server
+            .handle
+            .register_provider(
+                "gpt",
+                format!("http://{provider_addr}"),
+                vec!["gpt-4o".to_string(), "o1".to_string()],
+                "openai".to_string(),
+            )
+            .unwrap();
+
+        // Known model routes to the provider
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "gpt-4o" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // Unknown model with matching prefix routes to the provider
+        let resp = client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "gpt-4o-mini" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // Model without matching prefix falls through to default
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+
+        let resp = client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "claude-sonnet" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        let snapshot = server.handle.tracker().snapshot();
+        assert!(snapshot.get("gpt-4o").is_some() || snapshot.get("openai").is_some());
+        assert!(snapshot.get("gpt-4o-mini").is_some() || snapshot.get("openai").is_some());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_prefix_first_match_wins() {
+        let addr1 = spawn_echo_server().await;
+        let addr2 = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+
+        // Register two providers with model-name prefixes: "gpt" matches OpenAI, "gemini" matches Google
+        server
+            .handle
+            .register_provider(
+                "gpt",
+                format!("http://{addr1}"),
+                vec!["gpt-4o".to_string()],
+                "openai".to_string(),
+            )
+            .unwrap();
+        server
+            .handle
+            .register_provider(
+                "gemini",
+                format!("http://{addr2}"),
+                vec!["gemini-pro".to_string()],
+                "google".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+
+        // "gpt-4o" matches openai's known model
+        let resp = client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "gpt-4o" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // "gpt-4" matches openai's prefix
+        let resp = client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "gpt-4" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // "gemini-pro" matches google's known model
+        let resp = client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "gemini-pro" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn proxy_prefix_routing_records_usage_for_fallback_matched_models() {
+        let provider_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+
+        server
+            .handle
+            .register_provider(
+                "gpt",
+                format!("http://{provider_addr}"),
+                vec!["gpt-4o".to_string()],
+                "openai".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+
+        // Send a request for an unknown model that matches the prefix
+        client
+            .post(format!("{}/v1/usage", server.handle.local_base_url))
+            .json(&serde_json::json!({ "model": "gpt-4o-turbo" }))
+            .send()
+            .await
+            .unwrap();
+
+        let snapshot = server.handle.tracker().snapshot();
+        // Should be tracked under the provider label
+        let openai_stats = snapshot.get("openai");
+        assert!(
+            openai_stats.is_some(),
+            "expected 'openai' in snapshot: {:?}",
+            snapshot
+        );
+
+        server.shutdown().await;
     }
 }

@@ -3,10 +3,12 @@
 //! Unlike `pi`, OpenCode's config sources are additive: `OPENCODE_CONFIG`
 //! points at one extra file that gets merged into the chain (loaded after the
 //! global config, before the project config) rather than a whole directory to
-//! redirect wholesale. So this launcher never touches the user's own
-//! `opencode.json`, credentials, or session store -- it only ever writes its
-//! own small generated file under `GRANITE_CLI_HOME` and points
-//! `OPENCODE_CONFIG` at it.
+//! redirect wholesale. This launcher reads the user's global and project
+//! `opencode.json` configs to discover configured providers, registers them on
+//! the session proxy for usage tracking, then writes its own small generated
+//! file under `GRANITE_CLI_HOME` and points `OPENCODE_CONFIG` at it. The
+//! generated config includes granite-cli providers plus any user providers
+//! merged in with their `baseURL` redirected to the proxy.
 
 // Standard
 use std::collections::HashSet;
@@ -26,6 +28,7 @@ use crate::capabilities::{
 use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
 use crate::launchers::shared::mcp_cli::mcp_binding_request;
 use crate::providers::ApiType;
+use crate::proxy::ProxyHandle;
 use crate::registry::ConfigConstructable;
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
@@ -67,6 +70,11 @@ pub struct OpenCodeLauncher {
     /// its own `provider.<name>` entry and is referenced directly as
     /// `<provider>/<model>` in `agent.<name>.model` -- no mini-router needed.
     bound_sub_agents: Vec<(String, SubAgentBinding)>,
+    /// The session-scoped model proxy, if one was booted for this launch
+    /// (see `run_launch`) -- present whenever usage tracking or sub-agent
+    /// routing is needed. Used to redirect provider baseURLs so all traffic
+    /// flows through the proxy for usage accounting.
+    model_proxy: Option<ProxyHandle>,
 }
 
 impl ConfigConstructable for OpenCodeLauncher {
@@ -75,7 +83,7 @@ impl ConfigConstructable for OpenCodeLauncher {
     fn new(
         instance_id: &str,
         cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
+        global_config: &crate::config::Config,
     ) -> Self {
         let config: OpenCodeLauncherConfig =
             serde_json::from_value(cfg.clone()).unwrap_or_default();
@@ -85,6 +93,7 @@ impl ConfigConstructable for OpenCodeLauncher {
             bound_agent_model: None,
             bound_mcp_bindings: vec![],
             bound_sub_agents: vec![],
+            model_proxy: global_config.model_proxy.clone(),
         }
     }
 }
@@ -248,6 +257,14 @@ impl Launcher for OpenCodeLauncher {
     /// injecting it ahead of an arbitrary subcommand (e.g. `models`,
     /// `agent`) would either be rejected or silently misparsed. The config
     /// key is documented to apply uniformly across all of those surfaces.
+    ///
+    /// When usage tracking is active (proxy is running), discovers all
+    /// providers the user has configured in their global and project
+    /// `opencode.json` files and any env-based providers, registers them on
+    /// the proxy, and merges them into the generated config with their
+    /// `baseURL` redirected to the proxy. This ensures all model calls
+    /// (granite-cli managed and user-configured) flow through the proxy for
+    /// usage accounting.
     async fn launch(
         &self,
         args: &[String],
@@ -258,16 +275,43 @@ impl Launcher for OpenCodeLauncher {
             || !self.bound_mcp_bindings.is_empty()
             || !self.bound_sub_agents.is_empty()
         {
-            let mut providers = serde_json::Map::new();
+            // Build granite-cli provider entries
+            let mut granite_providers = serde_json::Map::new();
             for (index, (binding, model_names)) in self.provider_groups().iter().enumerate() {
                 let entry =
                     self.provider_entry(binding, model_names, &provider_api_key_env(index))?;
-                providers.insert(binding.provider_name.clone(), entry);
+                granite_providers.insert(binding.provider_name.clone(), entry);
             }
+
+            // Discover and register user providers for usage tracking
+            if let Some(proxy_handle) = &self.model_proxy {
+                // Discover user's configured providers from their config files
+                if let Some(user_providers) = Self::discover_user_providers(ctx) {
+                    // Register on proxy so the proxy can route and track them
+                    self.register_user_providers_on_proxy(proxy_handle, &user_providers);
+                    granite_providers = self.merge_user_providers_into_config(
+                        &user_providers,
+                        &Self::discover_env_providers(),
+                        &granite_providers,
+                    );
+                } else {
+                    // No user config providers — discover env-based ones
+                    let env_providers = Self::discover_env_providers();
+                    if !env_providers.is_empty() {
+                        self.register_user_providers_on_proxy(proxy_handle, &env_providers);
+                        granite_providers = self.merge_user_providers_into_config(
+                            &serde_json::Map::new(),
+                            &env_providers,
+                            &granite_providers,
+                        );
+                    }
+                }
+            }
+
             let agent = self.build_agent_config(ui);
             let config = generate_config(
                 self.bound_agent_model.as_ref(),
-                providers,
+                granite_providers,
                 agent,
                 &self.bound_mcp_bindings,
             );
@@ -333,13 +377,21 @@ impl OpenCodeLauncher {
     /// single provider instance may back both the main model and one or more
     /// sub-agents' models, all of which must land in the same generated
     /// `provider.<name>` entry rather than clobbering each other.
+    ///
+    /// When a session proxy is active (usage tracking or sub-agent routing
+    /// enabled), the provider's `baseURL` is overridden to point at the proxy
+    /// so all traffic flows through it for usage accounting. The proxy
+    /// dispatches based on the `"model"` field in each request body, which
+    /// means the provider name is irrelevant for routing -- only the model
+    /// name matters.
     fn provider_entry(
         &self,
         binding: &AgentModelBinding,
         model_names: &[&str],
         api_key_env: &str,
     ) -> anyhow::Result<serde_json::Value> {
-        let mut options = serde_json::json!({ "baseURL": opencode_base_url(binding) });
+        let base_url = self.proxy_base_url(binding);
+        let mut options = serde_json::json!({ "baseURL": base_url });
         if binding
             .api_key
             .as_ref()
@@ -474,6 +526,521 @@ impl OpenCodeLauncher {
                 (mapped_name, entry)
             })
             .collect()
+    }
+
+    /// Returns the baseURL to use for OpenCode provider entries. When a
+    /// session proxy is active (usage tracking enabled), returns the proxy's
+    /// local URL so all traffic flows through it for accounting -- the proxy
+    /// dispatches by the `"model"` field in each request body. Otherwise
+    /// delegates to `opencode_base_url` to compute the provider's real URL.
+    fn proxy_base_url(&self, binding: &AgentModelBinding) -> String {
+        match &self.model_proxy {
+            Some(handle) => handle.local_base_url.clone(),
+            None => opencode_base_url(binding),
+        }
+    }
+
+    /// Resolves `{env:VAR_NAME}` placeholders in a JSON value with the current
+    /// process environment. Leaves unknown variables as empty strings (matching
+    /// OpenCode's own behavior). Recurses into objects and arrays.
+    fn resolve_env_vars(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(s) => {
+                if s.starts_with("{env:") && s.ends_with('}') {
+                    let var_name = &s[5..s.len() - 1];
+                    serde_json::Value::String(std::env::var(var_name).unwrap_or_default())
+                } else {
+                    value.clone()
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let resolved: serde_json::Map<_, _> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Self::resolve_env_vars(v)))
+                    .collect();
+                serde_json::Value::Object(resolved)
+            }
+            serde_json::Value::Array(arr) => {
+                let resolved: Vec<_> = arr.iter().map(Self::resolve_env_vars).collect();
+                serde_json::Value::Array(resolved)
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Loads and parses a user's OpenCode config file (JSON or JSONC).
+    /// Strips `//` and `/* ... */` comments before parsing. Returns `None` if
+    /// the file doesn't exist or can't be parsed.
+    fn load_user_config(path: &Path) -> Option<serde_json::Value> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let content = Self::strip_jsonc_comments(&content);
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Strip JSONC comments from `content`, respecting string literals (doesn't
+    /// strip `//` or `/*` inside quoted strings).
+    fn strip_jsonc_comments(content: &str) -> String {
+        let mut result = String::with_capacity(content.len());
+        let mut chars = content.chars().peekable();
+        let mut in_string = false;
+        let mut escape = false;
+
+        while let Some(c) = chars.next() {
+            if escape {
+                result.push(c);
+                escape = false;
+                continue;
+            }
+            if c == '\\' && in_string {
+                result.push(c);
+                escape = true;
+                continue;
+            }
+            if c == '"' {
+                in_string = !in_string;
+                result.push(c);
+                continue;
+            }
+            if in_string {
+                result.push(c);
+                continue;
+            }
+            if c == '/' {
+                if let Some(&next) = chars.peek() {
+                    if next == '/' {
+                        // Line comment: skip to end of line
+                        while let Some(&ch) = chars.peek() {
+                            if ch == '\n' {
+                                break;
+                            }
+                            chars.next();
+                        }
+                        continue;
+                    } else if next == '*' {
+                        // Block comment: skip to */
+                        chars.next(); // consume '*'
+                        while let Some(ch) = chars.next() {
+                            if ch == '*' {
+                                if chars.peek() == Some(&'/') {
+                                    chars.next();
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            result.push(c);
+        }
+        result
+    }
+
+    /// Extracts the `provider` object from a parsed OpenCode config. Returns
+    /// `None` if the config has no provider key or it's not an object.
+    fn extract_providers(config: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        config.get("provider").and_then(|v| v.as_object())
+    }
+
+    /// Discovers all providers the user has configured in their global and
+    /// project OpenCode configs. Reads `~/.config/opencode/opencode.json`
+    /// (global) and `{working_dir}/opencode.json` (project), extracts
+    /// `provider` entries, and returns the merged provider map (project
+    /// overrides global for conflicting keys).
+    fn discover_user_providers(ctx: &LaunchContext) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let mut providers = serde_json::Map::new();
+
+        // Load global config (~/.config/opencode/opencode.json)
+        if let Some(global_config) = Self::load_global_opencode_config() {
+            let resolved = Self::resolve_env_vars(&global_config);
+            if let Some(global_providers) = Self::extract_providers(&resolved) {
+                for (key, value) in global_providers {
+                    providers.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        // Load project config (overwrites global for conflicting keys)
+        let project_path = ctx.working_dir.join("opencode.json");
+        if let Some(project_config) = Self::load_user_config(&project_path) {
+            let resolved = Self::resolve_env_vars(&project_config);
+            if let Some(project_providers) = Self::extract_providers(&resolved) {
+                for (key, value) in project_providers {
+                    providers.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        if providers.is_empty() {
+            None
+        } else {
+            Some(providers)
+        }
+    }
+
+    /// Returns the path to OpenCode's global config file.
+    fn global_opencode_config_path() -> Option<PathBuf> {
+        let home = std::env::var("XDG_CONFIG_HOME").ok().or_else(|| {
+            std::env::var("HOME").ok()
+        });
+        let path = match home.as_deref() {
+            Some(xdg) if !xdg.is_empty() => format!("{xdg}/opencode/opencode.json"),
+            _ => format!("/.config/opencode/opencode.json"),
+        };
+        let path = format!("%s{}", path.trim_start_matches('/'));
+        let home_path = home.map(|h| format!("{h}{path}"));
+        home_path.map(PathBuf::from)
+    }
+
+    /// Loads OpenCode's global config file and returns parsed JSON, or None.
+    fn load_global_opencode_config() -> Option<serde_json::Value> {
+        let path = Self::global_opencode_config_path()?;
+        Self::load_user_config(&path)
+    }
+
+    /// Registers discovered user providers on the session proxy so the proxy
+    /// can route and track traffic for them. For each provider with a
+    /// `baseURL`, registers the provider with its known model names and a
+    /// prefix-based fallback route. The prefix is derived from the base URL
+    /// (e.g. "api.openai.com" -> "gpt" prefix, "api.anthropic.com" -> "claude"
+    /// prefix) so that unknown model names from this provider still route
+    /// correctly. Also sets the proxy's default target to the first discovered
+    /// provider if no other default is set.
+    fn register_user_providers_on_proxy(
+        &self,
+        proxy_handle: &ProxyHandle,
+        user_providers: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        for (provider_name, provider_entry) in user_providers {
+            let Some(options) = provider_entry
+                .get("options")
+                .and_then(|o| o.as_object())
+            else {
+                continue;
+            };
+
+            let Some(base_url) = options.get("baseURL")
+                .and_then(|b| b.as_str())
+            else {
+                continue;
+            };
+
+            // Skip if baseURL already points at the proxy
+            if base_url.contains("127.0.0.1") || base_url.contains("localhost") {
+                continue;
+            }
+
+            // Compute a model-name prefix from the base URL for fallback routing
+            let prefix = model_prefix_from_url(base_url);
+
+            // Extract model names from the provider's models map
+            let model_names: Vec<String> = provider_entry
+                .get("models")
+                .and_then(|m| m.as_object())
+                .map(|models| {
+                    models.keys().cloned().collect()
+                })
+                .unwrap_or_default();
+
+            let label = format!("user-provider-{}", provider_name);
+            if let Err(e) = proxy_handle.register_provider(
+                &prefix,
+                base_url.to_string(),
+                model_names,
+                label,
+            ) {
+                alog_channel!(
+                    MessageLevel::Debug3,
+                    "failed to register provider '{}' on proxy: {}",
+                    provider_name,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Discovers env-based providers by checking for known API key environment
+    /// variables. Returns a map of provider name -> provider entry pointing at
+    /// the well-known base URL for each provider. These are providers that
+    /// OpenCode auto-loads when the corresponding env var is set, but don't
+    /// appear explicitly in the user's config files.
+    fn discover_env_providers() -> serde_json::Map<String, serde_json::Value> {
+        let mut providers = serde_json::Map::new();
+
+        // OpenAI
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "npm".to_string(),
+                serde_json::Value::String("@openai/openai".to_string()),
+            );
+            entry.insert(
+                "name".to_string(),
+                serde_json::Value::String("openai".to_string()),
+            );
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "baseURL".to_string(),
+                serde_json::Value::String("https://api.openai.com/v1".to_string()),
+            );
+            options.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String("{env:OPENAI_API_KEY}".to_string()),
+            );
+            entry.insert("options".to_string(), serde_json::Value::Object(options));
+            providers.insert("openai".to_string(), serde_json::Value::Object(entry));
+        }
+
+        // Anthropic
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "npm".to_string(),
+                serde_json::Value::String("@anthropic-ai/anthropic".to_string()),
+            );
+            entry.insert(
+                "name".to_string(),
+                serde_json::Value::String("anthropic".to_string()),
+            );
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "baseURL".to_string(),
+                serde_json::Value::String("https://api.anthropic.com".to_string()),
+            );
+            options.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String("{env:ANTHROPIC_API_KEY}".to_string()),
+            );
+            entry.insert("options".to_string(), serde_json::Value::Object(options));
+            providers.insert("anthropic".to_string(), serde_json::Value::Object(entry));
+        }
+
+        // Google Gemini
+        if std::env::var("GOOGLE_API_KEY").is_ok() {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "npm".to_string(),
+                serde_json::Value::String("@google/generative-ai".to_string()),
+            );
+            entry.insert(
+                "name".to_string(),
+                serde_json::Value::String("google".to_string()),
+            );
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "baseURL".to_string(),
+                serde_json::Value::String("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            );
+            options.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String("{env:GOOGLE_API_KEY}".to_string()),
+            );
+            entry.insert("options".to_string(), serde_json::Value::Object(options));
+            providers.insert("google".to_string(), serde_json::Value::Object(entry));
+        }
+
+        // Groq
+        if std::env::var("GROQ_API_KEY").is_ok() {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "npm".to_string(),
+                serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
+            );
+            entry.insert(
+                "name".to_string(),
+                serde_json::Value::String("groq".to_string()),
+            );
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "baseURL".to_string(),
+                serde_json::Value::String("https://api.groq.com/openai/v1".to_string()),
+            );
+            options.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String("{env:GROQ_API_KEY}".to_string()),
+            );
+            entry.insert("options".to_string(), serde_json::Value::Object(options));
+            providers.insert("groq".to_string(), serde_json::Value::Object(entry));
+        }
+
+        // OpenRouter
+        if std::env::var("OPENROUTER_API_KEY").is_ok() {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "npm".to_string(),
+                serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
+            );
+            entry.insert(
+                "name".to_string(),
+                serde_json::Value::String("openrouter".to_string()),
+            );
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "baseURL".to_string(),
+                serde_json::Value::String("https://openrouter.ai/api/v1".to_string()),
+            );
+            options.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String("{env:OPENROUTER_API_KEY}".to_string()),
+            );
+            entry.insert("options".to_string(), serde_json::Value::Object(options));
+            providers.insert("openrouter".to_string(), serde_json::Value::Object(entry));
+        }
+
+        // Cohere
+        if std::env::var("CO_API_KEY").is_ok() {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "npm".to_string(),
+                serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
+            );
+            entry.insert(
+                "name".to_string(),
+                serde_json::Value::String("cohere".to_string()),
+            );
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "baseURL".to_string(),
+                serde_json::Value::String("https://api.cohere.com/v1".to_string()),
+            );
+            options.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String("{env:CO_API_KEY}".to_string()),
+            );
+            entry.insert("options".to_string(), serde_json::Value::Object(options));
+            providers.insert("cohere".to_string(), serde_json::Value::Object(entry));
+        }
+
+        // Mistral
+        if std::env::var("MISTRAL_API_KEY").is_ok() {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "npm".to_string(),
+                serde_json::Value::String("@ai-sdk/openai-compatible".to_string()),
+            );
+            entry.insert(
+                "name".to_string(),
+                serde_json::Value::String("mistral".to_string()),
+            );
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "baseURL".to_string(),
+                serde_json::Value::String("https://api.mistral.ai/v1".to_string()),
+            );
+            options.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String("{env:MISTRAL_API_KEY}".to_string()),
+            );
+            entry.insert("options".to_string(), serde_json::Value::Object(options));
+            providers.insert("mistral".to_string(), serde_json::Value::Object(entry));
+        }
+
+        providers
+    }
+
+    /// Merges user-discovered and env-based providers into the generated config.
+    /// For each provider, creates a provider entry with `baseURL` pointing at
+    /// the proxy so all traffic flows through it. The proxy knows the real
+    /// upstream URL from `register_user_providers_on_proxy` and forwards
+    /// requests with usage tracking.
+    ///
+    /// Granite-cli provider entries (built from bindings) take precedence: if a
+    /// user also has a provider with the same name, our granite-cli entry
+    /// wins (since it's added to the map after the user entries).
+    fn merge_user_providers_into_config(
+        &self,
+        user_providers: &serde_json::Map<String, serde_json::Value>,
+        env_providers: &serde_json::Map<String, serde_json::Value>,
+        granite_providers: &serde_json::Map<String, serde_json::Value>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut merged = serde_json::Map::new();
+
+        // Add user-discovered providers (redirected to proxy)
+        for (name, entry) in user_providers {
+            if let Some(entry_value) = entry.as_object() {
+                let mut proxied = entry_value.clone();
+                if let Some(options) = proxied.get_mut("options") {
+                    if let Some(options_obj) = options.as_object_mut() {
+                        if let Some(real_url) = options_obj.get("baseURL").and_then(|b| b.as_str()) {
+                            // Only redirect if it's a real external URL (not already proxy)
+                            if !real_url.contains("127.0.0.1") && !real_url.contains("localhost") {
+                                options_obj.insert(
+                                    "baseURL".to_string(),
+                                    serde_json::Value::String(
+                                        self.model_proxy.as_ref()
+                                            .map(|h| h.local_base_url.clone())
+                                            .unwrap_or_else(|| real_url.to_string()),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                merged.insert(name.clone(), serde_json::Value::Object(proxied));
+            }
+        }
+
+        // Add env-based providers (redirected to proxy)
+        for (name, entry) in env_providers {
+            if let Some(entry_value) = entry.as_object() {
+                let mut proxied = entry_value.clone();
+                if let Some(options) = proxied.get_mut("options") {
+                    if let Some(options_obj) = options.as_object_mut() {
+                        let proxy_url = self.model_proxy
+                            .as_ref()
+                            .map(|h| h.local_base_url.clone())
+                            .unwrap_or_else(|| {
+                                options_obj.get("baseURL")
+                                    .and_then(|b| b.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string()
+                            });
+                        options_obj.insert(
+                            "baseURL".to_string(),
+                            serde_json::Value::String(proxy_url),
+                        );
+                    }
+                }
+                merged.insert(name.clone(), serde_json::Value::Object(proxied));
+            }
+        }
+
+        // Add granite-cli providers (overrides user providers with same name)
+        for (name, entry) in granite_providers {
+            merged.insert(name.clone(), entry.clone());
+        }
+
+        merged
+    }
+}
+
+/// Derives a model-name prefix from a provider's base URL for use in proxy
+/// prefix-based fallback routing. The prefix is the shortest recognizable
+/// substring that uniquely identifies the provider's models, e.g. "gpt" for
+/// OpenAI, "claude" for Anthropic. This allows the proxy to route unknown
+/// model names (e.g. "gpt-4o-turbo") to the correct provider even when the
+/// exact model name wasn't registered in the user's config.
+fn model_prefix_from_url(base_url: &str) -> String {
+    let url = base_url.to_lowercase();
+    if url.contains("openai") || url.contains("api.openai.com") {
+        "gpt".to_string()
+    } else if url.contains("anthropic") || url.contains("api.anthropic.com") {
+        "claude".to_string()
+    } else if url.contains("google") || url.contains("generativelanguage") {
+        "gemini".to_string()
+    } else if url.contains("groq") {
+        "llama".to_string() // Groq commonly hosts Llama models
+    } else if url.contains("openrouter") {
+        "gpt".to_string() // OpenRouter hosts many models; default to gpt prefix
+    } else if url.contains("cohere") {
+        "command".to_string() // Cohere's models start with "command"
+    } else if url.contains("mistral") {
+        "mistral".to_string()
+    } else {
+        // Default: use a common model prefix or the hostname itself
+        url.split('/').find(|s| !s.is_empty() && !s.contains('.') && s.len() <= 20)
+            .unwrap_or("model")
+            .to_string()
     }
 }
 
@@ -1333,5 +1900,222 @@ mod tests {
         assert_eq!(l.bound_sub_agents.len(), 1);
         assert_eq!(l.bound_sub_agents[0].0, "reviewer");
         assert_eq!(l.bound_sub_agents[0].1.model.model_name, "granite4.1:8b");
+    }
+
+    // -- proxy base url --------------------------------------------------------
+
+    #[tokio::test]
+    async fn proxy_base_url_returns_proxy_url_when_model_proxy_is_set() {
+        let b = binding();
+        let server = crate::proxy::ProxyServer::start().unwrap();
+        let mut l = launcher(serde_json::json!({}));
+        l.model_proxy = Some(server.handle.clone());
+        assert_eq!(
+            l.proxy_base_url(&b),
+            server.handle.local_base_url
+        );
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn proxy_base_url_returns_regular_url_when_no_model_proxy() {
+        let b = binding();
+        let l = launcher(serde_json::json!({}));
+        assert_eq!(l.proxy_base_url(&b), opencode_base_url(&b));
+    }
+
+    #[tokio::test]
+    async fn provider_entry_uses_proxy_url_when_model_proxy_is_active() {
+        let server = crate::proxy::ProxyServer::start().unwrap();
+        let mut l = launcher(serde_json::json!({}));
+        l.model_proxy = Some(server.handle.clone());
+        let b = binding();
+        let entry = l
+            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .unwrap();
+        assert_eq!(entry["options"]["baseURL"], server.handle.local_base_url);
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn provider_entry_uses_real_url_when_no_model_proxy() {
+        let l = launcher(serde_json::json!({}));
+        let b = binding();
+        let entry = l
+            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .unwrap();
+        assert_eq!(entry["options"]["baseURL"], opencode_base_url(&b));
+    }
+
+    #[tokio::test]
+    async fn dry_run_launch_with_proxy_redirects_base_url() {
+        let server = crate::proxy::ProxyServer::start().unwrap();
+        let mut l = bound(serde_json::json!({ "command_path": "ls" }), binding());
+        l.model_proxy = Some(server.handle.clone());
+        let ui = CaptureUi::default();
+        l.launch(&[], &ctx(true), &ui).await.unwrap();
+
+        let infos = ui.infos.borrow();
+        let dump = infos.join("\n");
+        assert!(dump.contains(&server.handle.local_base_url), "{dump}");
+        server.shutdown().await;
+    }
+
+    // -- JSONC parsing -----------------------------------------------------------
+
+    #[test]
+    fn strip_jsonc_comments_strips_line_comments() {
+        let input = r#"{ "key": "value" // trailing comment }"#;
+        let result = OpenCodeLauncher::strip_jsonc_comments(input);
+        assert!(
+            !result.contains("//"),
+            "line comments should be stripped: {result}"
+        );
+        assert!(result.contains("\"value\""), "value should remain");
+    }
+
+    #[test]
+    fn strip_jsonc_comments_strips_block_comments() {
+        let input = r#"{ "key": "value" /* block comment */ }"#;
+        let result = OpenCodeLauncher::strip_jsonc_comments(input);
+        assert!(
+            !result.contains("/*"),
+            "block comments should be stripped: {result}"
+        );
+        assert!(result.contains("\"value\""));
+    }
+
+    #[test]
+    fn strip_jsonc_comments_preserves_comments_in_strings() {
+        let input = r#"{ "key": "// not a comment" }"#;
+        let result = OpenCodeLauncher::strip_jsonc_comments(input);
+        assert!(result.contains("// not a comment"));
+    }
+
+    #[test]
+    fn strip_jsonc_comments_handles_multiline_block_comments() {
+        let input = r#"{
+            "key": "value" /*
+                multiline
+                comment
+            */
+        }"#;
+        let result = OpenCodeLauncher::strip_jsonc_comments(input);
+        assert!(!result.contains("multiline"));
+        assert!(result.contains("\"value\""));
+    }
+
+    // -- env var resolution ------------------------------------------------------
+
+    #[test]
+    fn resolve_env_vars_resolves_string_placeholders() {
+        unsafe { std::env::set_var("TEST_VAR_123", "resolved_value"); }
+        let input = serde_json::json!({ "url": "{env:TEST_VAR_123}" });
+        let result = OpenCodeLauncher::resolve_env_vars(&input);
+        assert_eq!(result["url"], "resolved_value");
+        unsafe { std::env::remove_var("TEST_VAR_123"); }
+    }
+
+    #[test]
+    fn resolve_env_vars_uses_empty_string_for_unset_vars() {
+        unsafe { std::env::remove_var("NONEXISTENT_VAR_XYZ"); }
+        let input = serde_json::json!({ "url": "{env:NONEXISTENT_VAR_XYZ}" });
+        let result = OpenCodeLauncher::resolve_env_vars(&input);
+        assert_eq!(result["url"], "");
+    }
+
+    #[test]
+    fn resolve_env_vars_leaves_non_placeholder_strings_untouched() {
+        let input = serde_json::json!({ "url": "https://example.com" });
+        let result = OpenCodeLauncher::resolve_env_vars(&input);
+        assert_eq!(result["url"], "https://example.com");
+    }
+
+    #[test]
+    fn resolve_env_vars_recurses_into_objects() {
+        unsafe { std::env::set_var("TEST_URL_456", "https://resolved.com/v1"); }
+        let input = serde_json::json!({
+            "provider": {
+                "options": {
+                    "baseURL": "{env:TEST_URL_456}"
+                }
+            }
+        });
+        let result = OpenCodeLauncher::resolve_env_vars(&input);
+        assert_eq!(result["provider"]["options"]["baseURL"], "https://resolved.com/v1");
+        unsafe { std::env::remove_var("TEST_URL_456"); }
+    }
+
+    #[test]
+    fn resolve_env_vars_recurses_into_arrays() {
+        let input = serde_json::json!([1, "{env:HOME}", true]);
+        let result = OpenCodeLauncher::resolve_env_vars(&input);
+        assert_eq!(result[0], 1);
+        assert_eq!(result[1], std::env::var("HOME").unwrap_or_default());
+        assert_eq!(result[2], true);
+    }
+
+    // -- env providers discovery -------------------------------------------------
+
+    #[test]
+    fn discover_env_providers_returns_empty_when_no_keys_set() {
+        // Save original values
+        let saved = [
+            ("OPENAI_API_KEY", std::env::var("OPENAI_API_KEY").ok()),
+            ("ANTHROPIC_API_KEY", std::env::var("ANTHROPIC_API_KEY").ok()),
+            ("GOOGLE_API_KEY", std::env::var("GOOGLE_API_KEY").ok()),
+        ];
+        // Clear the env vars
+        for (key, _) in &saved {
+            unsafe { std::env::remove_var(key); }
+        }
+
+        let providers = OpenCodeLauncher::discover_env_providers();
+        assert!(
+            !providers.contains_key("openai"),
+            "openai should not be discovered"
+        );
+        assert!(
+            !providers.contains_key("anthropic"),
+            "anthropic should not be discovered"
+        );
+        assert!(
+            !providers.contains_key("google"),
+            "google should not be discovered"
+        );
+
+        // Restore original values
+        for (key, orig) in &saved {
+            if let Some(val) = orig {
+                unsafe { std::env::set_var(key, val); }
+            }
+        }
+    }
+
+    // -- user config discovery ---------------------------------------------------
+
+    #[test]
+    fn extract_providers_returns_none_for_missing_provider_key() {
+        let config = serde_json::json!({ "model": "openai/gpt-4o" });
+        assert!(OpenCodeLauncher::extract_providers(&config).is_none());
+    }
+
+    #[test]
+    fn extract_providers_returns_none_for_non_object_provider() {
+        let config = serde_json::json!({ "provider": "invalid" });
+        assert!(OpenCodeLauncher::extract_providers(&config).is_none());
+    }
+
+    #[test]
+    fn extract_providers_returns_some_for_valid_provider_object() {
+        let config = serde_json::json!({
+            "provider": {
+                "openai": { "name": "openai", "options": {} }
+            }
+        });
+        let providers = OpenCodeLauncher::extract_providers(&config);
+        assert!(providers.is_some());
+        let providers = providers.unwrap();
+        assert!(providers.contains_key("openai"));
     }
 }
