@@ -181,22 +181,24 @@ impl Provider for OpenAIProvider {
             Ok(response) => {
                 let latency = start.elapsed();
 
-                if response.status().is_success() {
-                    Ok(HealthStatus {
+                if response.status().as_u16() != 200 {
+                    return Ok(HealthStatus {
+                        healthy: false,
+                        latency,
+                        error: Some(format!("HTTP {}", response.status())),
+                    });
+                }
+                match response.json::<serde_json::Value>().await {
+                    Ok(_) => Ok(HealthStatus {
                         healthy: true,
                         latency,
                         error: None,
-                    })
-                } else {
-                    Ok(HealthStatus {
+                    }),
+                    Err(e) => Ok(HealthStatus {
                         healthy: false,
                         latency,
-                        error: Some(format!(
-                            "HTTP {}: {}",
-                            response.status(),
-                            response.text().await.unwrap_or_default()
-                        )),
-                    })
+                        error: Some(format!("invalid JSON response: {e}")),
+                    }),
                 }
             }
             Err(e) => {
