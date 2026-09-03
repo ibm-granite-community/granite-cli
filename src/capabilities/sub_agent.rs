@@ -3,170 +3,353 @@
 //! agent can delegate to independently of whichever model the main session
 //! uses. See `docs/specs/0021-sub-agent-capability.md`.
 
-use crate::capabilities::base::{
-    AgentModelBinding, Binding, BindingRequest, BindingType, Capability, CapabilityMetadata,
-    Dependency, HasCapabilityMetadata, SubAgentBinding, SubAgentBindingRequest, ToolName,
-};
-use crate::capabilities::requirement::ModelRequirement;
-use crate::models::{ConfiguredModel, ModelFunction};
-use crate::registry::ConfigConstructable;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
-use std::collections::HashSet;
 
-/*-- SubAgentCapabilityConfig ------------------------------------------------------*/
+/*-- Macro: declare_sub_agent_basic -----------------------------------------------*/
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
-pub struct SubAgentCapabilityConfig {
-    /// Shown to the main agent so it can decide when to delegate to this
-    /// sub-agent -- the same role Claude Code's own subagent `description`
-    /// field plays.
-    #[validate(min_length = 1)]
-    pub description: String,
-    /// The sub-agent's system prompt.
-    #[validate(min_length = 1)]
-    pub prompt: String,
-    /// Tool allow-list. Empty (the default) means "inherit all tools."
-    #[serde(default)]
-    pub tools: Vec<ToolName>,
-    /// Key into the configured models map (the user-chosen instance ID) for
-    /// the model this sub-agent runs on.
-    #[validate(min_length = 1)]
-    pub model_id: String,
-}
-
-/*-- SubAgentCapability -------------------------------------------------------------*/
-
-pub struct SubAgentCapability {
-    instance_id: String,
-    config: SubAgentCapabilityConfig,
-    configured_model: ConfiguredModel,
-}
-
-impl ConfigConstructable for SubAgentCapability {
-    type Config = SubAgentCapabilityConfig;
-
-    /// Constructs the capability by resolving its model through
-    /// `ConfiguredModel`, exactly like `AgentModelCapability::new` -- so
-    /// `model.provider()` works at bind time and, when a usage-tracking
-    /// session is active, the model is transparently tracked.
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        global_config: &crate::config::Config,
-    ) -> Self {
-        let config: SubAgentCapabilityConfig =
-            serde_json::from_value(cfg.clone()).unwrap_or_default();
-        let configured_model = ConfiguredModel::resolve(&config.model_id, global_config);
-        Self {
-            instance_id: instance_id.to_string(),
-            config,
-            configured_model,
+/// Declares a sub-agent capability with a static prompt and static tools.
+/// Config only has `description` and `model_id`.
+#[macro_export]
+macro_rules! declare_sub_agent_basic {
+    (
+        $name_struct:ident
+        $config_struct:ident
+        $name_cap:expr;
+        $description_cap:expr;
+        [$($tag:expr),* $(,)?]
+        $description_expr:expr;
+        $prompt_expr:expr;
+        $tools_expr:expr;
+        $known_type:expr
+    ) => {
+        #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
+        pub struct $config_struct {
+            /// Key into the configured models map (the user-chosen instance ID) for
+            /// the model this sub-agent runs on.
+            #[validate(min_length = 1)]
+            pub model_id: String,
         }
-    }
-}
 
-impl crate::registry::Named for SubAgentCapability {
-    fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-}
-
-#[async_trait]
-impl Capability for SubAgentCapability {
-    fn name(&self) -> &str {
-        "Sub-Agent"
-    }
-
-    fn description(&self) -> &str {
-        "Defines a named sub-agent (prompt, tool allow-list, and model) that a launched coding agent can delegate to."
-    }
-
-    fn dependencies(&self) -> Vec<Dependency> {
-        vec![Dependency::Model {
-            config_key: "model_id".to_string(),
-            requirement: ModelRequirement {
-                supported_functions: vec![ModelFunction::Chat, ModelFunction::ToolCalling],
-                ..Default::default()
-            },
-            resolved_id: Some(self.config.model_id.clone()),
-            required: true,
-        }]
-    }
-
-    fn binding_types(&self) -> HashSet<BindingType> {
-        HashSet::from([BindingType::SubAgent])
-    }
-
-    async fn bind(&self, request: BindingRequest) -> anyhow::Result<Binding> {
-        let api_type = match request {
-            BindingRequest::SubAgent(SubAgentBindingRequest { api_type }) => api_type,
-            other => anyhow::bail!(
-                "SubAgentCapability does not handle {:?} binding requests",
-                other.binding_type()
-            ),
-        };
-        let model_id = &self.config.model_id;
-
-        let (provider, endpoint, model_name) = self.configured_model.resolve_provider_endpoint(
-            model_id,
-            api_type.clone(),
-            ModelFunction::Chat,
-            ModelFunction::Chat,
-        )?;
-
-        Ok(Binding::SubAgent(SubAgentBinding {
-            description: self.config.description.clone(),
-            prompt: self.config.prompt.clone(),
-            tools: self.config.tools.clone(),
-            model: AgentModelBinding {
-                api_type,
-                provider_name: provider.instance_id().to_string(),
-                base_url: provider.base_url().to_string(),
-                model_name,
-                endpoint_path: endpoint.path().to_string(),
-                api_key: provider.api_key().cloned(),
-                verify_ssl: provider.verify_ssl(),
-                context_length: Some(self.configured_model.model.context_length()),
-            },
-            known_type: None,
-        }))
-    }
-}
-
-impl HasCapabilityMetadata for SubAgentCapability {
-    fn metadata() -> CapabilityMetadata {
-        CapabilityMetadata {
-            name: "Sub-Agent".to_string(),
-            description: "Defines a named sub-agent (prompt, tool allow-list, and model) that a launched coding agent can delegate to.".to_string(),
-            dependencies: vec![Dependency::Model {
-                config_key: "model_id".to_string(),
-                requirement: ModelRequirement {
-                    supported_functions: vec![ModelFunction::Chat, ModelFunction::ToolCalling],
-                    ..Default::default()
-                },
-                resolved_id: None,
-                required: true,
-            }],
-            tags: vec!["agent".to_string(), "sub-agent".to_string()],
-            supported_binding_types: HashSet::from([BindingType::SubAgent]),
+        pub struct $name_struct {
+            instance_id: String,
+            config: $config_struct,
+            configured_model: $crate::models::ConfiguredModel,
+            /// Description shown to the parent agent for deciding when to delegate.
+            pub description: String,
+            /// Static prompt for this sub-agent.
+            pub prompt: String,
+            /// Static tool allow-list for this sub-agent.
+            pub tools: Vec<$crate::capabilities::base::ToolName>,
         }
-    }
+
+        impl $crate::registry::ConfigConstructable for $name_struct {
+            type Config = $config_struct;
+
+            fn new(
+                instance_id: &str,
+                cfg: &serde_json::Value,
+                global_config: &$crate::config::Config,
+            ) -> Self {
+                let config: $config_struct =
+                    serde_json::from_value(cfg.clone()).unwrap_or_default();
+                let configured_model = $crate::models::ConfiguredModel::resolve(&config.model_id, global_config);
+                let description = $description_expr;
+                let prompt = $prompt_expr;
+                let tools = $tools_expr;
+                Self {
+                    instance_id: instance_id.to_string(),
+                    config,
+                    configured_model,
+                    description,
+                    prompt,
+                    tools,
+                }
+            }
+        }
+
+        impl $crate::registry::Named for $name_struct {
+            fn instance_id(&self) -> &str {
+                &self.instance_id
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl $crate::capabilities::Capability for $name_struct {
+            fn name(&self) -> &str {
+                $name_cap
+            }
+
+            fn description(&self) -> &str {
+                $description_cap
+            }
+
+            fn dependencies(&self) -> Vec<$crate::capabilities::Dependency> {
+                vec![$crate::capabilities::Dependency::Model {
+                    config_key: "model_id".to_string(),
+                    requirement: $crate::capabilities::ModelRequirement {
+                        supported_functions: vec![$crate::models::ModelFunction::Chat, $crate::models::ModelFunction::ToolCalling],
+                        ..Default::default()
+                    },
+                    resolved_id: Some(self.config.model_id.clone()),
+                    required: true,
+                }]
+            }
+
+            fn binding_types(&self) -> std::collections::HashSet<$crate::capabilities::base::BindingType> {
+                std::collections::HashSet::from([$crate::capabilities::base::BindingType::SubAgent])
+            }
+
+            async fn bind(&self, request: $crate::capabilities::base::BindingRequest) -> anyhow::Result<$crate::capabilities::base::Binding> {
+                let api_type = match request {
+                    $crate::capabilities::base::BindingRequest::SubAgent($crate::capabilities::base::SubAgentBindingRequest { api_type }) => api_type,
+                    other => anyhow::bail!(
+                        "{} does not handle {:?} binding requests",
+                        stringify!($name_struct),
+                        other.binding_type()
+                    ),
+                };
+                let model_id = &self.config.model_id;
+                let (provider, endpoint, model_name) = self.configured_model.resolve_provider_endpoint(
+                    model_id,
+                    api_type.clone(),
+                    $crate::models::ModelFunction::Chat,
+                    $crate::models::ModelFunction::Chat,
+                )?;
+                Ok($crate::capabilities::base::Binding::SubAgent($crate::capabilities::base::SubAgentBinding {
+                    description: self.description.clone(),
+                    prompt: self.prompt.clone(),
+                    tools: self.tools.clone(),
+                    model: $crate::capabilities::base::AgentModelBinding {
+                        api_type,
+                        provider_name: provider.instance_id().to_string(),
+                        base_url: provider.base_url().to_string(),
+                        model_name,
+                        endpoint_path: endpoint.path().to_string(),
+                        api_key: provider.api_key().cloned(),
+                        verify_ssl: provider.verify_ssl(),
+                        context_length: Some(self.configured_model.model.context_length()),
+                    },
+                    known_type: $known_type,
+                }))
+            }
+        }
+
+        impl $crate::capabilities::base::HasCapabilityMetadata for $name_struct {
+            fn metadata() -> $crate::capabilities::base::CapabilityMetadata {
+                $crate::capabilities::base::CapabilityMetadata {
+                    name: $name_cap.to_string(),
+                    description: $description_cap.to_string(),
+                    dependencies: vec![$crate::capabilities::Dependency::Model {
+                        config_key: "model_id".to_string(),
+                        requirement: $crate::capabilities::ModelRequirement {
+                            supported_functions: vec![$crate::models::ModelFunction::Chat, $crate::models::ModelFunction::ToolCalling],
+                            ..Default::default()
+                        },
+                        resolved_id: None,
+                        required: true,
+                    }],
+                    tags: vec![$($tag.to_string()),*],
+                    supported_binding_types: std::collections::HashSet::from([$crate::capabilities::base::BindingType::SubAgent]),
+                }
+            }
+        }
+    };
 }
+
+/*-- Macro: declare_sub_agent_full ------------------------------------------------*/
+
+/// Declares a sub-agent capability with configurable prompt and tools.
+#[macro_export]
+macro_rules! declare_sub_agent_full {
+    (
+        $name_struct:ident
+        $config_struct:ident
+        $name_cap:expr;
+        $description_cap:expr;
+        [$($tag:expr),* $(,)?]
+        $known_type:expr;
+        {$($config_fields:tt)*}
+    ) => {
+        #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
+        pub struct $config_struct {
+            /// Shown to the main agent so it can decide when to delegate to this
+            /// sub-agent -- the same role Claude Code's own subagent `description`
+            /// field plays.
+            #[validate(min_length = 1)]
+            pub description: String,
+            /// Key into the configured models map (the user-chosen instance ID) for
+            /// the model this sub-agent runs on.
+            #[validate(min_length = 1)]
+            pub model_id: String,
+            $($config_fields)*
+        }
+
+        pub struct $name_struct {
+            instance_id: String,
+            config: $config_struct,
+            configured_model: $crate::models::ConfiguredModel,
+            /// Description shown to the parent agent for deciding when to delegate.
+            pub description: String,
+            /// Configurable prompt for this sub-agent.
+            pub prompt: String,
+            /// Configurable tool allow-list for this sub-agent.
+            pub tools: Vec<$crate::capabilities::base::ToolName>,
+        }
+
+        impl $crate::registry::ConfigConstructable for $name_struct {
+            type Config = $config_struct;
+
+            fn new(
+                instance_id: &str,
+                cfg: &serde_json::Value,
+                global_config: &$crate::config::Config,
+            ) -> Self {
+                let config: $config_struct =
+                    serde_json::from_value(cfg.clone()).unwrap_or_default();
+                let configured_model = $crate::models::ConfiguredModel::resolve(&config.model_id, global_config);
+                let description = config.description.clone();
+                let prompt = config.prompt.clone();
+                let tools = config.tools.clone();
+                Self {
+                    instance_id: instance_id.to_string(),
+                    config,
+                    configured_model,
+                    description,
+                    prompt,
+                    tools,
+                }
+            }
+        }
+
+        impl $crate::registry::Named for $name_struct {
+            fn instance_id(&self) -> &str {
+                &self.instance_id
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl $crate::capabilities::Capability for $name_struct {
+            fn name(&self) -> &str {
+                $name_cap
+            }
+
+            fn description(&self) -> &str {
+                $description_cap
+            }
+
+            fn dependencies(&self) -> Vec<$crate::capabilities::Dependency> {
+                vec![$crate::capabilities::Dependency::Model {
+                    config_key: "model_id".to_string(),
+                    requirement: $crate::capabilities::ModelRequirement {
+                        supported_functions: vec![$crate::models::ModelFunction::Chat, $crate::models::ModelFunction::ToolCalling],
+                        ..Default::default()
+                    },
+                    resolved_id: Some(self.config.model_id.clone()),
+                    required: true,
+                }]
+            }
+
+            fn binding_types(&self) -> std::collections::HashSet<$crate::capabilities::base::BindingType> {
+                std::collections::HashSet::from([$crate::capabilities::base::BindingType::SubAgent])
+            }
+
+            async fn bind(&self, request: $crate::capabilities::base::BindingRequest) -> anyhow::Result<$crate::capabilities::base::Binding> {
+                let api_type = match request {
+                    $crate::capabilities::base::BindingRequest::SubAgent($crate::capabilities::base::SubAgentBindingRequest { api_type }) => api_type,
+                    other => anyhow::bail!(
+                        "{} does not handle {:?} binding requests",
+                        stringify!($name_struct),
+                        other.binding_type()
+                    ),
+                };
+                let model_id = &self.config.model_id;
+                let (provider, endpoint, model_name) = self.configured_model.resolve_provider_endpoint(
+                    model_id,
+                    api_type.clone(),
+                    $crate::models::ModelFunction::Chat,
+                    $crate::models::ModelFunction::Chat,
+                )?;
+                Ok($crate::capabilities::base::Binding::SubAgent($crate::capabilities::base::SubAgentBinding {
+                    description: self.description.clone(),
+                    prompt: self.prompt.clone(),
+                    tools: self.tools.clone(),
+                    model: $crate::capabilities::base::AgentModelBinding {
+                        api_type,
+                        provider_name: provider.instance_id().to_string(),
+                        base_url: provider.base_url().to_string(),
+                        model_name,
+                        endpoint_path: endpoint.path().to_string(),
+                        api_key: provider.api_key().cloned(),
+                        verify_ssl: provider.verify_ssl(),
+                        context_length: Some(self.configured_model.model.context_length()),
+                    },
+                    known_type: $known_type,
+                }))
+            }
+        }
+
+        impl $crate::capabilities::base::HasCapabilityMetadata for $name_struct {
+            fn metadata() -> $crate::capabilities::base::CapabilityMetadata {
+                $crate::capabilities::base::CapabilityMetadata {
+                    name: $name_cap.to_string(),
+                    description: $description_cap.to_string(),
+                    dependencies: vec![$crate::capabilities::Dependency::Model {
+                        config_key: "model_id".to_string(),
+                        requirement: $crate::capabilities::ModelRequirement {
+                            supported_functions: vec![$crate::models::ModelFunction::Chat, $crate::models::ModelFunction::ToolCalling],
+                            ..Default::default()
+                        },
+                        resolved_id: None,
+                        required: true,
+                    }],
+                    tags: vec![$($tag.to_string()),*],
+                    supported_binding_types: std::collections::HashSet::from([$crate::capabilities::base::BindingType::SubAgent]),
+                }
+            }
+        }
+    };
+}
+
+/*-- SubAgentCapability ------------------------------------------------------------*/
+
+// Configuration for the generic sub-agent capability. The prompt and tools
+// are configurable via JSON, leaving only description and model_id.
+declare_sub_agent_full!(
+    SubAgentCapability
+    SubAgentCapabilityConfig
+    "Sub-Agent";
+    "Defines a named sub-agent (prompt, tool allow-list, and model) that a launched coding agent can delegate to.";
+    ["agent", "sub-agent"]
+    None;
+    {
+        /// The sub-agent's system prompt.
+        #[validate(min_length = 1)]
+        pub prompt: String,
+        /// Tool allow-list. Empty (the default) means "inherit all tools."
+        #[serde(default)]
+        pub tools: Vec<crate::capabilities::base::ToolName>,
+    }
+);
 
 /*-- tests -------------------------------------------------------------------------*/
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::base::{
+        Binding, BindingRequest, BindingType, Capability, Dependency, HasCapabilityMetadata,
+        SubAgentBindingRequest, ToolName,
+    };
     use crate::config::{Config, ModelConfig};
-    use crate::models::Model;
+    use crate::models::{Model, ModelFunction};
     use crate::providers::{
         ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError,
     };
-    use crate::registry::Secret;
+    use crate::registry::{ConfigConstructable, Secret};
+    use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     #[derive(Clone, Default)]
@@ -301,9 +484,6 @@ mod tests {
         }
     }
 
-    /// Builds a `SubAgentCapability` with a real registry model id (so
-    /// construction succeeds) and then swaps in a test double model/provider,
-    /// mirroring `agent_model.rs`'s test pattern.
     fn capability_with_test_model(
         functions: Vec<ModelFunction>,
         provider: FakeProvider,
@@ -338,6 +518,9 @@ mod tests {
                 }),
                 None,
             ),
+            description: cap.description,
+            prompt: cap.prompt,
+            tools: cap.tools,
         }
     }
 
@@ -378,6 +561,9 @@ mod tests {
                 }),
                 None,
             ),
+            description: cap.description,
+            prompt: cap.prompt,
+            tools: cap.tools,
         };
 
         let binding = cap.bind(request(ApiType::Anthropic)).await.unwrap();

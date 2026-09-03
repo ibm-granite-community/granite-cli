@@ -2,43 +2,14 @@
 //! prompt and fixed tool allow-list (FileRead, Search, Shell), and a `Model`/`Provider`
 //! of its own. The prompt has a placeholder that the user can fill in later.
 
-// Standard
-use serde_valid::Validate;
-use std::collections::HashSet;
-
-// Third Party
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_valid::Validate;
 
-// Local
-use crate::capabilities::ModelRequirement;
-use crate::capabilities::base::{
-    AgentModelBinding, Binding, BindingRequest, BindingType, Capability, CapabilityMetadata,
-    Dependency, HasCapabilityMetadata, KnownSubAgent, SubAgentBinding, SubAgentBindingRequest,
-    ToolName,
-};
-use crate::models::{ConfiguredModel, ModelFunction};
-use crate::registry::ConfigConstructable;
+use crate::capabilities::base::KnownSubAgent;
+use crate::capabilities::base::ToolName;
+use crate::declare_sub_agent_basic;
 
-/*-- ExploreSubAgentCapabilityConfig --------------------------------------------*/
-
-/// Configuration for the explore sub-agent capability. Unlike `SubAgentCapability`,
-/// the prompt and tools are static (not configurable via JSON), leaving only the
-/// description (what the sub-agent does) and model_id as configurable.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
-pub struct ExploreSubAgentCapabilityConfig {
-    /// Shown to the main agent so it can decide when to delegate to this
-    /// explore sub-agent.
-    #[validate(min_length = 1)]
-    pub description: String,
-    /// Key into the configured models map (the user-chosen instance ID) for
-    /// the model this sub-agent runs on.
-    #[validate(min_length = 1)]
-    pub model_id: String,
-}
-
-/*-- ExploreSubAgentCapability -----------------------------------------------*/
-
+const EXPLORE_DESCRIPTION: &str = "Thoroughly search and explore the codebase to find files, read implementations, and understand patterns. Use when the user needs to find specific files, understand code structure, or locate implementations.";
 // CITE: https://github.com/Piebald-AI/claude-code-system-prompts/blob/main/system-prompts/agent-prompt-explore.md
 const EXPLORE_PROMPT: &str = "You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
 
@@ -72,149 +43,37 @@ NOTE: You are meant to be a fast agent that returns output as quickly as possibl
 
 Complete the user's search request efficiently and report your findings clearly.";
 
-pub struct ExploreSubAgentCapability {
-    instance_id: String,
-    config: ExploreSubAgentCapabilityConfig,
-    configured_model: ConfiguredModel,
-    /// Static prompt for the explore sub-agent (placeholder for now; user can
-    /// override by editing this field later).
-    pub prompt: String,
-    /// Static tool allow-list for the explore sub-agent.
-    pub tools: Vec<ToolName>,
-}
-
-impl ConfigConstructable for ExploreSubAgentCapability {
-    type Config = ExploreSubAgentCapabilityConfig;
-
-    /// Constructs the capability by resolving its model through
-    /// `ConfiguredModel`, exactly like `AgentModelCapability::new` -- so
-    /// `model.provider()` works at bind time and, when a usage-tracking
-    /// session is active, the model is transparently tracked.
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        global_config: &crate::config::Config,
-    ) -> Self {
-        let config: ExploreSubAgentCapabilityConfig =
-            serde_json::from_value(cfg.clone()).unwrap_or_default();
-        let configured_model = ConfiguredModel::resolve(&config.model_id, global_config);
-
-        // Static prompt
-        // TODO: Make prompt a template that should be expanded by the launcher
-        let prompt = EXPLORE_PROMPT.to_string();
-        // Static tools: FileRead, Search, Shell
-        let tools = vec![ToolName::FileRead, ToolName::Search, ToolName::Shell];
-
-        Self {
-            instance_id: instance_id.to_string(),
-            config,
-            configured_model,
-            prompt,
-            tools,
-        }
-    }
-}
-
-impl crate::registry::Named for ExploreSubAgentCapability {
-    fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-}
-
-#[async_trait]
-impl Capability for ExploreSubAgentCapability {
-    fn name(&self) -> &str {
-        "Explore Sub-Agent"
-    }
-
-    fn description(&self) -> &str {
-        "Defines a named exploration sub-agent (static prompt, fixed tools, and model) that a launched coding agent can delegate to."
-    }
-
-    fn dependencies(&self) -> Vec<Dependency> {
-        vec![Dependency::Model {
-            config_key: "model_id".to_string(),
-            requirement: ModelRequirement {
-                supported_functions: vec![ModelFunction::Chat, ModelFunction::ToolCalling],
-                ..Default::default()
-            },
-            resolved_id: Some(self.config.model_id.clone()),
-            required: true,
-        }]
-    }
-
-    fn binding_types(&self) -> HashSet<BindingType> {
-        HashSet::from([BindingType::SubAgent])
-    }
-
-    async fn bind(&self, request: BindingRequest) -> anyhow::Result<Binding> {
-        let api_type = match request {
-            BindingRequest::SubAgent(SubAgentBindingRequest { api_type }) => api_type,
-            other => anyhow::bail!(
-                "ExploreSubAgentCapability does not handle {:?} binding requests",
-                other.binding_type()
-            ),
-        };
-        let model_id = &self.config.model_id;
-
-        let (provider, endpoint, model_name) = self.configured_model.resolve_provider_endpoint(
-            model_id,
-            api_type.clone(),
-            ModelFunction::Chat,
-            ModelFunction::Chat,
-        )?;
-
-        Ok(Binding::SubAgent(SubAgentBinding {
-            description: self.config.description.clone(),
-            prompt: self.prompt.clone(),
-            tools: self.tools.clone(),
-            model: AgentModelBinding {
-                api_type,
-                provider_name: provider.instance_id().to_string(),
-                base_url: provider.base_url().to_string(),
-                model_name,
-                endpoint_path: endpoint.path().to_string(),
-                api_key: provider.api_key().cloned(),
-                verify_ssl: provider.verify_ssl(),
-                context_length: Some(self.configured_model.model.context_length()),
-            },
-            known_type: Some(KnownSubAgent::Explore),
-        }))
-    }
-}
-
-impl HasCapabilityMetadata for ExploreSubAgentCapability {
-    fn metadata() -> CapabilityMetadata {
-        CapabilityMetadata {
-            name: "Explore Sub-Agent".to_string(),
-            description: "Defines a named exploration sub-agent (static prompt, fixed tools, and model) that a launched coding agent can delegate to.".to_string(),
-            dependencies: vec![Dependency::Model {
-                config_key: "model_id".to_string(),
-                requirement: ModelRequirement {
-                    supported_functions: vec![ModelFunction::Chat, ModelFunction::ToolCalling],
-                    ..Default::default()
-                },
-                resolved_id: None,
-                required: true,
-            }],
-            tags: vec!["agent".to_string(), "explore".to_string()],
-            supported_binding_types: HashSet::from([BindingType::SubAgent]),
-        }
-    }
-}
+declare_sub_agent_basic!(
+    ExploreSubAgentCapability
+    ExploreSubAgentCapabilityConfig
+    "Explore Sub-Agent";
+    "Defines a named exploration sub-agent (static prompt, fixed tools, and model) that a launched coding agent can delegate to.";
+    ["agent", "explore"]
+    EXPLORE_DESCRIPTION.to_string();
+    EXPLORE_PROMPT.to_string();
+    vec![ToolName::FileRead, ToolName::Search, ToolName::Shell];
+    Some(KnownSubAgent::Explore)
+);
 
 /*-- tests -------------------------------------------------------------------*/
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::base::{
+        Binding, BindingRequest, BindingType, Capability, Dependency, HasCapabilityMetadata,
+        SubAgentBindingRequest,
+    };
     use crate::config::{Config, ModelConfig};
-    use crate::models::Model;
+    use crate::models::{Model, ModelFunction};
     use crate::providers::{
         ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError,
     };
+    use crate::registry::ConfigConstructable;
     use crate::registry::Secret;
+    use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     #[derive(Clone, Default)]
@@ -349,9 +208,6 @@ mod tests {
         }
     }
 
-    /// Builds an `ExploreSubAgentCapability` with a real registry model id (so
-    /// construction succeeds) and then swaps in a test double model/provider,
-    /// mirroring the test pattern from `sub_agent.rs`.
     fn explore_capability_with_test_model(
         functions: Vec<ModelFunction>,
         provider: FakeProvider,
@@ -370,7 +226,6 @@ mod tests {
         let cap = ExploreSubAgentCapability::new(
             "explorer",
             &serde_json::json!({
-                "description": "Explores code",
                 "model_id": "granite-3.1-8b-instruct",
             }),
             &config,
@@ -385,6 +240,7 @@ mod tests {
                 }),
                 None,
             ),
+            description: cap.description,
             prompt: cap.prompt,
             tools: cap.tools,
         }
@@ -410,7 +266,6 @@ mod tests {
         let cap = ExploreSubAgentCapability::new(
             "explorer",
             &serde_json::json!({
-                "description": "Explores code",
                 "model_id": "granite-3.1-8b-instruct",
             }),
             &config,
@@ -425,6 +280,7 @@ mod tests {
                 }),
                 None,
             ),
+            description: cap.description,
             prompt: cap.prompt,
             tools: cap.tools,
         };
@@ -433,7 +289,7 @@ mod tests {
         let Binding::SubAgent(binding) = binding else {
             panic!("expected SubAgent binding")
         };
-        assert_eq!(binding.description, "Explores code");
+        assert_eq!(binding.description, EXPLORE_DESCRIPTION);
         assert_eq!(binding.prompt, EXPLORE_PROMPT.to_string());
         assert_eq!(
             binding.tools,

@@ -1416,6 +1416,23 @@ impl SetupCommands {
 
         // Configure capabilities
         for cap_type in selected_caps {
+            let model_id = Self::find_model_for_capability(cap_type, selected_models);
+
+            // Skip capabilities that have a required model dependency but no
+            // matching model was selected — saving them with model_id="" would
+            // panic when CapabilitySource constructs the instance below.
+            let needs_model = CAPABILITY_REGISTRY.get(cap_type).is_some_and(|meta| {
+                meta.dependencies
+                    .iter()
+                    .any(|d| matches!(d, Dependency::Model { required: true, .. }))
+            });
+            if needs_model && model_id.is_none() {
+                ui.warn(&format!(
+                    "Skipping '{cap_type}': no compatible model available."
+                ));
+                continue;
+            }
+
             ui.info(&format!("\nConfiguring capability: {cap_type}..."));
 
             let mut config = CAPABILITY_REGISTRY
@@ -1423,7 +1440,7 @@ impl SetupCommands {
                 .unwrap_or_default();
 
             // Set model_id if the capability requires a model
-            if let Some(model_id) = Self::find_model_for_capability(cap_type, selected_models) {
+            if let Some(model_id) = model_id {
                 config["model_id"] = model_id.into();
             }
 

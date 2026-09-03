@@ -12,6 +12,7 @@ pub static CAPABILITY_REGISTRY: LazyLock<base::CapabilityFactory> = LazyLock::ne
     factory.register::<agent_model::AgentModelCapability>("agent-model");
     factory.register::<vision_mcp::VisionMCPCapability>("vision-mcp");
     factory.register::<sub_agent::SubAgentCapability>("sub-agent");
+    factory.register::<sub_agent_code::CodeSubAgentCapability>("sub-agent-code");
     factory.register::<sub_agent_explore::ExploreSubAgentCapability>("sub-agent-explore");
     factory.register::<sub_agent_plan::PlanSubAgentCapability>("sub-agent-plan");
     factory
@@ -93,6 +94,9 @@ pub use vision_mcp::{VisionMCPCapability, VisionMCPCapabilityConfig};
 
 mod sub_agent;
 pub use sub_agent::{SubAgentCapability, SubAgentCapabilityConfig};
+
+mod sub_agent_code;
+pub use sub_agent_code::{CodeSubAgentCapability, CodeSubAgentCapabilityConfig};
 
 mod sub_agent_explore;
 pub use sub_agent_explore::{ExploreSubAgentCapability, ExploreSubAgentCapabilityConfig};

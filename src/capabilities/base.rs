@@ -148,6 +148,7 @@ pub enum ToolName {
 pub enum KnownSubAgent {
     Explore,
     Plan,
+    Code,
 }
 
 /// Result payload for `BindingType::SubAgent`: a named sub-agent's prompt,

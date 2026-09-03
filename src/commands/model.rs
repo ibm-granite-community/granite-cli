@@ -824,11 +824,9 @@ impl ModelCommands {
         resolution: &dependency::Resolution,
     ) -> Result<Option<String>> {
         if resolution.is_unsatisfiable() {
-            ctx.ui
-                .info("\nNo provider supports this variant's format/precision yet.");
-            ctx.ui
-                .info("Configure a provider later, then set its id on this model.");
-            return Ok(None);
+            anyhow::bail!(
+                "No provider type supports this model's format/precision; configure a compatible provider first, then set up this model."
+            );
         }
 
         const CONFIGURE_NEW: &str = "Configure a new provider...";
@@ -1794,6 +1792,23 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("variant")),
             "should not have prompted for a variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_provider_bails_when_no_provider_type_can_ever_satisfy_the_requirement() {
+        let mut ctx = empty_ctx();
+        let resolution = dependency::Resolution {
+            existing_instances: vec![],
+            configurable_types: vec![],
+        };
+
+        let err = ModelCommands::select_provider(&mut ctx, &resolution)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("No provider type supports"),
+            "{err}"
         );
     }
 

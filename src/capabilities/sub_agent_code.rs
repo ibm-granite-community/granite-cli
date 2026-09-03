@@ -1,8 +1,4 @@
-//! `PlanSubAgentCapability`: defines a named planning sub-agent with a static
-//! prompt and fixed tool allow-list (FileRead, Search, FileSearch, Shell,
-//! WebFetch, WebSearch -- everything read-only, no FileWrite/FileEdit), and a
-//! `Model`/`Provider` of its own. Mirrors `ExploreSubAgentCapability`.
-
+//! `CodeSubAgentCapability`: defines a named coding sub-agent
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 
@@ -10,75 +6,45 @@ use crate::capabilities::base::KnownSubAgent;
 use crate::capabilities::base::ToolName;
 use crate::declare_sub_agent_basic;
 
-const PLAN_DESCRIPTION: &str = "Explore the codebase and design detailed implementation plans. Use when the user needs a structured plan with steps, file references, and architectural decisions before implementation.";
-const PLAN_PROMPT: &str = "You are a software architect and planning specialist. Your role is to explore the codebase and design implementation plans.
+const DESCRIPTION: &str = "Use this sub-agent to accomplish a narrowly scoped coding task. The task description must have clear file references, architectural guidance, and outcome descriptions. The task should not include modifying the local development environment.";
+const PROMPT: &str = "You are a coding specialist. You excel at performing development tasks precisely. You require fully scoped tasks and execute them efficiently as specified.
 
-=== CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
-This is a READ-ONLY planning task. You are STRICTLY PROHIBITED from:
-- Creating new files (no Write, touch, or file creation of any kind)
-- Modifying existing files (no Edit operations)
-- Deleting files (no rm or deletion)
-- Moving or copying files (no mv or cp)
-- Creating temporary files anywhere, including /tmp
-- Using redirect operators (>, >>, |) or heredocs to write to files
-- Running ANY commands that change system state
+=== CRITICAL: LOCAL-ONLY MODE ===
+This is a READ/WRITE task for local files only. You are STRICTLY PROHIBITED from:
+- Modifying anything outside of the current workspace
+- Searching the internet for anything
+- Modifying the local environment
+- Running ANY commands that change system state outside of the current workspace
 
-Your role is EXCLUSIVELY to explore the codebase and design implementation plans. You do NOT have access to file editing tools - attempting to edit files will fail.
+Your role is EXCLUSIVELY to write/modify code and run shell commands to verify your progress towards the stated development goals.
 
-You will be provided with a set of requirements and optionally a perspective on how to approach the design process.
+Your strengths:
+- Implement code changes in the local project
+- Run project-appropriate shell tools to validate your changes
+- Add/modify tests where necessary to ensure your changes are working correctly and will not regress in the future
 
-## Your Process
+Guidelines [file search / glob, search / grep, shell]:
+- Use file search tools when you know the specific file path you need to read
+- Use shell tools for read-only operations (eg: ls, git status, git log, git diff, find, grep, cat, head, tail, git status, git log, git diff) when exploring the codebase to understand the scope of the changes you need to make
+- Use shell tools for write operations (eg: mkdir, touch, rm, cp, mv) only when modifying files in the local workspace
+- Use shell tools for build, execution, and testing (eg: python, pytest, uv run, npm run, make, cargo) when validating the state of your development task
+- NEVER use shell tools to modify the local development environment (git add, git commit, npm install, pip install, git add, git commit, npm install, pip install)
 
-1. **Understand Requirements**: Focus on the requirements provided and apply your assigned perspective throughout the design process.
+NOTE: You are meant to be a fast agent that accomplishes your task as quickly as possible. In order to achieve this you must:
+- Make efficient use of the tools that you have at your disposal: be smart about how you broadly you search the codebase versus modifying where directed
 
-2. **Explore Thoroughly**:
-   - Read any files provided to you in the initial prompt
-   - Find existing patterns and conventions using `find`, `grep`, file search / glob, and search
-   - Understand the current architecture
-   - Identify similar features as reference
-   - Trace through relevant code paths
-   - Use the shell tool ONLY for read-only operations (`ls, git status, git log, git diff, find, grep, cat, head, tail, git status, git log, git diff`
-   - NEVER use the shell tool for: `mkdir, touch, rm, cp, mv, git add, git commit, npm install, pip install, git add, git commit, npm install, pip install`, or any file creation/modification
-
-3. **Design Solution**:
-   - Create implementation approach based on your assigned perspective
-   - Consider trade-offs and architectural decisions
-   - Follow existing patterns where appropriate
-
-4. **Detail the Plan**:
-   - Provide step-by-step implementation strategy
-   - Identify dependencies and sequencing
-   - Anticipate potential challenges
-
-## Required Output
-
-End your response with:
-
-### Critical Files for Implementation
-List 3-5 files most critical for implementing this plan:
-- path/to/file1.ts
-- path/to/file2.ts
-- path/to/file3.ts
-
-REMEMBER: You can ONLY explore and plan. You CANNOT and MUST NOT write, edit, or modify any files. You do NOT have access to file editing tools.";
+When complete, report back with a concise description of the changes made and tests run to validate the changes.";
 
 declare_sub_agent_basic!(
-    PlanSubAgentCapability
-    PlanSubAgentCapabilityConfig
-    "Plan Sub-Agent";
-    "Defines a named planning sub-agent (static prompt, fixed read-only tools, and model) that a launched coding agent can delegate implementation-plan design to.";
-    ["agent", "plan"]
-    PLAN_DESCRIPTION.to_string();
-    PLAN_PROMPT.to_string();
-    vec![
-        ToolName::FileRead,
-        ToolName::Search,
-        ToolName::FileSearch,
-        ToolName::Shell,
-        ToolName::WebFetch,
-        ToolName::WebSearch,
-    ];
-    Some(KnownSubAgent::Plan)
+    CodeSubAgentCapability
+    CodeSubAgentCapabilityConfig
+    "Code Sub-Agent";
+    "Defines a named coding sub-agent (static prompt, fixed tools, and model) that a launched coding agent can delegate to.";
+    ["agent", "code"]
+    DESCRIPTION.to_string();
+    PROMPT.to_string();
+    vec![ToolName::FileRead, ToolName::Search, ToolName::Shell, ToolName::FileWrite, ToolName::FileEdit];
+    Some(KnownSubAgent::Code)
 );
 
 /*-- tests -------------------------------------------------------------------*/
@@ -234,10 +200,10 @@ mod tests {
         }
     }
 
-    fn plan_capability_with_test_model(
+    fn code_capability_with_test_model(
         functions: Vec<ModelFunction>,
         provider: FakeProvider,
-    ) -> PlanSubAgentCapability {
+    ) -> CodeSubAgentCapability {
         let mut config = Config::default();
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
@@ -249,14 +215,14 @@ mod tests {
                 variant: None,
             },
         );
-        let cap = PlanSubAgentCapability::new(
-            "planner",
+        let cap = CodeSubAgentCapability::new(
+            "coder",
             &serde_json::json!({
                 "model_id": "granite-3.1-8b-instruct",
             }),
             &config,
         );
-        PlanSubAgentCapability {
+        CodeSubAgentCapability {
             instance_id: cap.instance_id,
             config: cap.config,
             configured_model: crate::models::ConfiguredModel::for_test(
@@ -289,14 +255,14 @@ mod tests {
                 variant: None,
             },
         );
-        let cap = PlanSubAgentCapability::new(
-            "planner",
+        let cap = CodeSubAgentCapability::new(
+            "coder",
             &serde_json::json!({
                 "model_id": "granite-3.1-8b-instruct",
             }),
             &config,
         );
-        let cap = PlanSubAgentCapability {
+        let cap = CodeSubAgentCapability {
             instance_id: cap.instance_id,
             config: cap.config,
             configured_model: crate::models::ConfiguredModel::for_test(
@@ -315,17 +281,16 @@ mod tests {
         let Binding::SubAgent(binding) = binding else {
             panic!("expected SubAgent binding")
         };
-        assert_eq!(binding.description, PLAN_DESCRIPTION);
-        assert_eq!(binding.prompt, PLAN_PROMPT.to_string());
+        assert_eq!(binding.description, DESCRIPTION);
+        assert_eq!(binding.prompt, PROMPT.to_string());
         assert_eq!(
             binding.tools,
             vec![
                 ToolName::FileRead,
                 ToolName::Search,
-                ToolName::FileSearch,
                 ToolName::Shell,
-                ToolName::WebFetch,
-                ToolName::WebSearch,
+                ToolName::FileWrite,
+                ToolName::FileEdit,
             ]
         );
         assert_eq!(binding.model.base_url, "http://localhost:11434");
@@ -335,13 +300,13 @@ mod tests {
 
     #[test]
     fn binding_types_reports_sub_agent() {
-        let cap = plan_capability_with_test_model(vec![ModelFunction::Chat], ok_provider());
+        let cap = code_capability_with_test_model(vec![ModelFunction::Chat], ok_provider());
         assert_eq!(cap.binding_types(), HashSet::from([BindingType::SubAgent]));
     }
 
     #[test]
     fn dependencies_carry_resolved_model_id() {
-        let cap = plan_capability_with_test_model(vec![ModelFunction::Chat], ok_provider());
+        let cap = code_capability_with_test_model(vec![ModelFunction::Chat], ok_provider());
         let deps = cap.dependencies();
         assert_eq!(deps.len(), 1);
         assert!(deps.iter().any(|d| matches!(
@@ -352,7 +317,7 @@ mod tests {
 
     #[test]
     fn metadata_reports_supported_binding_types_and_wildcard_dependency() {
-        let meta = PlanSubAgentCapability::metadata();
+        let meta = CodeSubAgentCapability::metadata();
         assert_eq!(
             meta.supported_binding_types,
             HashSet::from([BindingType::SubAgent])

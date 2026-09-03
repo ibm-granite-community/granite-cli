@@ -24,7 +24,6 @@ pub struct OpenRouterProviderConfig {
     pub verify_ssl: bool,
     #[serde(default = "default_health_endpoint")]
     pub health_check_endpoint: String,
-    pub function_endpoints: Option<HashMap<ModelFunction, Vec<ApiEndpoint>>>,
 }
 
 fn default_timeout() -> u64 {
@@ -47,7 +46,6 @@ impl Default for OpenRouterProviderConfig {
             timeout_secs: 10,
             verify_ssl: true,
             health_check_endpoint: default_health_endpoint(),
-            function_endpoints: None,
         }
     }
 }
@@ -56,7 +54,6 @@ pub struct OpenRouterProvider {
     instance_id: String,
     config: OpenRouterProviderConfig,
     client: reqwest::Client,
-    function_endpoints: HashMap<ModelFunction, Vec<ApiEndpoint>>,
 }
 
 impl OpenRouterProvider {
@@ -99,16 +96,10 @@ impl ConfigConstructable for OpenRouterProvider {
             .build()
             .expect("Failed to create HTTP client");
 
-        let function_endpoints = config
-            .function_endpoints
-            .clone()
-            .unwrap_or_else(Self::default_function_endpoints);
-
         Self {
             instance_id: instance_id.to_string(),
             config,
             client,
-            function_endpoints,
         }
     }
 }
@@ -126,7 +117,7 @@ impl Provider for OpenRouterProvider {
     }
 
     fn function_endpoints(&self) -> HashMap<ModelFunction, Vec<ApiEndpoint>> {
-        self.function_endpoints.clone()
+        Self::default_function_endpoints()
     }
 
     fn supported_api_types(&self) -> Vec<ApiType> {
@@ -166,17 +157,6 @@ impl Provider for OpenRouterProvider {
 
 impl HasProviderMetadata for OpenRouterProvider {
     fn metadata() -> ProviderMetadata {
-        let mut default_mappings = HashMap::new();
-        default_mappings.insert(ModelFunction::Chat, vec![ApiEndpoint::OpenAIChat]);
-        default_mappings.insert(
-            ModelFunction::Embeddings,
-            vec![ApiEndpoint::OpenAIEmbeddings],
-        );
-        default_mappings.insert(
-            ModelFunction::Transcription,
-            vec![ApiEndpoint::OpenAIAudioTranscription],
-        );
-
         ProviderMetadata {
             name: "OpenRouter".to_string(),
             description: "Hosted provider for accessing multiple AI models via the OpenRouter API"
@@ -184,7 +164,7 @@ impl HasProviderMetadata for OpenRouterProvider {
             provider_type: ProviderType::Hosted,
             default_endpoint: "https://openrouter.ai/api".to_string(),
             supported_api_types: vec![ApiType::OpenAI],
-            default_function_endpoints: default_mappings,
+            default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: vec![ModelFormat::OpenRouter],
             authentication: vec![AuthType::BearerToken],
             tags: vec!["openrouter".to_string(), "hosted".to_string()],

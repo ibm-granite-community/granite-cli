@@ -2,7 +2,7 @@ use crate::models::huggingface::hf_repo_id;
 use crate::models::{ModelFunction, ModelMetadata, ModelVariant};
 use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
-    ProviderError, ProviderMetadata, ProviderType, http_health_check,
+    ProviderError, ProviderMetadata, ProviderType,
 };
 use crate::registry::{ConfigConstructable, Secret};
 use crate::utils::ui::Ui;
@@ -364,13 +364,63 @@ impl Provider for LlamaCppProvider {
     }
 
     async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
-        http_health_check(
-            &self.client,
-            &self.config.base_url,
-            &self.config.health_check_endpoint,
-            self.config.api_key.as_ref(),
-        )
-        .await
+        use std::time::Instant;
+        let start = Instant::now();
+        let url = format!(
+            "{}{}",
+            self.config.base_url, self.config.health_check_endpoint
+        );
+        let mut request = self.client.get(&url);
+        if let Some(key) = &self.config.api_key {
+            request = request.bearer_auth(&key.0);
+        }
+        match request.send().await {
+            Ok(response) => {
+                let latency = start.elapsed();
+                if response.status() != reqwest::StatusCode::OK {
+                    return Ok(HealthStatus {
+                        healthy: false,
+                        latency,
+                        error: Some(format!(
+                            "HTTP {}: {}",
+                            response.status(),
+                            response.text().await.unwrap_or_default()
+                        )),
+                    });
+                }
+                match response.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                        if status == "ok" {
+                            Ok(HealthStatus {
+                                healthy: true,
+                                latency,
+                                error: None,
+                            })
+                        } else {
+                            Ok(HealthStatus {
+                                healthy: false,
+                                latency,
+                                error: Some(format!("unexpected status: {status:?}")),
+                            })
+                        }
+                    }
+                    Err(e) => Ok(HealthStatus {
+                        healthy: false,
+                        latency,
+                        error: Some(format!("invalid JSON response: {e}")),
+                    }),
+                }
+            }
+            Err(e) => {
+                let latency = start.elapsed();
+                Ok(HealthStatus {
+                    healthy: false,
+                    latency,
+                    error: Some(format!("Connection failed: {e}")),
+                })
+            }
+        }
     }
 
     async fn pull_model(
@@ -460,7 +510,29 @@ mod tests {
         assert!(config.api_key.is_none());
         assert_eq!(config.timeout_secs, 10);
         assert!(config.verify_ssl);
-        assert_eq!(config.health_check_endpoint, "/health");
+        assert_eq!(config.health_check_endpoint, "/health"); // /health and /v1/health are aliases
+    }
+
+    #[test]
+    fn test_health_response_ok_status() {
+        let body: serde_json::Value = serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
+        let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        assert_eq!(status, "ok");
+    }
+
+    #[test]
+    fn test_health_response_loading_status() {
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"status":"loading model"}"#).unwrap();
+        let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        assert_ne!(status, "ok");
+    }
+
+    #[test]
+    fn test_health_response_missing_status() {
+        let body: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        assert_ne!(status, "ok");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 # Granite Models Catalog
-# Generated: 2026-08-25 15:32:26 UTC
+# Generated: 2026-09-01 17:30:25 UTC
 # Source: HuggingFace ibm-granite organization
 
 - id: granite-3.0-1b-a400m-instruct
@@ -2497,6 +2497,10 @@
       precision: Q4_K_M
       size_gb: 5.3
       url: "https://ollama.com/library/granite4.2:8b"
+    - format: OpenRouter
+      precision: 
+      size_gb: null
+      url: "https://openrouter.ai/ibm-granite/granite-4.2-8b"
   description: |
     | | |
     |---|---|

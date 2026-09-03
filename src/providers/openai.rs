@@ -181,14 +181,8 @@ impl Provider for OpenAIProvider {
             Ok(response) => {
                 let latency = start.elapsed();
 
-                if response.status().is_success() {
-                    Ok(HealthStatus {
-                        healthy: true,
-                        latency,
-                        error: None,
-                    })
-                } else {
-                    Ok(HealthStatus {
+                if response.status() != reqwest::StatusCode::OK {
+                    return Ok(HealthStatus {
                         healthy: false,
                         latency,
                         error: Some(format!(
@@ -196,7 +190,20 @@ impl Provider for OpenAIProvider {
                             response.status(),
                             response.text().await.unwrap_or_default()
                         )),
-                    })
+                    });
+                }
+
+                match response.json::<serde_json::Value>().await {
+                    Ok(_) => Ok(HealthStatus {
+                        healthy: true,
+                        latency,
+                        error: None,
+                    }),
+                    Err(e) => Ok(HealthStatus {
+                        healthy: false,
+                        latency,
+                        error: Some(format!("invalid JSON response: {e}")),
+                    }),
                 }
             }
             Err(e) => {
@@ -278,6 +285,25 @@ mod tests {
         assert!(config.api_key.is_none());
         assert_eq!(config.timeout_secs, 10);
         assert!(config.verify_ssl);
+        assert_eq!(config.health_check_endpoint, "/v1/models");
+    }
+
+    #[test]
+    fn test_health_rejects_html_response() {
+        // Ensure that an HTML payload (e.g. Open WebUI 404 page) is not treated as valid
+        let html = r#"<!DOCTYPE html><html><body>Not Found</body></html>"#;
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(html);
+        assert!(parsed.is_err(), "HTML must not parse as JSON");
+    }
+
+    #[test]
+    fn test_health_accepts_models_json() {
+        let json = r#"{"object":"list","data":[{"id":"granite3.3:8b","object":"model"}]}"#;
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(json);
+        assert!(
+            parsed.is_ok(),
+            "valid /v1/models payload must parse as JSON"
+        );
     }
 
     #[test]

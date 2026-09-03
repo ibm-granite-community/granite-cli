@@ -516,7 +516,7 @@ impl OpenCodeLauncher {
                 let mapped_name = match binding.known_type {
                     Some(KnownSubAgent::Explore) => "explore".to_string(),
                     Some(KnownSubAgent::Plan) => "plan".to_string(),
-                    None => name.clone(),
+                    _ => name.clone(),
                 };
                 (mapped_name, entry)
             })

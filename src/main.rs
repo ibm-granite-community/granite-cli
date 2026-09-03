@@ -448,6 +448,13 @@ impl alog::Formatter for UiFormatter {
 
 #[tokio::main]
 async fn main() {
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = dialoguer::console::Term::stderr().show_cursor();
+            std::process::exit(130);
+        }
+    });
+
     let cli = Cli::parse();
     let log_level = cli.log_level.clone();
     let log_filters = cli.log_filters.clone();

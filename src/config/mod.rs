@@ -101,7 +101,159 @@ pub struct LauncherConfig {
     pub config: serde_json::Value,
 }
 
+/*-- Windows / WSL ----------------------------------------------------------*/
+
+/// Convert a Windows path string to a WSL path.
+///
+/// `C:\Users\gabel\AppData\Roaming\granite-cli\launchers` →
+/// `/mnt/c/Users/gabel/AppData/Roaming/granite-cli/launchers`
+#[allow(dead_code)]
+fn windows_to_wsl(path: &str) -> Option<String> {
+    let path = path.trim();
+    // Match Windows drive letters: X:\... or X:/...
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || bytes[2] != b'\\' && bytes[2] != b'/' {
+        return None;
+    }
+    let drive = &path[..1].to_lowercase();
+    let rest = &path[2..];
+    let normalized = rest.replace('\\', "/");
+    Some(format!("/mnt/{drive}/{normalized}"))
+}
+
+/// Convert a WSL path to a Windows path.
+///
+/// `/mnt/c/Users/gabel/AppData/Roaming/granite-cli\launchers` →
+/// `C:\Users\gabel\AppData\Roaming\granite-cli\launchers`
+pub fn translate_wsl_to_windows(path: &str) -> Option<String> {
+    let path = path.trim();
+    if !path.starts_with("/mnt/") {
+        return None;
+    }
+    let remainder = &path[5..];
+    let mut parts = remainder.splitn(2, '/');
+    let drive = parts.next()?.to_uppercase();
+    let rest = parts.next()?;
+    let normalized = rest.replace('/', "\\");
+    Some(format!("{drive}:\\{normalized}"))
+}
+
+/// Recursively walk a serde_json::Value and translate path strings.
+///
+/// When `to_wsl` is true, converts Windows paths → WSL paths.
+/// When `to_wsl` is false, converts WSL paths → Windows paths.
+#[allow(dead_code)]
+fn translate_paths_in_value(value: &serde_json::Value, to_wsl: bool) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            let translated = if to_wsl {
+                windows_to_wsl(s)
+            } else {
+                translate_wsl_to_windows(s)
+            };
+            match translated {
+                Some(t) => serde_json::Value::String(t),
+                None => value.clone(),
+            }
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|v| translate_paths_in_value(v, to_wsl))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let new_map: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), translate_paths_in_value(v, to_wsl)))
+                .collect();
+            serde_json::Value::Object(new_map)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Translate all path strings in a serde_json::Value config object.
+///
+/// When running under WSL, Windows paths stored in config files are
+/// converted to WSL paths so they work at runtime. On save, the reverse
+/// conversion restores Windows-native paths for disk persistence.
+#[cfg(not(windows))]
+fn translate_paths_in_config(config: &mut serde_json::Value, to_wsl: bool) {
+    config["command_path"] = translate_paths_in_value(&config["command_path"], to_wsl);
+    if let Some(overrides) = config.get_mut("provider_overrides") {
+        *overrides = translate_paths_in_value(overrides, to_wsl);
+    }
+    if let Some(overrides) = config.get_mut("model_overrides") {
+        *overrides = translate_paths_in_value(overrides, to_wsl);
+    }
+    if let Some(overrides) = config.get_mut("base_path") {
+        *overrides = translate_paths_in_value(overrides, to_wsl);
+    }
+}
+
+/// No-op stub for native Windows builds where paths never need translation.
+#[cfg(windows)]
+fn translate_paths_in_config(_config: &mut serde_json::Value, _to_wsl: bool) {}
+
+/// Trait for config types that carry a serde_json::Value config field.
+/// Used to apply path translation generically across all config types.
+trait ConfigPathTranslator {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value>;
+}
+
+impl ConfigPathTranslator for ModelConfig {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        Some(&mut self.config)
+    }
+}
+
+impl ConfigPathTranslator for ProviderConfig {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        Some(&mut self.config)
+    }
+}
+
+impl ConfigPathTranslator for CapabilityConfig {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        Some(&mut self.config)
+    }
+}
+
+impl ConfigPathTranslator for LauncherConfig {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        Some(&mut self.config)
+    }
+}
+
+/*-- Core Config ------------------------------------------------------------*/
+
 impl Config {
+    /// Detect if running under Windows Subsystem for Linux.
+    ///
+    /// We check multiple indicators because PE binaries running under WSL
+    /// may not have reliable access to `/proc/version` (the Windows libc
+    /// runtime used by PE binaries doesn't translate `/proc` the same way
+    /// Linux processes do). We prefer the `/proc/sys/kernel/osrelease` file
+    /// which WSL consistently exposes, then fall back to `/proc/version`.
+    fn is_wsl() -> bool {
+        // Method 1: Check /proc/sys/kernel/osrelease (works for PE binaries under WSL)
+        if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+            let lower = s.to_lowercase();
+            if lower.contains("microsoft") || lower.contains("wsl") {
+                return true;
+            }
+        }
+        // Method 2: Check /proc/version (works for native Linux binaries)
+        if let Ok(s) = std::fs::read_to_string("/proc/version") {
+            let lower = s.to_lowercase();
+            if lower.contains("microsoft") || lower.contains("wsl") {
+                return true;
+            }
+        }
+        // Method 3: Check for WSL_DISTRO_NAME environment variable
+        std::env::var("WSL_DISTRO_NAME").is_ok()
+    }
+
     fn config_dir() -> Result<PathBuf> {
         let val_res = std::env::var("GRANITE_CLI_HOME");
 
@@ -122,6 +274,57 @@ impl Config {
             }
 
             return Ok(path);
+        }
+
+        // When running under WSL, always use the Windows AppData path so
+        // config is shared between WSL and native Windows invocations,
+        // regardless of how the binary was compiled. Under WSL the C: drive
+        // is mounted at /mnt/c, so C:\Users\<user>\AppData\Roaming maps to
+        // /mnt/c/Users/<user>/AppData/Roaming. We query the Windows username
+        // via cmd.exe because it may differ from the WSL login name.
+        //
+        // The path format depends on the compile target: ELF binaries (Linux
+        // builds) see WSL paths like `/mnt/c/...`, while PE binaries (Windows
+        // builds) see native Windows paths like `C:\Users\...`.
+        if Self::is_wsl() {
+            let windows_username = std::process::Command::new("cmd.exe")
+                .arg("/C")
+                .arg("echo")
+                .arg("%USERNAME%")
+                .output()
+                .ok()
+                .and_then(|out| {
+                    String::from_utf8(out.stdout)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                });
+
+            if let Some(username) = windows_username {
+                #[cfg(windows)]
+                {
+                    // PE binary: use native Windows path
+                    let path = PathBuf::from("C:\\Users")
+                        .join(&username)
+                        .join("AppData")
+                        .join("Roaming")
+                        .join("granite-cli");
+                    return Ok(path);
+                }
+                #[cfg(not(windows))]
+                {
+                    // ELF binary: use WSL mount path
+                    let path = PathBuf::from("/mnt/c")
+                        .join("Users")
+                        .join(&username)
+                        .join("AppData")
+                        .join("Roaming")
+                        .join("granite-cli");
+                    return Ok(path);
+                }
+            }
+
+            anyhow::bail!("Running under WSL but could not determine Windows username via cmd.exe");
         }
 
         let default_dir = dirs::config_dir().ok_or_else(|| {
@@ -202,7 +405,10 @@ impl Config {
         Ok(())
     }
 
-    fn load_dir<K: std::hash::Hash + Eq + ToString, V: serde::de::DeserializeOwned + ConfigId>(
+    fn load_dir<
+        K: std::hash::Hash + Eq + ToString,
+        V: serde::de::DeserializeOwned + ConfigId + ConfigPathTranslator,
+    >(
         dir: &Path,
         into_key: impl Fn(&str) -> K + Copy,
     ) -> Result<HashMap<K, V>> {
@@ -218,7 +424,10 @@ impl Config {
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if let Ok(config) = Self::load_yaml_from_file::<V>(&path) {
+                if let Ok(mut config) = Self::load_yaml_from_file::<V>(&path) {
+                    if let Some(cfg) = config.config_mut() {
+                        translate_paths_in_config(cfg, true);
+                    }
                     let id = config.config_id().to_string();
                     let file_id = Self::id_from_filename(&file_name);
                     if id != file_id {
@@ -266,11 +475,15 @@ impl Config {
     }
 
     fn id_to_filename(id: &str) -> String {
-        id.replace(std::path::MAIN_SEPARATOR, PATH_DELIM)
+        // NOTE: This replaces huggingface-style '/' delimiters which are not
+        // platform-specific
+        id.replace('/', PATH_DELIM)
     }
 
     fn id_from_filename(id: &str) -> String {
-        id.replace(PATH_DELIM, std::path::MAIN_SEPARATOR_STR)
+        // NOTE: This replaces huggingface-style '/' delimiters which are not
+        // platform-specific
+        id.replace(PATH_DELIM, "/")
     }
 
     fn save(&self) -> Result<()> {
@@ -279,26 +492,46 @@ impl Config {
 
         // Save individual model files
         for (id, model) in &self.models {
+            let mut model = model.clone();
+            if let Some(cfg) = model.config_mut() {
+                translate_paths_in_config(cfg, false);
+            }
             let path = Self::models_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
-            Self::save_yaml_to_file(&path, model)?;
+            alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
+            Self::save_yaml_to_file(&path, &model)?;
         }
 
         // Save individual provider files
         for (id, provider) in &self.providers {
+            let mut provider = provider.clone();
+            if let Some(cfg) = provider.config_mut() {
+                translate_paths_in_config(cfg, false);
+            }
             let path = Self::providers_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
-            Self::save_yaml_to_file(&path, provider)?;
+            alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
+            Self::save_yaml_to_file(&path, &provider)?;
         }
 
         // Save individual capability files
         for (id, capability) in &self.capabilities {
+            let mut capability = capability.clone();
+            if let Some(cfg) = capability.config_mut() {
+                translate_paths_in_config(cfg, false);
+            }
             let path = Self::capabilities_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
-            Self::save_yaml_to_file(&path, capability)?;
+            alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
+            Self::save_yaml_to_file(&path, &capability)?;
         }
 
         // Save individual launcher files
         for (id, launcher) in &self.launchers {
+            let mut launcher = launcher.clone();
+            if let Some(cfg) = launcher.config_mut() {
+                translate_paths_in_config(cfg, false);
+            }
             let path = Self::launchers_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
-            Self::save_yaml_to_file(&path, launcher)?;
+            alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
+            Self::save_yaml_to_file(&path, &launcher)?;
         }
 
         Ok(())
@@ -318,7 +551,7 @@ impl Config {
     pub fn remove_model(&mut self, id: &str) -> Result<()> {
         self.models.remove(id);
         let path = Self::models_dir().ok().and_then(|d| {
-            let p = d.join(format!("{id}.yaml"));
+            let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
             if p.exists() { Some(p) } else { None }
         });
         if let Some(p) = path {
@@ -350,7 +583,7 @@ impl Config {
     pub fn remove_provider(&mut self, id: &str) -> Result<()> {
         self.providers.remove(id);
         let path = Self::providers_dir().ok().and_then(|d| {
-            let p = d.join(format!("{id}.yaml"));
+            let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
             if p.exists() { Some(p) } else { None }
         });
         if let Some(p) = path {
@@ -382,7 +615,7 @@ impl Config {
     pub fn remove_capability(&mut self, id: &str) -> Result<()> {
         self.capabilities.remove(id);
         let path = Self::capabilities_dir().ok().and_then(|d| {
-            let p = d.join(format!("{id}.yaml"));
+            let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
             if p.exists() { Some(p) } else { None }
         });
         if let Some(p) = path {
@@ -418,7 +651,7 @@ impl Config {
     pub fn remove_launcher(&mut self, id: &str) -> Result<()> {
         self.launchers.remove(id);
         let path = Self::launchers_dir().ok().and_then(|d| {
-            let p = d.join(format!("{id}.yaml"));
+            let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
             if p.exists() { Some(p) } else { None }
         });
         if let Some(p) = path {

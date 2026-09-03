@@ -90,6 +90,43 @@ pub trait Launcher: crate::registry::Named + Send + Sync {
     }
 }
 
+/// Translate WSL paths to Windows paths in env var values.
+///
+/// When running a native Windows binary from WSL (e.g., `opencode.exe`),
+/// env vars like `OPENCODE_CONFIG` may contain WSL paths (`/mnt/c/Users/...`)
+/// that the PE binary cannot understand. Convert them to Windows format.
+fn translate_env_for_windows(binary: &PathBuf, env: &[EnvBinding]) -> Vec<EnvBinding> {
+    // Only translate when the target is a Windows PE binary (ends in .exe)
+    alog_channel!(MessageLevel::Debug2, "Translating for binary {:#?}", binary);
+    if !binary.to_string_lossy().to_lowercase().ends_with(".exe") {
+        return env.to_vec();
+    }
+    let mut out: Vec<_> = env
+        .iter()
+        .map(|b| {
+            let value = crate::config::translate_wsl_to_windows(&b.value)
+                .unwrap_or_else(|| b.value.clone());
+            EnvBinding {
+                key: b.key.clone(),
+                value,
+            }
+        })
+        .collect();
+    // In order for WSL env vars to be seen by Windows, they need to be added
+    // to the special WSLENV variable
+    let wslenv = out
+        .iter()
+        .map(|b| b.key.clone())
+        .collect::<Vec<_>>()
+        .join(":");
+    out.push(EnvBinding {
+        key: "WSLENV".to_string(),
+        value: wslenv,
+    });
+    alog_channel!(MessageLevel::Debug3, "Translated env vars: {:#?}", out);
+    out
+}
+
 /// Resolve a command and run it, handling dry_run and exit status.
 ///
 /// This is the shared utility that both the default `Launcher::launch` and
@@ -136,9 +173,12 @@ pub(crate) async fn run_command(
         }
     }
 
+    // Translate WSL paths in env vars when spawning a native Windows binary.
+    let translated_overlay = translate_env_for_windows(&binary, overlay);
+
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
-    for binding in overlay {
+    for binding in &translated_overlay {
         cmd.env(&binding.key, &binding.value);
     }
 
@@ -146,8 +186,61 @@ pub(crate) async fn run_command(
     // thread until the subprocess exits, which would otherwise starve the
     // async runtime -- notably the usage-tracking proxy server, which needs
     // scheduler time concurrently with the child running.
+    //
+    // On Windows, some PE binaries (notably from official release builds run
+    // in WSL) fail with os error 193 ("%1 is not a valid Win32 application")
+    // when spawned directly. In those cases, fall back to invoking through
+    // `cmd.exe /C`, which handles PE format compatibility correctly.
+    #[cfg(windows)]
+    let (binary_fallback, args_fallback, overlay_fallback) =
+        (binary.clone(), args.to_vec(), translated_overlay);
+
     tokio::task::spawn_blocking(move || -> anyhow::Result<std::process::ExitStatus> {
-        Ok(cmd.spawn()?.wait()?)
+        let mut spawn_cmd = cmd;
+
+        // In WSL, the parent's CWD may be a WSL path that gets translated to
+        // a UNC path for Windows processes. If the binary is on a Windows
+        // drive, set the CWD to that drive's root to avoid the UNC issue.
+        #[cfg(windows)]
+        if let Some(drive) = binary_fallback.parent().and_then(|p| {
+            p.to_str().and_then(|s| {
+                let chars: Vec<char> = s.chars().collect();
+                if chars.len() >= 2 && chars[1] == ':' {
+                    Some(format!("{}\\", &s[..2]))
+                } else {
+                    None
+                }
+            })
+        }) {
+            spawn_cmd.current_dir(drive);
+        }
+
+        let mut child = match spawn_cmd.spawn() {
+            Ok(child) => child,
+            #[allow(unreachable_code)]
+            Err(e) => {
+                #[cfg(windows)]
+                if let Some(193) = e.raw_os_error() {
+                    let mut shell = std::process::Command::new("cmd.exe");
+                    shell.arg("/C");
+                    // Build the full command string for cmd.exe
+                    let mut cmd_str = String::new();
+                    cmd_str.push_str(&binary_fallback.to_string_lossy());
+                    for arg in &args_fallback {
+                        cmd_str.push(' ');
+                        cmd_str.push_str(arg);
+                    }
+                    shell.arg(&cmd_str);
+                    for binding in &overlay_fallback {
+                        shell.env(&binding.key, &binding.value);
+                    }
+                    return shell.spawn()?.wait().map_err(anyhow::Error::from);
+                }
+                return Err(e.into());
+            }
+        };
+
+        Ok(child.wait()?)
     })
     .await?
 }
@@ -184,7 +277,7 @@ pub struct LaunchContext {
 }
 
 /// A single environment variable binding contributed to the subprocess overlay.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EnvBinding {
     pub key: String,
     pub value: String,
