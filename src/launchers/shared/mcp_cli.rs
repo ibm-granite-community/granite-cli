@@ -21,6 +21,10 @@ pub(crate) fn mcp_binding_request() -> BindingRequest {
 
 /// Runs `<binary> mcp add-json <name> <json> <scope_args...>`, or reports
 /// what it would run under `--dry-run` instead of executing.
+///
+/// Always does a best-effort remove first so that a stale entry left by a
+/// previously crashed or suspended session (where `remove_mcp_server` never
+/// ran) doesn't cause `add-json` to fail with "already exists".
 pub(crate) fn register_mcp_server(
     binary: &Path,
     name: &str,
@@ -29,6 +33,9 @@ pub(crate) fn register_mcp_server(
     ctx: &LaunchContext,
     ui: &dyn Ui,
 ) -> anyhow::Result<()> {
+    // Best-effort: ignore failure — the server simply may not exist yet.
+    remove_mcp_server(binary, name, scope_args, ctx, ui);
+
     let json = binding.to_canonical_json().to_string();
     let mut args = vec![
         "mcp".to_string(),

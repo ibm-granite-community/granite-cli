@@ -23,6 +23,8 @@ pub enum ModelFunction {
     ImageUnderstanding,
     /// Detect harms
     Guardian,
+    /// Document conversion and processing (e.g. PDF to structured formats)
+    DocumentConversion,
 
     /*-- Embedding Functions --*/
     /// Vector representation generation for text
@@ -47,6 +49,7 @@ impl std::fmt::Display for ModelFunction {
             ModelFunction::Thinking => write!(f, "Thinking"),
             ModelFunction::ImageUnderstanding => write!(f, "Image Understanding"),
             ModelFunction::Guardian => write!(f, "Guardian"),
+            ModelFunction::DocumentConversion => write!(f, "Document Conversion"),
             ModelFunction::Embeddings => write!(f, "Embeddings"),
             ModelFunction::Transcription => write!(f, "Transcription"),
             ModelFunction::Translation => write!(f, "Translation"),

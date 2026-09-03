@@ -2234,14 +2234,18 @@ mod tests {
         let ctx = test_ctx();
         let discovery = run_discovery(&ctx).await;
 
-        // bob only supports the Mcp binding, so only vision-mcp should show.
+        // bob only supports the Mcp binding, so only Mcp-binding capabilities
+        // (vision-mcp, docling-mcp, etc.) should show.
+        let mcp_only_caps: HashSet<&str> = ["vision-mcp", "docling-mcp"].into_iter().collect();
         let bob_only: HashSet<String> = ["bob".to_string()].into_iter().collect();
         let filtered = Revaluator::for_capabilities(&discovery, &bob_only);
         assert!(
-            filtered
-                .iter()
-                .all(|r| matches!(r, Recommendation::Capability { capability_type, .. } if capability_type == "vision-mcp")),
-            "with only bob (Mcp-only) selected, only vision-mcp should be recommended"
+            filtered.iter().all(|r| matches!(
+                r,
+                Recommendation::Capability { capability_type, .. }
+                    if mcp_only_caps.contains(capability_type.as_str())
+            )),
+            "with only bob (Mcp-only) selected, only Mcp-binding capabilities should be recommended"
         );
     }
 
