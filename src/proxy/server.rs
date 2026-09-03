@@ -100,8 +100,32 @@ impl ProxyHandle {
         Ok(())
     }
 
+    /// Registers a provider under the path prefix `/providers/{name}`.
+    /// A request arriving on that prefix is forwarded to the provider's
+    /// real upstream with the prefix stripped, so routing is decided by the
+    /// URL the launcher wrote into the tool's config rather than by guessing
+    /// which provider a model name belongs to. Auth is passed through
+    /// untouched. Works whether the proxy is already serving traffic or not.
+    pub fn register_provider(
+        &self,
+        provider_name: &str,
+        base_url: String,
+        label: String,
+    ) -> anyhow::Result<()> {
+        let resolved = ResolvedTarget::build(UpstreamTarget {
+            base_url,
+            verify_ssl: true,
+            auth: UpstreamAuth::Passthrough,
+        })?;
+        let mut table = self.state.routing.write().unwrap();
+        table
+            .providers
+            .insert(provider_name.to_string(), (resolved, label));
+        Ok(())
+    }
+
     /// Sets (or replaces) the fallback target used for requests whose
-    /// `"model"` field doesn't match any registered route.
+    /// `"model"` field doesn't match any registered route or provider prefix.
     pub fn set_default(&self, target: UpstreamTarget, label: String) -> anyhow::Result<()> {
         let resolved = ResolvedTarget::build(target)?;
         let mut table = self.state.routing.write().unwrap();
@@ -175,6 +199,7 @@ impl ProxyServer {
             default_label: "default".to_string(),
             routes: HashMap::new(),
             labels: HashMap::new(),
+            providers: HashMap::new(),
         }));
         let tracker = Arc::new(UsageTracker::new());
         let state = ProxyState { routing, tracker };
@@ -237,6 +262,12 @@ struct RoutingTable {
     default_label: String,
     routes: HashMap<String, ResolvedTarget>,
     labels: HashMap<String, String>,
+    /// Providers registered for path-based routing, keyed by name: a request
+    /// whose path starts with `/providers/{name}/` is forwarded to this
+    /// provider's target with the prefix stripped. Decided by URL rather
+    /// than by the request's model name, so models the provider serves but
+    /// granite-cli has never heard of still route and track correctly.
+    providers: HashMap<String, (ResolvedTarget, String)>,
 }
 
 impl RoutingTable {
@@ -255,8 +286,22 @@ impl RoutingTable {
     /// `default_label` is used only when the body has no identifiable
     /// model name at all (non-JSON body, or a missing/non-string `"model"`
     /// field).
-    fn target_and_label_for(&self, body: &[u8]) -> (ResolvedTarget, String) {
+    fn target_and_label_for(
+        &self,
+        path_and_query: &str,
+        body: &[u8],
+    ) -> anyhow::Result<(ResolvedTarget, String, String)> {
         let model = model_from_body(body);
+        if let Some((name, rest)) = split_provider_path(path_and_query) {
+            let Some((target, label)) = self.providers.get(name) else {
+                anyhow::bail!("no provider registered under '/providers/{name}'");
+            };
+            let label = match &model {
+                Some(model) => format!("{label}/{model}"),
+                None => label.clone(),
+            };
+            return Ok((target.clone(), label, rest.to_string()));
+        }
         if let Some(model) = &model
             && let Some(target) = self.routes.get(model)
         {
@@ -265,11 +310,24 @@ impl RoutingTable {
                 .get(model)
                 .cloned()
                 .unwrap_or_else(|| model.clone());
-            return (target.clone(), label);
+            return Ok((target.clone(), label, path_and_query.to_string()));
         }
         let label = model.unwrap_or_else(|| self.default_label.clone());
-        (self.default.clone(), label)
+        Ok((self.default.clone(), label, path_and_query.to_string()))
     }
+}
+
+/// Splits `/providers/{name}/rest...` into `(name, /rest...)`. Returns
+/// `None` for any other path shape, including a bare `/providers/{name}`
+/// with nothing to forward.
+fn split_provider_path(path_and_query: &str) -> Option<(&str, &str)> {
+    let rest = path_and_query.strip_prefix("/providers/")?;
+    let slash = rest.find('/')?;
+    let (name, remainder) = rest.split_at(slash);
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, remainder))
 }
 
 /// Reads the top-level `"model"` string out of a JSON request body. A
@@ -339,17 +397,13 @@ async fn forward(
     body: Body,
 ) -> anyhow::Result<Response> {
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await?;
-    let (target, label) = {
+    let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let (target, label, forward_path) = {
         let table = state.routing.read().unwrap();
-        table.target_and_label_for(&body_bytes)
+        table.target_and_label_for(path_and_query, &body_bytes)?
     };
 
-    let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let url = format!(
-        "{}{}",
-        target.base_url.trim_end_matches('/'),
-        path_and_query
-    );
+    let url = format!("{}{}", target.base_url.trim_end_matches('/'), forward_path);
 
     let outbound_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
     alog_channel!(
@@ -1004,5 +1058,138 @@ mod tests {
         assert_eq!(chat.requests, 1);
         assert_eq!(chat.input_tokens, 5);
         assert_eq!(chat.output_tokens, 9);
+    }
+
+    #[test]
+    fn split_provider_path_extracts_name_and_remainder() {
+        assert_eq!(
+            split_provider_path("/providers/openai/v1/usage"),
+            Some(("openai", "/v1/usage"))
+        );
+        assert_eq!(split_provider_path("/providers/openai"), None);
+        assert_eq!(split_provider_path("/providers//v1/usage"), None);
+        assert_eq!(split_provider_path("/v1/usage"), None);
+    }
+
+    #[tokio::test]
+    async fn register_provider_routes_by_path_prefix_and_strips_it() {
+        let provider_addr = spawn_echo_server().await;
+        let default_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+
+        server
+            .handle
+            .register_provider(
+                "openai",
+                format!("http://{provider_addr}"),
+                "openai".to_string(),
+            )
+            .unwrap();
+        server
+            .handle
+            .set_default(
+                target(format!("http://{default_addr}"), UpstreamAuth::Passthrough),
+                "default".to_string(),
+            )
+            .unwrap();
+
+        // A model granite-cli has never heard of routes via the path prefix;
+        // the echo server only serves /v1/usage, so success proves the
+        // /providers/openai prefix was stripped before forwarding.
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "{}/providers/openai/v1/usage",
+                server.handle.local_base_url
+            ))
+            .json(&serde_json::json!({ "model": "gpt-4o-mini" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // An unregistered provider path is refused outright rather than
+        // forwarded to the default target with the caller's credentials.
+        let resp = client
+            .post(format!(
+                "{}/providers/unknown/v1/usage",
+                server.handle.local_base_url
+            ))
+            .json(&serde_json::json!({ "model": "gpt-4o-mini" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_path_routing_separates_two_providers() {
+        let addr1 = spawn_echo_server().await;
+        let addr2 = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+
+        server
+            .handle
+            .register_provider("openai", format!("http://{addr1}"), "openai".to_string())
+            .unwrap();
+        server
+            .handle
+            .register_provider("google", format!("http://{addr2}"), "google".to_string())
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        for (provider, model) in [("openai", "gpt-4o"), ("google", "gemini-pro")] {
+            let resp = client
+                .post(format!(
+                    "{}/providers/{provider}/v1/usage",
+                    server.handle.local_base_url
+                ))
+                .json(&serde_json::json!({ "model": model }))
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_success());
+        }
+
+        let snapshot = server.handle.tracker().snapshot();
+        assert!(snapshot.contains_key("openai/gpt-4o"), "{snapshot:?}");
+        assert!(snapshot.contains_key("google/gemini-pro"), "{snapshot:?}");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_path_routing_records_usage_per_provider_and_model() {
+        let provider_addr = spawn_echo_server().await;
+        let server = ProxyServer::start().unwrap();
+
+        server
+            .handle
+            .register_provider(
+                "openrouter",
+                format!("http://{provider_addr}"),
+                "openrouter".to_string(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!(
+                "{}/providers/openrouter/v1/usage",
+                server.handle.local_base_url
+            ))
+            .json(&serde_json::json!({ "model": "anthropic/claude-sonnet-4" }))
+            .send()
+            .await
+            .unwrap();
+
+        let snapshot = server.handle.tracker().snapshot();
+        let stats = snapshot.get("openrouter/anthropic/claude-sonnet-4");
+        assert!(stats.is_some(), "expected labeled row in {snapshot:?}");
+        assert_eq!(stats.unwrap().requests, 1);
+
+        server.shutdown().await;
     }
 }
