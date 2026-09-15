@@ -568,7 +568,10 @@ fn generate_recommended_config_sources(rc_dir: &Path) -> String {
                 let abs_path = path
                     .canonicalize()
                     .expect("failed to canonicalize recommended config path");
-                entries.push((stem, abs_path.to_str().unwrap().to_string()));
+                let path_str = abs_path.to_str().unwrap();
+                #[cfg(windows)]
+                let path_str = path_str.replace('\\', "/");
+                entries.push((stem, path_str.to_string()));
             }
         }
     }
