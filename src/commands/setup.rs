@@ -1178,16 +1178,21 @@ pub struct SetupCommands;
 
 impl SetupCommands {
     /// Entry point for `granite-cli setup`.
-    pub async fn run(ctx: &mut crate::AppContext, auto: bool, skip_pull: bool) -> Result<()> {
+    pub async fn run(
+        ctx: &mut crate::AppContext,
+        auto: bool,
+        pull: bool,
+        skip_pull: bool,
+    ) -> Result<()> {
         if auto {
-            Self::run_auto(ctx).await
+            Self::run_auto(ctx, pull).await
         } else {
-            Self::run_wizard(ctx, skip_pull).await
+            Self::run_wizard(ctx, pull, skip_pull).await
         }
     }
 
     /// Run the interactive wizard.
-    async fn run_wizard(ctx: &mut crate::AppContext, skip_pull: bool) -> Result<()> {
+    async fn run_wizard(ctx: &mut crate::AppContext, pull: bool, skip_pull: bool) -> Result<()> {
         let ui = &*ctx.ui;
         ui.info("=== granite-cli Setup Wizard ===\n");
         ui.info("Discovering available components...\n");
@@ -1281,7 +1286,9 @@ impl SetupCommands {
         .await?;
 
         // Phase 6: Pull (optional)
-        if !skip_pull {
+        if pull {
+            Self::pull_models(ctx, &selected_models).await?;
+        } else if !skip_pull {
             Self::prompt_pull(ctx, &selected_models).await?;
         }
 
@@ -1298,14 +1305,15 @@ impl SetupCommands {
     }
 
     /// Run auto mode — detect, configure everything with defaults.
-    async fn run_auto(ctx: &mut crate::AppContext) -> Result<()> {
-        Self::run_auto_with_hardware(ctx, &detect_hardware()).await
+    async fn run_auto(ctx: &mut crate::AppContext, pull: bool) -> Result<()> {
+        Self::run_auto_with_hardware(ctx, &detect_hardware(), pull).await
     }
 
     /// Hardware-aware variant of `run_auto` for testability.
     async fn run_auto_with_hardware(
         ctx: &mut crate::AppContext,
         hardware: &crate::utils::hardware::HardwareProfile,
+        pull: bool,
     ) -> Result<()> {
         let ui = &*ctx.ui;
         ui.info("=== granite-cli Auto Setup ===\n");
@@ -1356,7 +1364,10 @@ impl SetupCommands {
         )
         .await?;
 
-        // Never auto-pull in --auto mode
+        if pull {
+            Self::pull_models(ctx, &selection.models).await?;
+        }
+
         Self::print_summary(
             ctx,
             &selection.capabilities,
@@ -2593,17 +2604,36 @@ impl SetupCommands {
         let pull_now = ui.confirm("\n→ Pull model weights now?", !items.is_empty())?;
 
         if pull_now {
-            for (model_id, _provider_id, _provider_type) in &pullable {
-                ui.info(&format!("Pulling {model_id}..."));
-                // `ModelCommands::pull` already reports success/failure to
-                // `ctx.ui` itself; just keep going on error rather than
-                // aborting the rest of the pull phase over one model.
-                if let Err(e) = ModelCommands::pull(ctx, model_id).await {
-                    alog_channel!(MessageLevel::Warning, "Pull failed for '{model_id}': {e}");
-                }
-            }
+            Self::pull_models(ctx, selected_models).await?;
         }
 
+        Ok(())
+    }
+
+    /// Pull all configured models, continuing when an individual provider
+    /// fails so one unavailable model cannot prevent the remaining pulls.
+    async fn pull_models(
+        ctx: &mut crate::AppContext,
+        selected_models: &HashSet<String>,
+    ) -> Result<()> {
+        let ui = ctx.ui.clone();
+        let pullable: Vec<String> = selected_models
+            .iter()
+            .filter(|model_id| {
+                ctx.config
+                    .get_model(*model_id)
+                    .and_then(|mc| ctx.config.get_provider(mc.provider_id.as_str()))
+                    .is_some()
+            })
+            .cloned()
+            .collect();
+
+        for model_id in pullable {
+            ui.info(&format!("Pulling {model_id}..."));
+            if let Err(e) = ModelCommands::pull(ctx, &model_id).await {
+                alog_channel!(MessageLevel::Warning, "Pull failed for '{model_id}': {e}");
+            }
+        }
         Ok(())
     }
 
@@ -3739,7 +3769,7 @@ mod tests {
     #[tokio::test]
     async fn run_wizard_with_empty_config_shows_info() {
         let mut ctx = test_ctx();
-        let _ = SetupCommands::run(&mut ctx, false, true).await;
+        let _ = SetupCommands::run(&mut ctx, false, false, true).await;
         // Wizard should complete without error even with no recommendations
         // (it will show info messages)
     }
@@ -3748,7 +3778,7 @@ mod tests {
     async fn run_auto_with_no_recommendations_shows_info() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = test_ctx();
-        let result = SetupCommands::run(&mut ctx, true, true).await;
+        let result = SetupCommands::run(&mut ctx, true, false, true).await;
         assert!(result.is_ok());
     }
 

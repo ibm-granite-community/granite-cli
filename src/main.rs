@@ -137,8 +137,12 @@ enum Commands {
         #[arg(long)]
         auto: bool,
 
+        /// Pull model weights automatically after setup.
+        /// With --auto, this enables non-interactive model pulls.
+        #[arg(long)]
+        pull: bool,
+
         /// Skip the model weight pull prompt at the end of the wizard.
-        /// Model weights are never auto-pulled in --auto mode regardless.
         #[arg(long)]
         skip_pull: bool,
     },
@@ -530,7 +534,11 @@ async fn main() {
                 .await
                 .map_err(|e| ctx.ui.error(&e.to_string()))
         }
-        Some(Commands::Setup { auto, skip_pull }) => {
+        Some(Commands::Setup {
+            auto,
+            pull,
+            skip_pull,
+        }) => {
             let mut ctx = construct_context(
                 "terminal",
                 &log_level,
@@ -538,7 +546,7 @@ async fn main() {
                 log_json,
                 log_thread_id,
             );
-            SetupCommands::run(&mut ctx, auto, skip_pull)
+            SetupCommands::run(&mut ctx, auto, pull, skip_pull)
                 .await
                 .map_err(|e| ctx.ui.error(&e.to_string()))
         }
