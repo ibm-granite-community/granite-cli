@@ -13,7 +13,7 @@ use crate::launchers::base::{
     EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command, run_command_captured,
 };
 use crate::providers::ApiType;
-use crate::registry::ConfigConstructable;
+use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -51,17 +51,14 @@ pub struct PiLauncher {
 impl ConfigConstructable for PiLauncher {
     type Config = PiLauncherConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
-        let config: PiLauncherConfig = serde_json::from_value(cfg.clone()).unwrap_or_default();
-        Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
+        let config: PiLauncherConfig =
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
             bound_binding: None,
-        }
+        })
     }
 }
 
@@ -708,7 +705,7 @@ mod tests {
     use crate::utils::ui::base::tests::CaptureUi;
 
     fn launcher(cfg: serde_json::Value) -> PiLauncher {
-        PiLauncher::new("pi", &cfg, &crate::config::Config::default())
+        PiLauncher::new("pi", &cfg).unwrap()
     }
 
     fn binding() -> AgentModelBinding {
@@ -738,6 +735,7 @@ mod tests {
             base_env: std::collections::HashMap::new(),
             dry_run,
             usage_tracker: None,
+            model_proxy: None,
         }
     }
 
@@ -781,11 +779,7 @@ mod tests {
 
     #[test]
     fn instance_id_round_trips_from_construction() {
-        let l = PiLauncher::new(
-            "pi-local",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let l = PiLauncher::new("pi-local", &serde_json::json!({})).unwrap();
         assert_eq!(l.instance_id(), "pi-local");
     }
 

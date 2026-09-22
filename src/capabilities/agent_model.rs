@@ -8,7 +8,7 @@ use crate::capabilities::base::{
 };
 use crate::capabilities::requirement::ModelRequirement;
 use crate::models::{ConfiguredModel, ModelFunction};
-use crate::registry::ConfigConstructable;
+use crate::registry::{ConfigConstructable, ConstructError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
@@ -44,17 +44,13 @@ impl ConfigConstructable for AgentModelCapability {
     /// Builds the capability from its own config alone. `cfg` holds the
     /// capability's instance config (e.g. `{"model_id": "my-model"}`), where
     /// `model_id` is a name resolved later by `resolve_refs`.
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: AgentModelCapabilityConfig =
-            serde_json::from_value(cfg.clone()).unwrap_or_default();
-        Self {
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
-        }
+        })
     }
 }
 
@@ -182,81 +178,12 @@ mod tests {
     use super::*;
     use crate::capabilities::{CapabilityInfo, ResolvedCapability};
     use crate::config::{Config, ModelConfig, ProviderConfig};
-    use crate::models::Model;
-    use crate::providers::{
-        ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError,
-    };
-    use crate::registry::Secret;
+    use crate::utils::test_support::{FakeModel, FakeProvider};
+
+    use crate::providers::{ApiEndpoint, ApiType};
+
     use std::collections::HashMap;
     use std::sync::Arc;
-
-    #[derive(Clone, Default)]
-    pub(crate) struct FakeProvider {
-        pub(crate) instance_id: String,
-        pub(crate) base_url: String,
-        pub(crate) api_key: Option<Secret>,
-        pub(crate) verify_ssl: bool,
-        pub(crate) api_types: Vec<ApiType>,
-        pub(crate) endpoints: HashMap<ModelFunction, Vec<ApiEndpoint>>,
-        /// When set, `model_alias` returns this value instead of `None`.
-        pub(crate) alias: Option<String>,
-    }
-
-    impl ConfigConstructable for FakeProvider {
-        type Config = crate::registry::NoConfig;
-
-        fn new(
-            _instance_id: &str,
-            _cfg: &serde_json::Value,
-            _global_config: &crate::config::Config,
-        ) -> Self {
-            unimplemented!("not used in tests")
-        }
-    }
-
-    impl crate::registry::Named for FakeProvider {
-        fn instance_id(&self) -> &str {
-            &self.instance_id
-        }
-    }
-
-    #[async_trait]
-    impl Provider for FakeProvider {
-        fn name(&self) -> &str {
-            "Fake Provider"
-        }
-        fn function_endpoints(&self) -> HashMap<ModelFunction, Vec<ApiEndpoint>> {
-            self.endpoints.clone()
-        }
-        fn supported_api_types(&self) -> Vec<ApiType> {
-            self.api_types.clone()
-        }
-        fn base_url(&self) -> &str {
-            &self.base_url
-        }
-        fn api_key(&self) -> Option<&Secret> {
-            self.api_key.as_ref()
-        }
-        fn verify_ssl(&self) -> bool {
-            self.verify_ssl
-        }
-        fn custom_headers(&self) -> Option<HashMap<String, Secret>> {
-            None
-        }
-        fn supported_formats(&self) -> Vec<ModelFormat> {
-            vec![]
-        }
-        fn model_alias(
-            &self,
-            _model_id: String,
-            _variant: Option<&crate::models::ModelVariant>,
-        ) -> Option<String> {
-            self.alias.clone()
-        }
-        async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
-            unimplemented!("not used in tests")
-        }
-    }
 
     fn ok_provider(
         api_types: Vec<ApiType>,
@@ -318,82 +245,17 @@ mod tests {
         let cap = AgentModelCapability::new(
             "my-agent",
             &serde_json::json!({ "model_id": "granite-3.1-8b-instruct" }),
-            &config,
-        );
+        )
+        .unwrap();
         // Replace the real model with our test double that has a custom provider
         // and the specified variants list.
         ResolvedAgentModelCapability {
             inner: cap,
             configured_model: crate::models::ConfiguredModel::for_test(
-                Arc::new(TestModelWithVariants {
-                    supported_functions: functions,
-                    variants,
-                }),
+                Arc::new(FakeModel::text(functions).with_variants(variants)),
                 std::sync::Arc::new(provider),
                 variant_str,
             ),
-        }
-    }
-
-    /// Extended test model that carries a mutable variants list.
-    struct TestModelWithVariants {
-        supported_functions: Vec<ModelFunction>,
-        variants: Vec<crate::models::ModelVariant>,
-    }
-
-    impl ConfigConstructable for TestModelWithVariants {
-        type Config = crate::registry::NoConfig;
-        fn new(
-            _instance_id: &str,
-            _cfg: &serde_json::Value,
-            _global_config: &crate::config::Config,
-        ) -> Self {
-            unimplemented!("not used in tests")
-        }
-    }
-
-    impl crate::registry::Named for TestModelWithVariants {
-        fn instance_id(&self) -> &str {
-            "granite-3.1-8b-instruct"
-        }
-    }
-
-    impl Model for TestModelWithVariants {
-        fn family(&self) -> &str {
-            "Test"
-        }
-        fn version(&self) -> &str {
-            "1.0"
-        }
-        fn size(&self) -> u64 {
-            1
-        }
-        fn context_length(&self) -> u64 {
-            4096
-        }
-        fn model_type(&self) -> &crate::models::ModelType {
-            &crate::models::ModelType::Text
-        }
-        fn huggingface_repo(&self) -> &str {
-            "test/test"
-        }
-        fn native_dtype(&self) -> &str {
-            "bfloat16"
-        }
-        fn architecture(&self) -> &crate::models::ModelArchitecture {
-            unimplemented!("not used in tests")
-        }
-        fn variants(&self) -> &[crate::models::ModelVariant] {
-            &self.variants
-        }
-        fn description(&self) -> Option<&str> {
-            None
-        }
-        fn tags(&self) -> &[String] {
-            &[]
-        }
-        fn supported_functions(&self) -> &[ModelFunction] {
-            &self.supported_functions
         }
     }
 
@@ -513,8 +375,8 @@ mod tests {
         let cap = AgentModelCapability::new(
             "my-agent",
             &serde_json::json!({ "model_id": "granite-3.1-8b-instruct" }),
-            &config,
-        );
+        )
+        .unwrap();
         assert_eq!(
             cap.binding_types(),
             HashSet::from([BindingType::AgentModel])

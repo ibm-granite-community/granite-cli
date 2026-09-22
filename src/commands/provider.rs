@@ -393,7 +393,6 @@ impl ProviderCommands {
                 &provider_config.provider_type,
                 &provider_config.provider_id,
                 &provider_config.config,
-                &ctx.config,
             )
             .map_err(|e| anyhow::anyhow!("Failed to create provider: {e}"))?;
 

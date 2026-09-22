@@ -36,10 +36,23 @@ pub struct ModelSource {
 }
 
 impl ModelSource {
+    /// Models whose providers carry their real connection details.
     pub fn from_config(config: &crate::config::Config) -> Self {
+        Self::with_proxy(config, None)
+    }
+
+    /// Models whose providers point at `model_proxy` when a launch started
+    /// one, so a capability resolved against this source binds to the proxy.
+    pub fn with_proxy(
+        config: &crate::config::Config,
+        model_proxy: Option<crate::proxy::ProxyHandle>,
+    ) -> Self {
         Self {
             config: config.clone(),
-            providers: Arc::new(crate::providers::ProviderSource::from_config(config)),
+            providers: Arc::new(crate::providers::ProviderSource::with_proxy(
+                config,
+                model_proxy,
+            )),
             cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -117,9 +130,8 @@ impl ModelSource {
                 &model_config.model_type,
                 &model_config.model_id,
                 &model_config.config,
-                &self.config,
             )
-            .map_err(|e| anyhow::anyhow!("could not construct model '{model_id}': {e}"))?;
+            .map_err(|e| e.about("model", model_id))?;
 
         let built: Arc<dyn Model> = Arc::from(built);
         // Built outside the lock, so two callers can reach here for one id.
@@ -566,9 +578,8 @@ mod tests {
             },
         );
         let server = ProxyServer::start().unwrap();
-        config.model_proxy = Some(server.handle.clone());
 
-        let source = ModelSource::from_config(&config);
+        let source = ModelSource::with_proxy(&config, Some(server.handle.clone()));
 
         // Registering the route is the launch path's job, so do here what
         // `register_proxy_routes` does there: read the real upstream details

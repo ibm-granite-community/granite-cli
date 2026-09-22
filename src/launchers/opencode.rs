@@ -29,7 +29,7 @@ use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetada
 use crate::launchers::shared::mcp_cli::mcp_binding_request;
 use crate::providers::ApiType;
 use crate::proxy::ProxyHandle;
-use crate::registry::ConfigConstructable;
+use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
 
@@ -70,31 +70,21 @@ pub struct OpenCodeLauncher {
     /// its own `provider.<name>` entry and is referenced directly as
     /// `<provider>/<model>` in `agent.<name>.model` -- no mini-router needed.
     bound_sub_agents: Vec<(String, SubAgentBinding)>,
-    /// The session-scoped model proxy, if one was booted for this launch
-    /// (see `run_launch`) -- present whenever usage tracking or sub-agent
-    /// routing is needed. Used to redirect provider baseURLs so all traffic
-    /// flows through the proxy for usage accounting.
-    model_proxy: Option<ProxyHandle>,
 }
 
 impl ConfigConstructable for OpenCodeLauncher {
     type Config = OpenCodeLauncherConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        global_config: &crate::config::Config,
-    ) -> Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: OpenCodeLauncherConfig =
-            serde_json::from_value(cfg.clone()).unwrap_or_default();
-        Self {
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
             bound_agent_model: None,
             bound_mcp_bindings: vec![],
             bound_sub_agents: vec![],
-            model_proxy: global_config.model_proxy.clone(),
-        }
+        })
     }
 }
 
@@ -278,8 +268,12 @@ impl Launcher for OpenCodeLauncher {
             // Build granite-cli provider entries
             let mut granite_providers = serde_json::Map::new();
             for (index, (binding, model_names)) in self.provider_groups().iter().enumerate() {
-                let entry =
-                    self.provider_entry(binding, model_names, &provider_api_key_env(index))?;
+                let entry = self.provider_entry(
+                    ctx.model_proxy.as_ref(),
+                    binding,
+                    model_names,
+                    &provider_api_key_env(index),
+                )?;
                 granite_providers.insert(binding.provider_name.clone(), entry);
             }
 
@@ -289,13 +283,14 @@ impl Launcher for OpenCodeLauncher {
             // recognize is rejected rather than forwarded (see
             // `target_and_label_for`), so an entry in one set but not the
             // other would break that provider outright.
-            if let Some(proxy_handle) = &self.model_proxy {
+            if let Some(proxy_handle) = ctx.model_proxy.as_ref() {
                 let user_providers = Self::discover_user_providers(ctx).unwrap_or_default();
                 let env_providers = Self::discover_env_providers();
                 if !user_providers.is_empty() || !env_providers.is_empty() {
                     self.register_user_providers_on_proxy(proxy_handle, &env_providers);
                     self.register_user_providers_on_proxy(proxy_handle, &user_providers);
                     granite_providers = self.merge_user_providers_into_config(
+                        ctx.model_proxy.as_ref(),
                         &user_providers,
                         &env_providers,
                         &granite_providers,
@@ -381,11 +376,12 @@ impl OpenCodeLauncher {
     /// name matters.
     fn provider_entry(
         &self,
+        proxy: Option<&ProxyHandle>,
         binding: &AgentModelBinding,
         model_names: &[&str],
         api_key_env: &str,
     ) -> anyhow::Result<serde_json::Value> {
-        let base_url = self.proxy_base_url(binding);
+        let base_url = self.proxy_base_url(proxy, binding);
         let mut options = serde_json::json!({ "baseURL": base_url });
         if binding
             .api_key
@@ -535,8 +531,8 @@ impl OpenCodeLauncher {
     /// local URL so all traffic flows through it for accounting -- the proxy
     /// dispatches by the `"model"` field in each request body. Otherwise
     /// delegates to `opencode_base_url` to compute the provider's real URL.
-    fn proxy_base_url(&self, binding: &AgentModelBinding) -> String {
-        match &self.model_proxy {
+    fn proxy_base_url(&self, proxy: Option<&ProxyHandle>, binding: &AgentModelBinding) -> String {
+        match proxy {
             Some(handle) => handle.local_base_url.clone(),
             None => opencode_base_url(binding),
         }
@@ -863,8 +859,12 @@ impl OpenCodeLauncher {
     /// the session proxy's `/providers/{name}` path prefix, from which the
     /// proxy resolves the real upstream registered in
     /// `register_user_providers_on_proxy`.
-    fn provider_proxy_url(&self, provider_name: &str) -> Option<String> {
-        self.model_proxy.as_ref().map(|handle| {
+    fn provider_proxy_url(
+        &self,
+        proxy: Option<&ProxyHandle>,
+        provider_name: &str,
+    ) -> Option<String> {
+        proxy.map(|handle| {
             format!(
                 "{}/providers/{}",
                 handle.local_base_url.trim_end_matches('/'),
@@ -875,6 +875,7 @@ impl OpenCodeLauncher {
 
     fn merge_user_providers_into_config(
         &self,
+        proxy: Option<&ProxyHandle>,
         user_providers: &serde_json::Map<String, serde_json::Value>,
         env_providers: &serde_json::Map<String, serde_json::Value>,
         granite_providers: &serde_json::Map<String, serde_json::Value>,
@@ -891,7 +892,7 @@ impl OpenCodeLauncher {
                     && let Some(real_url) = options_obj.get("baseURL").and_then(|b| b.as_str())
                     && !real_url.contains("127.0.0.1")
                     && !real_url.contains("localhost")
-                    && let Some(proxy_url) = self.provider_proxy_url(name)
+                    && let Some(proxy_url) = self.provider_proxy_url(proxy, name)
                 {
                     options_obj.insert("baseURL".to_string(), serde_json::Value::String(proxy_url));
                 }
@@ -906,7 +907,7 @@ impl OpenCodeLauncher {
                 if let Some(options_obj) = proxied
                     .get_mut("options")
                     .and_then(|options| options.as_object_mut())
-                    && let Some(proxy_url) = self.provider_proxy_url(name)
+                    && let Some(proxy_url) = self.provider_proxy_url(proxy, name)
                 {
                     options_obj.insert("baseURL".to_string(), serde_json::Value::String(proxy_url));
                 }
@@ -1034,7 +1035,7 @@ mod tests {
     use crate::utils::ui::base::tests::CaptureUi;
 
     fn launcher(cfg: serde_json::Value) -> OpenCodeLauncher {
-        OpenCodeLauncher::new("opencode", &cfg, &crate::config::Config::default())
+        OpenCodeLauncher::new("opencode", &cfg).unwrap()
     }
 
     fn binding() -> AgentModelBinding {
@@ -1064,6 +1065,7 @@ mod tests {
             base_env: std::collections::HashMap::new(),
             dry_run,
             usage_tracker: None,
+            model_proxy: None,
         }
     }
 
@@ -1113,11 +1115,7 @@ mod tests {
 
     #[test]
     fn instance_id_round_trips_from_construction() {
-        let l = OpenCodeLauncher::new(
-            "opencode-local",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let l = OpenCodeLauncher::new("opencode-local", &serde_json::json!({})).unwrap();
         assert_eq!(l.instance_id(), "opencode-local");
     }
 
@@ -1144,7 +1142,7 @@ mod tests {
     fn provider_entry_describes_bound_model() {
         let b = binding();
         let entry = launcher(serde_json::json!({}))
-            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .provider_entry(None, &b, &[b.model_name.as_str()], API_KEY_ENV)
             .unwrap();
         assert_eq!(entry["npm"], "@ai-sdk/openai-compatible");
         assert_eq!(entry["options"]["baseURL"], "http://localhost:11434/v1");
@@ -1160,7 +1158,7 @@ mod tests {
     fn provider_entry_describes_multiple_models_for_one_provider() {
         let b = binding();
         let entry = launcher(serde_json::json!({}))
-            .provider_entry(&b, &["granite4.1:8b", "granite4.1:3b"], API_KEY_ENV)
+            .provider_entry(None, &b, &["granite4.1:8b", "granite4.1:3b"], API_KEY_ENV)
             .unwrap();
         assert_eq!(entry["models"]["granite4.1:8b"]["name"], "granite4.1:8b");
         assert_eq!(entry["models"]["granite4.1:3b"]["name"], "granite4.1:3b");
@@ -1173,7 +1171,7 @@ mod tests {
             ..binding()
         };
         let entry = launcher(serde_json::json!({}))
-            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .provider_entry(None, &b, &[b.model_name.as_str()], API_KEY_ENV)
             .unwrap();
         assert_eq!(
             entry["options"]["apiKey"],
@@ -1189,6 +1187,7 @@ mod tests {
         };
         let entry = launcher(serde_json::json!({}))
             .provider_entry(
+                None,
                 &b,
                 &[b.model_name.as_str()],
                 "GRANITE_CLI_OPENCODE_API_KEY_1",
@@ -1207,7 +1206,7 @@ mod tests {
             ..binding()
         };
         let entry = launcher(serde_json::json!({}))
-            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .provider_entry(None, &b, &[b.model_name.as_str()], API_KEY_ENV)
             .unwrap();
         assert!(entry["options"].get("apiKey").is_none());
     }
@@ -1219,7 +1218,7 @@ mod tests {
         }));
         let b = binding();
         let entry = l
-            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .provider_entry(None, &b, &[b.model_name.as_str()], API_KEY_ENV)
             .unwrap();
         assert_eq!(entry["headers"]["X-Custom"], "1");
         // Generated keys survive the merge.
@@ -1233,7 +1232,7 @@ mod tests {
         }));
         let b = binding();
         let entry = l
-            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .provider_entry(None, &b, &[b.model_name.as_str()], API_KEY_ENV)
             .unwrap();
         assert_eq!(entry["npm"], "@ai-sdk/openai");
     }
@@ -1254,7 +1253,7 @@ mod tests {
             ..binding()
         };
         let entry = launcher(serde_json::json!({}))
-            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .provider_entry(None, &b, &[b.model_name.as_str()], API_KEY_ENV)
             .unwrap();
         assert_eq!(
             entry["options"]["headers"]["Helicone-Cache-Enabled"],
@@ -1820,9 +1819,11 @@ mod tests {
     async fn proxy_base_url_returns_proxy_url_when_model_proxy_is_set() {
         let b = binding();
         let server = crate::proxy::ProxyServer::start().unwrap();
-        let mut l = launcher(serde_json::json!({}));
-        l.model_proxy = Some(server.handle.clone());
-        assert_eq!(l.proxy_base_url(&b), server.handle.local_base_url);
+        let l = launcher(serde_json::json!({}));
+        assert_eq!(
+            l.proxy_base_url(Some(&server.handle), &b),
+            server.handle.local_base_url
+        );
         server.shutdown().await;
     }
 
@@ -1830,17 +1831,21 @@ mod tests {
     fn proxy_base_url_returns_regular_url_when_no_model_proxy() {
         let b = binding();
         let l = launcher(serde_json::json!({}));
-        assert_eq!(l.proxy_base_url(&b), opencode_base_url(&b));
+        assert_eq!(l.proxy_base_url(None, &b), opencode_base_url(&b));
     }
 
     #[tokio::test]
     async fn provider_entry_uses_proxy_url_when_model_proxy_is_active() {
         let server = crate::proxy::ProxyServer::start().unwrap();
-        let mut l = launcher(serde_json::json!({}));
-        l.model_proxy = Some(server.handle.clone());
+        let l = launcher(serde_json::json!({}));
         let b = binding();
         let entry = l
-            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .provider_entry(
+                Some(&server.handle),
+                &b,
+                &[b.model_name.as_str()],
+                API_KEY_ENV,
+            )
             .unwrap();
         assert_eq!(entry["options"]["baseURL"], server.handle.local_base_url);
         server.shutdown().await;
@@ -1851,7 +1856,7 @@ mod tests {
         let l = launcher(serde_json::json!({}));
         let b = binding();
         let entry = l
-            .provider_entry(&b, &[b.model_name.as_str()], API_KEY_ENV)
+            .provider_entry(None, &b, &[b.model_name.as_str()], API_KEY_ENV)
             .unwrap();
         assert_eq!(entry["options"]["baseURL"], opencode_base_url(&b));
     }
@@ -1859,10 +1864,11 @@ mod tests {
     #[tokio::test]
     async fn dry_run_launch_with_proxy_redirects_base_url() {
         let server = crate::proxy::ProxyServer::start().unwrap();
-        let mut l = bound(serde_json::json!({ "command_path": "ls" }), binding());
-        l.model_proxy = Some(server.handle.clone());
+        let l = bound(serde_json::json!({ "command_path": "ls" }), binding());
         let ui = CaptureUi::default();
-        l.launch(&[], &ctx(true), &ui).await.unwrap();
+        let mut launch_ctx = ctx(true);
+        launch_ctx.model_proxy = Some(server.handle.clone());
+        l.launch(&[], &launch_ctx, &ui).await.unwrap();
 
         let dump = ui.infos.borrow().join("\n");
         assert!(dump.contains(&server.handle.local_base_url), "{dump}");
@@ -2034,8 +2040,7 @@ mod tests {
     #[tokio::test]
     async fn merge_user_providers_rewrites_base_urls_to_provider_paths() {
         let server = crate::proxy::ProxyServer::start().unwrap();
-        let mut l = launcher(serde_json::json!({}));
-        l.model_proxy = Some(server.handle.clone());
+        let l = launcher(serde_json::json!({}));
 
         let user: serde_json::Map<String, serde_json::Value> = serde_json::json!({
             "openrouter": {
@@ -2070,7 +2075,8 @@ mod tests {
         .unwrap()
         .clone();
 
-        let merged = l.merge_user_providers_into_config(&user, &env, &granite);
+        let merged =
+            l.merge_user_providers_into_config(Some(&server.handle), &user, &env, &granite);
 
         let proxy = server
             .handle

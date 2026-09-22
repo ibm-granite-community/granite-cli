@@ -48,6 +48,7 @@ fn derived_ctx(ctx: &LaunchContext, launcher_id: String) -> LaunchContext {
         base_env: ctx.base_env.clone(),
         dry_run: ctx.dry_run,
         usage_tracker: ctx.usage_tracker.clone(),
+        model_proxy: ctx.model_proxy.clone(),
     }
 }
 
@@ -111,11 +112,11 @@ async fn build_delegate_sub_agent(
     outer_ctx: &LaunchContext,
 ) -> anyhow::Result<DelegateSubAgent> {
     let launcher_id = format!("bob-delegate-{tool_name}");
-    let mut pi = PiLauncher::new(
-        &launcher_id,
-        &serde_json::json!({}),
-        &crate::config::Config::default(),
-    );
+    // An empty settings blob is `PiLauncherConfig`'s default shape, so this
+    // cannot report unreadable settings; it is mapped rather than unwrapped
+    // so a later field with no default surfaces here instead of panicking.
+    let mut pi = PiLauncher::new(&launcher_id, &serde_json::json!({}))
+        .map_err(|e| anyhow::anyhow!("could not build the delegate launcher: {e}"))?;
     let wrapper = StaticCapabilityBinding {
         instance_id: tool_name.clone(),
         binding: Binding::AgentModel(binding.model.clone()),
@@ -326,6 +327,7 @@ mod tests {
             base_env: HashMap::new(),
             dry_run: true,
             usage_tracker: None,
+            model_proxy: None,
         }
     }
 

@@ -62,14 +62,6 @@ pub struct Config {
     pub capabilities: HashMap<String, CapabilityConfig>,
     pub launchers: HashMap<String, LauncherConfig>,
     pub recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
-    /// Ephemeral handle to the session-scoped model proxy for the current
-    /// `launch` invocation, set whenever `-u`/`--usage-tracking` is enabled
-    /// or a bound capability needs sub-agent routing. Never persisted --
-    /// `Config` is saved as separate per-entry YAML files (see `save()`),
-    /// never as a whole, so this field is simply skipped on both
-    /// directions.
-    #[serde(skip)]
-    pub model_proxy: Option<crate::proxy::ProxyHandle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

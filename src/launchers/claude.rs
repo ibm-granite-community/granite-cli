@@ -16,8 +16,7 @@ use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetada
 use crate::launchers::shared::mcp_cli::{
     mcp_binding_request, register_mcp_server, remove_mcp_server,
 };
-use crate::proxy::ProxyHandle;
-use crate::registry::ConfigConstructable;
+use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
 
@@ -43,34 +42,27 @@ pub struct ClaudeLauncher {
     /// `(name, binding)` for every `SubAgentCapability` bound to this
     /// launcher -- `name` is the capability's own `instance_id`, used as the
     /// sub-agent's name in the `--agents` JSON map. Each sub-agent's route
-    /// was already registered on `model_proxy` by `ModelSource::take`; when
+    /// was already registered on the session proxy by `run_launch`; when
     /// non-empty, `launch()` (via `wire_model_proxy`) points
     /// `ANTHROPIC_BASE_URL` at that proxy so each sub-agent's model reaches
-    /// its own resolved provider.
+    /// its own resolved provider. The handle itself arrives on
+    /// `LaunchContext`, not on this struct.
     bound_sub_agents: Vec<(String, SubAgentBinding)>,
-    /// The session-scoped model proxy, if one was booted for this launch
-    /// (see `run_launch`) -- present whenever usage tracking or sub-agent
-    /// routing is needed.
-    model_proxy: Option<ProxyHandle>,
 }
 
 impl ConfigConstructable for ClaudeLauncher {
     type Config = ClaudeLauncherConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        global_config: &crate::config::Config,
-    ) -> Self {
-        let config: ClaudeLauncherConfig = serde_json::from_value(cfg.clone()).unwrap_or_default();
-        Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
+        let config: ClaudeLauncherConfig =
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
             bound_agent_model: None,
             bound_mcp_bindings: vec![],
             bound_sub_agents: vec![],
-            model_proxy: global_config.model_proxy.clone(),
-        }
+        })
     }
 }
 
@@ -326,7 +318,7 @@ impl ClaudeLauncher {
         ctx: &LaunchContext,
         overlay: &mut Vec<EnvBinding>,
     ) -> anyhow::Result<()> {
-        match &self.model_proxy {
+        match &ctx.model_proxy {
             Some(handle) => {
                 if let Some(main) = &self.bound_agent_model
                     && let Err(e) = handle.set_default_from_route(&main.model_name)
@@ -450,11 +442,7 @@ mod tests {
 
     #[test]
     fn command_defaults_to_claude() {
-        let l = ClaudeLauncher::new(
-            "my-claude",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let l = ClaudeLauncher::new("my-claude", &serde_json::json!({})).unwrap();
         assert_eq!(l.command(), "claude");
     }
 
@@ -465,8 +453,8 @@ mod tests {
             &serde_json::json!({
                 "command_path": "/opt/bin/claude"
             }),
-            &crate::config::Config::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(l.command(), "/opt/bin/claude");
     }
 
@@ -477,8 +465,8 @@ mod tests {
             &serde_json::json!({
                 "command_path": "/no/such/path/claude"
             }),
-            &crate::config::Config::default(),
-        );
+        )
+        .unwrap();
         assert!(l.validate_command().is_err());
     }
 
@@ -489,8 +477,8 @@ mod tests {
             &serde_json::json!({
                 "command_path": "ls"
             }),
-            &crate::config::Config::default(),
-        );
+        )
+        .unwrap();
         assert!(l.validate_command().is_ok());
     }
 
@@ -600,11 +588,7 @@ mod tests {
 
     #[test]
     fn map_tool_name_covers_every_canonical_variant_and_formats_mcp_references() {
-        let l = ClaudeLauncher::new(
-            "my-claude",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let l = ClaudeLauncher::new("my-claude", &serde_json::json!({})).unwrap();
         assert_eq!(
             l.map_tool_name(&ToolName::FileRead),
             Some("Read".to_string())
@@ -679,14 +663,19 @@ mod tests {
         bound_agent_model: Option<crate::capabilities::AgentModelBinding>,
         bound_sub_agents: Vec<(String, SubAgentBinding)>,
     ) -> ClaudeLauncher {
-        let mut l = ClaudeLauncher::new(
-            "my-claude",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let mut l = ClaudeLauncher::new("my-claude", &serde_json::json!({})).unwrap();
         l.bound_agent_model = bound_agent_model;
         l.bound_sub_agents = bound_sub_agents;
         l
+    }
+
+    /// A launch context carrying the session proxy, as `run_launch` builds
+    /// one when usage tracking or sub-agent routing booted a proxy.
+    fn proxied_launch_context(handle: crate::proxy::ProxyHandle) -> LaunchContext {
+        LaunchContext {
+            model_proxy: Some(handle),
+            ..test_launch_context(false)
+        }
     }
 
     fn test_launch_context(dry_run: bool) -> LaunchContext {
@@ -696,6 +685,7 @@ mod tests {
             base_env: std::collections::HashMap::new(),
             dry_run,
             usage_tracker: None,
+            model_proxy: None,
         }
     }
 
@@ -778,11 +768,10 @@ mod tests {
         // process would never reach the proxy and nothing would ever be
         // tracked.
         let server = crate::proxy::ProxyServer::start().unwrap();
-        let mut l = launcher_with(None, vec![]);
-        l.model_proxy = Some(server.handle.clone());
+        let l = launcher_with(None, vec![]);
 
         let mut overlay = vec![];
-        l.wire_model_proxy(&test_launch_context(false), &mut overlay)
+        l.wire_model_proxy(&proxied_launch_context(server.handle.clone()), &mut overlay)
             .unwrap();
         assert_eq!(overlay.len(), 1);
         assert_eq!(overlay[0].key, "ANTHROPIC_BASE_URL");
@@ -891,7 +880,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut l = launcher_with(
+        let l = launcher_with(
             // As it would look once wrapped: base_url points at the proxy,
             // api_key is cleared -- neither is used by the fix, only
             // `model_name` is (to look up the already-registered route).
@@ -911,10 +900,9 @@ mod tests {
                 sub_agent_binding("Reviews code", "granite-3.1-8b-instruct", vec![]),
             )],
         );
-        l.model_proxy = Some(server.handle.clone());
 
         let mut overlay = vec![];
-        l.wire_model_proxy(&test_launch_context(false), &mut overlay)
+        l.wire_model_proxy(&proxied_launch_context(server.handle.clone()), &mut overlay)
             .unwrap();
         assert_eq!(overlay[0].key, "ANTHROPIC_BASE_URL");
         assert_eq!(overlay[0].value, server.handle.local_base_url);
@@ -1014,11 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_capability_pushes_sub_agent_binding() {
-        let mut l = ClaudeLauncher::new(
-            "my-claude",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let mut l = ClaudeLauncher::new("my-claude", &serde_json::json!({})).unwrap();
         let cap = FakeSubAgentCapability {
             instance_id: "reviewer".to_string(),
             binding: sub_agent_binding("Reviews code", "granite-3.1-8b-instruct", vec![]),

@@ -4,7 +4,7 @@ use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
     ProviderError, ProviderMetadata, ProviderType, http_health_check,
 };
-use crate::registry::{ConfigConstructable, Secret};
+use crate::registry::{ConfigConstructable, ConstructError, Secret};
 use crate::utils::ui::Ui;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -183,30 +183,27 @@ impl OllamaProvider {
 impl ConfigConstructable for OllamaProvider {
     type Config = OllamaProviderConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
-        let config: OllamaProviderConfig = serde_json::from_value(cfg.clone()).unwrap_or_default();
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
+        let config: OllamaProviderConfig =
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .danger_accept_invalid_certs(!config.verify_ssl)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(ConstructError::settings)?;
 
         let stream_client = reqwest::Client::builder()
             .danger_accept_invalid_certs(!config.verify_ssl)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(ConstructError::settings)?;
 
-        Self {
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
             client,
             stream_client,
-        }
+        })
     }
 }
 
@@ -448,29 +445,21 @@ mod tests {
             "base_url": "http://example.com:8080",
             "timeout_secs": 30
         });
-        let provider = OllamaProvider::new("my-ollama", &cfg, &crate::config::Config::default());
+        let provider = OllamaProvider::new("my-ollama", &cfg).unwrap();
         assert_eq!(provider.config.base_url, "http://example.com:8080");
         assert_eq!(provider.config.timeout_secs, 30);
     }
 
     #[test]
     fn test_can_run_model_accepts_gguf() {
-        let provider = OllamaProvider::new(
-            "my-ollama",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = OllamaProvider::new("my-ollama", &serde_json::json!({})).unwrap();
         assert!(provider.can_run_model("gguf", "Q4_K_M"));
         assert!(provider.can_run_model("GGUF", "fp16"));
     }
 
     #[test]
     fn test_can_run_model_rejects_non_gguf() {
-        let provider = OllamaProvider::new(
-            "my-ollama",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = OllamaProvider::new("my-ollama", &serde_json::json!({})).unwrap();
         assert!(!provider.can_run_model("safetensors", "fp16"));
         assert!(!provider.can_run_model("onnx", "fp32"));
     }
@@ -614,11 +603,7 @@ mod tests {
 
     #[test]
     fn test_model_alias_returns_library_ref_for_ollama_variant() {
-        let provider = OllamaProvider::new(
-            "my-ollama",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = OllamaProvider::new("my-ollama", &serde_json::json!({})).unwrap();
         let variant = ModelVariant {
             format: "Ollama".to_string(),
             precision: "Q4_K_M".to_string(),
@@ -633,11 +618,7 @@ mod tests {
 
     #[test]
     fn test_model_alias_returns_org_scoped_ref_for_org_url() {
-        let provider = OllamaProvider::new(
-            "my-ollama",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = OllamaProvider::new("my-ollama", &serde_json::json!({})).unwrap();
         let variant = ModelVariant {
             format: "Ollama".to_string(),
             precision: "Q4_K_M".to_string(),
@@ -652,11 +633,7 @@ mod tests {
 
     #[test]
     fn test_model_alias_returns_none_for_non_ollama_variant() {
-        let provider = OllamaProvider::new(
-            "my-ollama",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = OllamaProvider::new("my-ollama", &serde_json::json!({})).unwrap();
         let variant = ModelVariant {
             format: "GGUF".to_string(),
             precision: "Q4_K_M".to_string(),
@@ -671,11 +648,7 @@ mod tests {
 
     #[test]
     fn test_model_alias_returns_none_when_no_variant() {
-        let provider = OllamaProvider::new(
-            "my-ollama",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = OllamaProvider::new("my-ollama", &serde_json::json!({})).unwrap();
         assert_eq!(provider.model_alias("unused".to_string(), None), None);
     }
 

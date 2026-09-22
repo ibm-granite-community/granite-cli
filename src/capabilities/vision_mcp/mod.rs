@@ -24,7 +24,7 @@ use crate::capabilities::base::{
 use crate::capabilities::requirement::ModelRequirement;
 use crate::models::{ConfiguredModel, ModelFunction, ModelType};
 use crate::providers::ApiType;
-use crate::registry::ConfigConstructable;
+use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::subserver::SubServer;
 use async_trait::async_trait;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -100,17 +100,13 @@ impl ConfigConstructable for VisionMCPCapability {
     /// `ConfiguredModel`, exactly like `AgentModelCapability::new` -- so
     /// `model.provider()` works at bind time and, when a usage-tracking
     /// session is active, the model is transparently tracked.
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: VisionMCPCapabilityConfig =
-            serde_json::from_value(cfg.clone()).unwrap_or_default();
-        Self {
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
-        }
+        })
     }
 }
 
@@ -280,72 +276,12 @@ mod tests {
     use super::*;
     use crate::capabilities::{CapabilityInfo, ResolvedCapability};
     use crate::config::{Config, ModelConfig, ProviderConfig};
-    use crate::models::{Model, ModelVariant};
-    use crate::providers::{ApiEndpoint, HealthStatus, ModelFormat, Provider, ProviderError};
-    use crate::registry::Secret;
+    use crate::models::Model;
+    use crate::utils::test_support::{FakeModel, FakeProvider};
+
+    use crate::providers::ApiEndpoint;
+
     use std::collections::HashMap as StdHashMap;
-
-    #[derive(Clone, Default)]
-    struct FakeProvider {
-        instance_id: String,
-        base_url: String,
-        api_key: Option<Secret>,
-        verify_ssl: bool,
-        api_types: Vec<ApiType>,
-        endpoints: StdHashMap<ModelFunction, Vec<ApiEndpoint>>,
-        alias: Option<String>,
-    }
-
-    impl ConfigConstructable for FakeProvider {
-        type Config = crate::registry::NoConfig;
-        fn new(_: &str, _: &serde_json::Value, _: &crate::config::Config) -> Self {
-            unimplemented!("not used in tests")
-        }
-    }
-
-    impl crate::registry::Named for FakeProvider {
-        fn instance_id(&self) -> &str {
-            &self.instance_id
-        }
-    }
-
-    #[async_trait]
-    impl Provider for FakeProvider {
-        fn name(&self) -> &str {
-            "Fake Provider"
-        }
-        fn function_endpoints(&self) -> StdHashMap<ModelFunction, Vec<ApiEndpoint>> {
-            self.endpoints.clone()
-        }
-        fn supported_api_types(&self) -> Vec<ApiType> {
-            self.api_types.clone()
-        }
-        fn base_url(&self) -> &str {
-            &self.base_url
-        }
-        fn api_key(&self) -> Option<&Secret> {
-            self.api_key.as_ref()
-        }
-        fn verify_ssl(&self) -> bool {
-            self.verify_ssl
-        }
-        fn custom_headers(&self) -> Option<StdHashMap<String, Secret>> {
-            None
-        }
-        fn supported_formats(&self) -> Vec<ModelFormat> {
-            vec![]
-        }
-        fn model_alias(
-            &self,
-            _model_id: String,
-            _variant: Option<&ModelVariant>,
-        ) -> Option<String> {
-            self.alias.clone()
-        }
-        async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
-            unimplemented!("not used in tests")
-        }
-    }
 
     fn ok_provider() -> FakeProvider {
         let mut endpoints = StdHashMap::new();
@@ -358,62 +294,6 @@ mod tests {
             api_types: vec![ApiType::OpenAI],
             endpoints,
             alias: None,
-        }
-    }
-
-    struct TestVisionModel {
-        supported_functions: Vec<ModelFunction>,
-    }
-
-    impl ConfigConstructable for TestVisionModel {
-        type Config = crate::registry::NoConfig;
-        fn new(_: &str, _: &serde_json::Value, _: &crate::config::Config) -> Self {
-            unimplemented!("not used in tests")
-        }
-    }
-
-    impl crate::registry::Named for TestVisionModel {
-        fn instance_id(&self) -> &str {
-            "granite-vision-test"
-        }
-    }
-
-    impl Model for TestVisionModel {
-        fn family(&self) -> &str {
-            "Test"
-        }
-        fn version(&self) -> &str {
-            "1.0"
-        }
-        fn size(&self) -> u64 {
-            1
-        }
-        fn context_length(&self) -> u64 {
-            4096
-        }
-        fn model_type(&self) -> &ModelType {
-            &ModelType::Vision
-        }
-        fn huggingface_repo(&self) -> &str {
-            "test/test-vision"
-        }
-        fn native_dtype(&self) -> &str {
-            "bfloat16"
-        }
-        fn architecture(&self) -> &crate::models::ModelArchitecture {
-            unimplemented!("not used in tests")
-        }
-        fn variants(&self) -> &[ModelVariant] {
-            &[]
-        }
-        fn description(&self) -> Option<&str> {
-            None
-        }
-        fn tags(&self) -> &[String] {
-            &[]
-        }
-        fn supported_functions(&self) -> &[ModelFunction] {
-            &self.supported_functions
         }
     }
 
@@ -446,14 +326,12 @@ mod tests {
         let cap = VisionMCPCapability::new(
             "vision",
             &serde_json::json!({ "model_id": "granite-3.1-8b-instruct" }),
-            &config,
-        );
+        )
+        .unwrap();
         ResolvedVisionMCPCapability {
             inner: cap,
             configured_model: ConfiguredModel::for_test(
-                Arc::new(TestVisionModel {
-                    supported_functions: functions,
-                }),
+                Arc::new(FakeModel::vision(functions)),
                 Arc::new(provider),
                 None,
             ),
@@ -474,6 +352,7 @@ mod tests {
             base_env: HashMap::new(),
             dry_run: false,
             usage_tracker: None,
+            model_proxy: None,
         }
     }
 
@@ -565,15 +444,15 @@ mod tests {
         // image requests away from a text model is the `ModelRequirement`
         // this capability's metadata declares, applied when the name is
         // resolved. This asserts the declaration reaches that check.
-        let cap = Box::new(VisionMCPCapability::new(
-            "vision",
-            &serde_json::json!({ "model_id": "granite-3.1-8b-instruct" }),
-            &Config::default(),
-        ));
+        let cap = Box::new(
+            VisionMCPCapability::new(
+                "vision",
+                &serde_json::json!({ "model_id": "granite-3.1-8b-instruct" }),
+            )
+            .unwrap(),
+        );
         let lookup = CheckingLookup {
-            model: Arc::new(TestVisionModel {
-                supported_functions: vec![ModelFunction::Chat],
-            }),
+            model: Arc::new(FakeModel::vision(vec![ModelFunction::Chat])),
         };
 
         let err = cap

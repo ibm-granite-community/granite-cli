@@ -161,12 +161,13 @@ and a failure anywhere in the chain is returned to whoever asked:
 `ModelSource` answers which provider a model names, and assembles a
 `ConfiguredModel` out of the model, that provider and the variant the user
 pinned, so a model no longer carries a copy of its provider's settings.
-`CapabilitySource` constructs a capability and then hands it a model lookup to
-fill in its model, comparing that model with the `ModelRequirement` the
-capability's registry entry declares. Both steps run while the source is still
-the only owner of the capability, and the source caches and hands out a handle
-only when both have succeeded, so a capability without its model never leaves
-the module that builds it. A launcher holds no capabilities: the ids in
+`CapabilitySource` constructs a capability and then hands it a model lookup,
+which consumes it and returns the form that holds its model, comparing that
+model with the `ModelRequirement` the capability's registry entry declares.
+Binding is declared on that second form alone, so a capability without its
+model has no `bind` to call. Both steps run while the source is still the only
+owner of the capability, and the source caches and hands out a handle only
+when both have succeeded. A launcher holds no capabilities: the ids in
 `enabled_capabilities` are read from configuration by a launch.
 
 The error a source returns carries the kind, the id and what went wrong, which
@@ -280,7 +281,7 @@ naming it; and `instances()` followed by `get` returning the same object.
   `src/launchers/mod.rs` (the four eager loops)
 - `src/models/base.rs:256` (`ModelSource::from_config` rebuilt per resolve)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -333,7 +334,7 @@ ones, while `health_check` and `pull_model` still reach the real upstream.
 - `build.rs:60-75` (the generated field and its deserialisation)
 - `src/proxy/model_wrapper.rs` (`ProxiedModel`, `ProxiedProvider`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -348,11 +349,12 @@ unsuitable model itself.
 
 The models layer publishes the narrow lookup a capability needs, which
 `ModelSource` implements and which assembles a `ConfiguredModel` from the
-model, its provider and the configured variant. `Capability` gains one
-optional method that takes that lookup and fills in the capability's model,
-defaulting to doing nothing so the capabilities with no outbound references
-need no change. The six model-backed capabilities hold their model as an
-optional field, set it in that method and read it in `bind`.
+model, its provider and the configured variant. What a capability reports
+about itself splits from what it does: `Capability` declares taking that
+lookup and returning the resolved form, and `ResolvedCapability` declares
+`bind` and the launch hooks. The six model-backed capabilities gain a resolved
+companion holding the `ConfiguredModel` outright, built only by that step, so
+binding one that never resolved does not compile.
 
 `CapabilitySource` constructs and then resolves, in that order, while it is
 still the only owner of the capability, and caches and returns a handle only
@@ -390,7 +392,7 @@ every id `refs()` reports is one the resolve step consumes.
   (the two plain implementations and the two macros)
 - `src/capabilities/requirement.rs` (`Requirement<dyn Model>`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -426,7 +428,7 @@ faithful.
 - `src/models/base.rs`, `src/launchers/base.rs`, `src/utils/ui/base.rs`,
   `src/registry/mod.rs` (the remaining doubles)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -462,7 +464,7 @@ what it produces from the field today.
 - `src/main.rs` (`construct_ui`, the launch path)
 - `src/launchers/claude.rs`, `src/launchers/base.rs` (`LaunchContext`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -509,7 +511,7 @@ name still reported as an unknown type.
   `src/models/custom.rs`, `src/utils/ui/backends/*.rs` (the implementations)
 - the `reqwest::Client::builder` calls in the five provider constructors
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 

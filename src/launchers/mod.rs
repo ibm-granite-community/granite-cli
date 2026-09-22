@@ -58,8 +58,8 @@ impl LauncherSource {
             .get(launcher_id)
             .ok_or_else(|| anyhow::anyhow!("launcher '{launcher_id}' is not configured"))?;
         let built = LAUNCHER_REGISTRY
-            .construct(&lc.launcher_type, &lc.launcher_id, &lc.config, &self.config)
-            .map_err(|e| anyhow::anyhow!("could not construct launcher '{launcher_id}': {e}"))?;
+            .construct(&lc.launcher_type, &lc.launcher_id, &lc.config)
+            .map_err(|e| e.about("launcher", launcher_id))?;
         let built: std::sync::Arc<dyn Launcher> = std::sync::Arc::from(built);
         // Built outside the lock, so two callers can reach here for one id.
         // `or_insert` keeps whichever landed first and drops the other, so

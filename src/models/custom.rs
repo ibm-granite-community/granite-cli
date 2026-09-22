@@ -6,7 +6,7 @@ use crate::models::base::{
     HasModelMetadata, Model, ModelArchitecture, ModelFunction, ModelMetadata, ModelType,
     ModelVariant,
 };
-use crate::registry::{ConfigConstructable, Named};
+use crate::registry::{ConfigConstructable, ConstructError, Named};
 
 /*-- CustomModelConfig ---------------------------------------------------------*/
 
@@ -73,16 +73,13 @@ pub struct CustomModel {
 impl ConfigConstructable for CustomModel {
     type Config = CustomModelConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
-        let config: CustomModelConfig = serde_json::from_value(cfg.clone()).unwrap_or_default();
-        Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
+        let config: CustomModelConfig =
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
-        }
+        })
     }
 }
 
@@ -195,7 +192,7 @@ mod tests {
             "tags": ["chat"],
             "supported_functions": ["Chat"],
         });
-        let model = CustomModel::new("my-nickname", &cfg, &crate::config::Config::default());
+        let model = CustomModel::new("my-nickname", &cfg).unwrap();
         assert_eq!(model.instance_id(), "my-nickname");
         assert_eq!(model.family(), "My Local Model");
         assert_eq!(model.size(), 7_000_000_000);
@@ -233,7 +230,7 @@ mod tests {
             "context_length": 4096,
             "model_type": "Vision",
         });
-        let model = CustomModel::new("nick", &cfg, &crate::config::Config::default());
+        let model = CustomModel::new("nick", &cfg).unwrap();
         let md = model.to_metadata();
         assert_eq!(md.family, "My Local Model");
         assert_eq!(md.context_length, 4096);

@@ -624,73 +624,9 @@ mod to_metadata_tests {
 #[cfg(test)]
 mod configured_model_tests {
     use super::*;
-    use crate::providers::{
-        ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError,
-    };
-    use crate::registry::{ConfigConstructable, Secret};
+    use crate::providers::{ApiEndpoint, ApiType};
+    use crate::utils::test_support::FakeProvider;
     use std::collections::HashMap;
-
-    #[derive(Clone, Default)]
-    struct FakeProvider {
-        instance_id: String,
-        base_url: String,
-        api_key: Option<Secret>,
-        verify_ssl: bool,
-        api_types: Vec<ApiType>,
-        endpoints: HashMap<ModelFunction, Vec<ApiEndpoint>>,
-        alias: Option<String>,
-    }
-
-    impl ConfigConstructable for FakeProvider {
-        type Config = crate::registry::NoConfig;
-        fn new(_: &str, _: &serde_json::Value, _: &crate::config::Config) -> Self {
-            unimplemented!("not used in tests")
-        }
-    }
-
-    impl crate::registry::Named for FakeProvider {
-        fn instance_id(&self) -> &str {
-            &self.instance_id
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for FakeProvider {
-        fn name(&self) -> &str {
-            "Fake Provider"
-        }
-        fn function_endpoints(&self) -> HashMap<ModelFunction, Vec<ApiEndpoint>> {
-            self.endpoints.clone()
-        }
-        fn supported_api_types(&self) -> Vec<ApiType> {
-            self.api_types.clone()
-        }
-        fn base_url(&self) -> &str {
-            &self.base_url
-        }
-        fn api_key(&self) -> Option<&Secret> {
-            self.api_key.as_ref()
-        }
-        fn verify_ssl(&self) -> bool {
-            self.verify_ssl
-        }
-        fn custom_headers(&self) -> Option<HashMap<String, Secret>> {
-            None
-        }
-        fn supported_formats(&self) -> Vec<ModelFormat> {
-            vec![]
-        }
-        fn model_alias(
-            &self,
-            _model_id: String,
-            _variant: Option<&ModelVariant>,
-        ) -> Option<String> {
-            self.alias.clone()
-        }
-        async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
-            unimplemented!("not used in tests")
-        }
-    }
 
     fn ok_provider() -> FakeProvider {
         let mut endpoints = HashMap::new();

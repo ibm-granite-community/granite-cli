@@ -3,7 +3,7 @@ use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
     ProviderError, ProviderMetadata, ProviderType,
 };
-use crate::registry::{ConfigConstructable, Secret};
+use crate::registry::{ConfigConstructable, ConstructError, Secret};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -107,18 +107,15 @@ impl OpenAIProvider {
 impl ConfigConstructable for OpenAIProvider {
     type Config = OpenAIProviderConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
-        let config: OpenAIProviderConfig = serde_json::from_value(cfg.clone()).unwrap_or_default();
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
+        let config: OpenAIProviderConfig =
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .danger_accept_invalid_certs(!config.verify_ssl)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(ConstructError::settings)?;
 
         let function_endpoints = config
             .function_endpoints
@@ -130,14 +127,14 @@ impl ConfigConstructable for OpenAIProvider {
 
         let model_aliases = config.model_aliases.clone().unwrap_or_default();
 
-        Self {
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
             client,
             function_endpoints,
             custom_headers,
             model_aliases,
-        }
+        })
     }
 }
 
@@ -373,7 +370,7 @@ mod tests {
             "api_key": "test-key",
             "timeout_secs": 30
         });
-        let provider = OpenAIProvider::new("my-openai", &cfg, &crate::config::Config::default());
+        let provider = OpenAIProvider::new("my-openai", &cfg).unwrap();
         assert_eq!(provider.config.base_url, "http://example.com:8080");
         assert_eq!(
             provider.config.api_key,
@@ -402,7 +399,7 @@ mod tests {
             }
         });
 
-        let provider = OpenAIProvider::new("my-openai", &cfg, &crate::config::Config::default());
+        let provider = OpenAIProvider::new("my-openai", &cfg).unwrap();
         assert!(provider.config.custom_headers.is_some());
         let headers = provider.config.custom_headers.as_ref().unwrap();
         assert_eq!(headers.len(), 2);
@@ -418,8 +415,10 @@ mod tests {
 
     #[test]
     fn test_provider_function_endpoints() {
-        let cfg = serde_json::json!({});
-        let provider = OpenAIProvider::new("my-openai", &cfg, &crate::config::Config::default());
+        // base_url has no default: an openai-compatible provider is defined
+        // by the endpoint it talks to, so the settings have to state one.
+        let cfg = serde_json::json!({ "base_url": "http://localhost:8080" });
+        let provider = OpenAIProvider::new("my-openai", &cfg).unwrap();
         let endpoints = provider.function_endpoints();
         assert!(endpoints.contains_key(&ModelFunction::Chat));
         assert!(endpoints.contains_key(&ModelFunction::Embeddings));
@@ -432,7 +431,7 @@ mod tests {
         let cfg = serde_json::json!({
             "base_url": "http://example.com:8080"
         });
-        let provider = OpenAIProvider::new("my-openai", &cfg, &crate::config::Config::default());
+        let provider = OpenAIProvider::new("my-openai", &cfg).unwrap();
         let endpoints = provider.function_endpoints();
         // Default config has all three functions
         assert!(endpoints.contains_key(&ModelFunction::Chat));

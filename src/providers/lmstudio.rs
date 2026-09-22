@@ -4,7 +4,7 @@ use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
     ProviderError, ProviderMetadata, ProviderType, http_health_check,
 };
-use crate::registry::{ConfigConstructable, Secret};
+use crate::registry::{ConfigConstructable, ConstructError, Secret};
 use crate::utils::ui::Ui;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -154,25 +154,21 @@ impl LMStudioProvider {
 impl ConfigConstructable for LMStudioProvider {
     type Config = LMStudioProviderConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: LMStudioProviderConfig =
-            serde_json::from_value(cfg.clone()).unwrap_or_default();
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .danger_accept_invalid_certs(!config.verify_ssl)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(ConstructError::settings)?;
 
-        Self {
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
             client,
-        }
+        })
     }
 }
 
@@ -391,41 +387,28 @@ mod tests {
             "base_url": "http://example.com:5678",
             "timeout_secs": 30
         });
-        let provider =
-            LMStudioProvider::new("my-lmstudio", &cfg, &crate::config::Config::default());
+        let provider = LMStudioProvider::new("my-lmstudio", &cfg).unwrap();
         assert_eq!(provider.config.base_url, "http://example.com:5678");
         assert_eq!(provider.config.timeout_secs, 30);
     }
 
     #[test]
     fn test_can_run_model_accepts_gguf() {
-        let provider = LMStudioProvider::new(
-            "my-lmstudio",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LMStudioProvider::new("my-lmstudio", &serde_json::json!({})).unwrap();
         assert!(provider.can_run_model("gguf", "Q4_K_M"));
         assert!(provider.can_run_model("GGUF", "fp16"));
     }
 
     #[test]
     fn test_can_run_model_rejects_non_supported() {
-        let provider = LMStudioProvider::new(
-            "my-lmstudio",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LMStudioProvider::new("my-lmstudio", &serde_json::json!({})).unwrap();
         assert!(!provider.can_run_model("safetensors", "fp16"));
         assert!(!provider.can_run_model("onnx", "fp32"));
     }
 
     #[test]
     fn test_mlx_formats_on_macos() {
-        let provider = LMStudioProvider::new(
-            "my-lmstudio",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LMStudioProvider::new("my-lmstudio", &serde_json::json!({})).unwrap();
         let formats = provider.supported_formats();
 
         #[cfg(target_os = "macos")]
@@ -437,11 +420,7 @@ mod tests {
 
     #[test]
     fn test_can_run_mlx_model() {
-        let provider = LMStudioProvider::new(
-            "my-lmstudio",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LMStudioProvider::new("my-lmstudio", &serde_json::json!({})).unwrap();
 
         #[cfg(target_os = "macos")]
         assert!(provider.can_run_model("mlx", "fp16"));

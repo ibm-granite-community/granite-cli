@@ -31,9 +31,8 @@ pub struct ProviderSource {
     /// The configuration this source was built from. Only
     /// `config.providers` is read; `construct` takes the whole thing.
     config: crate::config::Config,
-    /// When a session proxy is running, every provider handed out by `get`
-    /// points at it instead of the real upstream. Read from
-    /// `Config.model_proxy`, which a launch sets when it starts one.
+    /// When a launch passes a session proxy, every provider handed out by
+    /// `get` points at it instead of the real upstream.
     model_proxy: Option<crate::proxy::ProxyHandle>,
     /// Providers as configured, carrying their real connection details.
     upstream: std::sync::Mutex<HashMap<String, std::sync::Arc<dyn Provider>>>,
@@ -45,10 +44,21 @@ pub struct ProviderSource {
 }
 
 impl ProviderSource {
+    /// Providers carrying their real connection details. This is what the
+    /// launch path reads to register a route's upstream target, which has to
+    /// happen before the proxy swap rather than from behind it.
     pub fn from_config(config: &crate::config::Config) -> Self {
+        Self::with_proxy(config, None)
+    }
+
+    /// Providers pointed at `model_proxy` when a launch started one.
+    pub fn with_proxy(
+        config: &crate::config::Config,
+        model_proxy: Option<crate::proxy::ProxyHandle>,
+    ) -> Self {
         Self {
             config: config.clone(),
-            model_proxy: config.model_proxy.clone(),
+            model_proxy,
             upstream: std::sync::Mutex::new(HashMap::new()),
             proxied: std::sync::Mutex::new(HashMap::new()),
         }
@@ -96,9 +106,8 @@ impl ProviderSource {
                 &provider_config.provider_type,
                 &provider_config.provider_id,
                 &provider_config.config,
-                &self.config,
             )
-            .map_err(|e| anyhow::anyhow!("could not construct provider '{provider_id}': {e}"))?;
+            .map_err(|e| e.about("provider", provider_id))?;
         let built: std::sync::Arc<dyn Provider> = std::sync::Arc::from(built);
         // Built outside the lock, so two callers can reach here for one id.
         // `or_insert` keeps whichever landed first and drops the other, so
@@ -187,6 +196,46 @@ mod tests {
             openai_provider_config("ollama", "http://localhost:11434"),
         );
         config
+    }
+
+    #[test]
+    fn get_names_the_provider_whose_settings_cannot_be_read() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({ "timeout_secs": "ten" }),
+            },
+        );
+
+        let source = ProviderSource::from_config(&config);
+        let err = source.get("ollama").err().unwrap().to_string();
+        assert!(
+            err.contains("provider 'ollama'") && err.contains("invalid type"),
+            "expected the instance and what serde said, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_names_the_provider_whose_type_is_unknown() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "mystery".to_string(),
+            ProviderConfig {
+                provider_id: "mystery".to_string(),
+                provider_type: "not-a-provider-type".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+
+        let source = ProviderSource::from_config(&config);
+        let err = source.get("mystery").err().unwrap().to_string();
+        assert!(
+            err.contains("mystery") && err.contains("not-a-provider-type"),
+            "expected the instance and the type it names, got: {err}"
+        );
     }
 
     #[test]

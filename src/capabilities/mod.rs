@@ -64,11 +64,8 @@ impl CapabilitySource {
                 &capability_config.capability_type,
                 &capability_config.capability_id,
                 &capability_config.config,
-                &self.config,
             )
-            .map_err(|e| {
-                anyhow::anyhow!("could not construct capability '{capability_id}': {e}")
-            })?;
+            .map_err(|e| e.about("capability", capability_id))?;
 
         // Wiring the capability to what it names is where a missing or
         // unsuitable model is reported. Spec 0024 gated this with a
@@ -239,7 +236,7 @@ mod tests {
                 "prompt": "a probe",
             });
             let capability = CAPABILITY_REGISTRY
-                .construct(type_name, "an-instance", &cfg, &Config::default())
+                .construct(type_name, "an-instance", &cfg)
                 .unwrap_or_else(|e| panic!("{type_name} must construct from its own config: {e}"));
 
             let lookup = RecordingLookup {
@@ -298,6 +295,51 @@ mod tests {
         );
 
         assert!(source.get("healthy").is_ok());
+        let ids: Vec<String> = source.instances().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec!["healthy".to_string()]);
+    }
+
+    #[test]
+    fn settings_that_cannot_be_read_are_named_and_left_out() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        config.models.insert(
+            "granite-3.1-8b-instruct".to_string(),
+            ModelConfig {
+                model_id: "granite-3.1-8b-instruct".to_string(),
+                model_type: "granite-3.1-8b-instruct".to_string(),
+                config: serde_json::json!({}),
+                provider_id: "ollama".to_string(),
+                variant: None,
+            },
+        );
+        config.capabilities.insert(
+            "healthy".to_string(),
+            agent_model_config("healthy", "granite-3.1-8b-instruct"),
+        );
+        config.capabilities.insert(
+            "broken".to_string(),
+            CapabilityConfig {
+                capability_id: "broken".to_string(),
+                capability_type: "agent-model".to_string(),
+                config: serde_json::json!({ "model_id": 42 }),
+            },
+        );
+
+        let source = CapabilitySource::from_config(&config);
+        let err = source.get("broken").err().unwrap().to_string();
+        assert!(
+            err.contains("capability 'broken'") && err.contains("invalid type"),
+            "expected the instance and what serde said, got: {err}"
+        );
+
         let ids: Vec<String> = source.instances().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec!["healthy".to_string()]);
     }

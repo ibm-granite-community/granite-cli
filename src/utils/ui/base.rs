@@ -51,7 +51,7 @@ pub(crate) fn non_interactive<T>() -> anyhow::Result<T> {
 /// Invoke with the constructor expression as argument:
 ///
 /// ```ignore
-/// output_contract_tests!(PlainOutput::new("plain", &serde_json::json!({})));
+/// output_contract_tests!(PlainOutput::new("plain", &serde_json::json!({})).unwrap());
 /// ```
 #[macro_export]
 macro_rules! output_contract_tests {
@@ -338,9 +338,8 @@ pub(crate) mod tests {
         fn new(
             _instance_id: &str,
             _cfg: &serde_json::Value,
-            _global_config: &crate::config::Config,
-        ) -> Self {
-            Self::default()
+        ) -> Result<Self, crate::registry::ConstructError> {
+            Ok(Self::default())
         }
     }
 
@@ -518,12 +517,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ui_registry_construct_unknown_returns_err() {
-        let result = UI_REGISTRY.construct(
-            "nonexistent",
-            "nonexistent",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let result = UI_REGISTRY.construct("nonexistent", "nonexistent", &serde_json::json!({}));
         assert!(result.is_err());
     }
 

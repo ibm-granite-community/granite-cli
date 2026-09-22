@@ -1,16 +1,66 @@
 mod secret;
 pub use secret::Secret;
 
-// TODO: There are a number of instances of `#[allow(unused)]` that allow
-// certain portions of the factories to be unused without warning. These should
-// be removed once all factories are populated and utilized.
-
 /*-- Generic Factory Infrastructure ------------------------------------------*/
 
 /// Unit struct for types that have no structured config.
 /// Used by test doubles and impls that genuinely have no config to declare.
 #[derive(schemars::JsonSchema, serde::Serialize, serde::Deserialize, Default)]
 pub struct NoConfig {}
+
+/// Why a factory could not produce an instance.
+///
+/// The two cases are kept apart so a caller can act on them without reading
+/// the message: an unregistered type name is a different problem, with a
+/// different repair, from settings that cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstructError {
+    /// The name given is not a key in this kind's registry.
+    UnknownType { type_name: String },
+    /// The settings blob does not produce an instance of this type, because
+    /// it does not deserialise into the type's `Config` or because building
+    /// from it failed.
+    Settings { detail: String },
+}
+
+impl ConstructError {
+    /// Report settings that cannot be read. `detail` is whatever the
+    /// deserialiser or the builder said; the caller that names the instance
+    /// adds the rest.
+    pub fn settings(detail: impl std::fmt::Display) -> Self {
+        Self::Settings {
+            detail: detail.to_string(),
+        }
+    }
+}
+
+impl ConstructError {
+    /// This failure as a message naming the instance it is about, for a
+    /// source that knows which kind and id it was asked for. One wording for
+    /// all four kinds, so the same problem reads the same whichever source
+    /// reports it.
+    pub fn about(&self, kind: &str, instance_id: &str) -> anyhow::Error {
+        match self {
+            Self::UnknownType { type_name } => {
+                anyhow::anyhow!("{kind} '{instance_id}' has an unknown {kind} type '{type_name}'")
+            }
+            Self::Settings { detail } => {
+                anyhow::anyhow!("the settings for {kind} '{instance_id}' are not valid: {detail}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ConstructError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownType { type_name } => write!(f, "unknown instance type: {type_name}"),
+            Self::Settings { detail } => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ConstructError {}
 
 /// Core trait that all factory-managed types must implement.
 /// Provides construction from a configuration object.
@@ -19,8 +69,7 @@ pub trait ConfigConstructable {
     /// Must implement `JsonSchema + Serialize + Default`.
     type Config: schemars::JsonSchema + serde::Serialize + Default;
 
-    /// Construct with the instance's configured name, a config instance, and
-    /// the global application config.
+    /// Construct with the instance's configured name and its own config.
     ///
     /// `instance_id` is the key this instance is configured under (e.g. the
     /// provider nickname `my-ollama`), *not* the registry type name. Implementations
@@ -28,13 +77,16 @@ pub trait ConfigConstructable {
     /// [`Named`]. For instances constructed outside any configured set (bare
     /// catalog lookups, `--output` backends), callers pass the type name.
     ///
-    /// Most implementations ignore `global_config`; types that need cross-registry
-    /// resolution (e.g. resolving a model's provider) use it.
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        global_config: &crate::config::Config,
-    ) -> Self
+    /// A name this instance refers to is resolved after construction, by the
+    /// source that owns what is being named, so nothing here needs the
+    /// application configuration.
+    ///
+    /// Reading `cfg` is the one thing that can fail. An implementation
+    /// deserialises it into its own `Config` and reports
+    /// [`ConstructError::Settings`] when that does not work, so a blob that
+    /// does not parse is named instead of silently becoming a default.
+    /// Construction does no I/O, so nothing else here has anything to report.
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError>
     where
         Self: Sized;
 }
@@ -95,7 +147,6 @@ macro_rules! define_factory {
         /// Uses PhantomData to maintain type information without storing instances.
         struct MetaOf<T>(std::marker::PhantomData<T>);
         impl<T> MetaOf<T> {
-            #[allow(unused)]
             const fn new() -> Self {
                 Self(std::marker::PhantomData)
             }
@@ -104,13 +155,21 @@ macro_rules! define_factory {
         $crate::paste::paste! {
             /// Internal trait for metadata provision and construction.
             /// This trait enables type erasure while maintaining type safety.
+            /// The `#[allow(unused)]` annotations below are for the `Ui`
+            /// factory, the one instantiation nothing describes or prompts
+            /// for: `--output` constructs a backend by name and never asks
+            /// for its metadata, schema or defaults outside tests.
             pub(crate) trait [<$trait Metadata_>]: Send + Sync {
                 /// Get metadata describing this implementation
+                #[allow(unused)]
                 fn describe(&self) -> $metadata;
 
-                /// Construct an instance with its configured name, config, and global application config
-                #[allow(unused)]
-                fn construct(&self, instance_id: &str, cfg: &serde_json::Value, global_config: &$crate::config::Config) -> Box<dyn $trait>;
+                /// Construct an instance with its configured name and config
+                fn construct(
+                    &self,
+                    instance_id: &str,
+                    cfg: &serde_json::Value,
+                ) -> Result<Box<dyn $trait>, $crate::registry::ConstructError>;
 
                 /// JSON schema of the config this implementation expects
                 #[allow(unused)]
@@ -143,8 +202,12 @@ macro_rules! define_factory {
                     T::metadata()
                 }
 
-                fn construct(&self, instance_id: &str, cfg: &serde_json::Value, global_config: &$crate::config::Config) -> Box<dyn $trait> {
-                    Box::new(T::new(instance_id, cfg, global_config))
+                fn construct(
+                    &self,
+                    instance_id: &str,
+                    cfg: &serde_json::Value,
+                ) -> Result<Box<dyn $trait>, $crate::registry::ConstructError> {
+                    Ok(Box::new(T::new(instance_id, cfg)?))
                 }
 
                 fn config_schema(&self) -> schemars::Schema {
@@ -186,7 +249,6 @@ macro_rules! define_factory {
                 /// # Arguments
                 ///
                 /// * `name` - Static string identifier for this implementation
-                #[allow(unused)]
                 pub(crate) fn register<T>(&mut self, name: &'static str)
                 where
                     T: $trait
@@ -202,8 +264,8 @@ macro_rules! define_factory {
 
                 /// Construct an instance by name with the given configuration.
                 ///
-                /// `name` selects the registered implementation. `instance_id`,
-                /// `cfg` and `global_config` go to that implementation's
+                /// `name` selects the registered implementation. `instance_id`
+                /// and `cfg` go to that implementation's
                 /// `ConfigConstructable::new` unchanged, so `cfg` is what decides
                 /// the instance:
                 /// - A saved instance's config produces that configured instance,
@@ -214,8 +276,8 @@ macro_rules! define_factory {
                 ///   since there is no config key.
                 ///
                 /// `instance_id` is only the label the instance reports through
-                /// [`Named`]. It is never looked up in `global_config`, so an id
-                /// that is not configured constructs the same as one that is.
+                /// [`Named`]. Nothing here looks it up, so an id that is not
+                /// configured constructs the same as one that is.
                 ///
                 /// # Arguments
                 ///
@@ -228,19 +290,21 @@ macro_rules! define_factory {
                 /// # Returns
                 ///
                 /// * `Ok(Box<dyn Trait>)` - Successfully constructed instance
-                /// * `Err(String)` - Error message if name not found
-                #[allow(unused)]
+                /// * `Err(ConstructError::UnknownType)` - `name` is not registered
+                /// * `Err(ConstructError::Settings)` - `cfg` cannot be read as
+                ///   this type's config
                 pub(crate) fn construct(
                     &self,
                     name: &str,
                     instance_id: &str,
                     cfg: &serde_json::Value,
-                    global_config: &$crate::config::Config,
-                ) -> Result<Box<dyn $trait>, String> {
+                ) -> Result<Box<dyn $trait>, $crate::registry::ConstructError> {
                     self.registry
                         .get(name)
-                        .map(|x| x.construct(instance_id, cfg, global_config))
-                        .ok_or_else(|| format!("Unknown instance type: {}", name))
+                        .ok_or_else(|| $crate::registry::ConstructError::UnknownType {
+                            type_name: name.to_string(),
+                        })?
+                        .construct(instance_id, cfg)
                 }
 
                 /// Get metadata for a specific implementation by name.
@@ -341,16 +405,12 @@ mod tests {
     impl ConfigConstructable for TestImpl1 {
         type Config = NoConfig;
 
-        fn new(
-            instance_id: &str,
-            cfg: &serde_json::Value,
-            _global_config: &crate::config::Config,
-        ) -> Self {
+        fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
             let value = cfg.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            Self {
+            Ok(Self {
                 instance_id: instance_id.to_string(),
                 value,
-            }
+            })
         }
     }
 
@@ -381,16 +441,12 @@ mod tests {
     impl ConfigConstructable for TestImpl2 {
         type Config = TestImpl2Config;
 
-        fn new(
-            instance_id: &str,
-            cfg: &serde_json::Value,
-            _global_config: &crate::config::Config,
-        ) -> Self {
+        fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
             let value = cfg.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            Self {
+            Ok(Self {
                 instance_id: instance_id.to_string(),
                 value: value * 2,
-            }
+            })
         }
     }
 
@@ -415,6 +471,49 @@ mod tests {
     impl HasTestTraitMetadata for TestImpl2 {
         fn metadata() -> String {
             "TestImpl2: Another test implementation".to_string()
+        }
+    }
+
+    /// A type whose config has a typed field, so a blob of the wrong shape
+    /// is something `new` can report.
+    struct TestImpl3 {
+        instance_id: String,
+        value: i32,
+    }
+
+    #[derive(schemars::JsonSchema, serde::Serialize, serde::Deserialize, Default)]
+    struct TestImpl3Config {
+        value: i32,
+    }
+
+    impl ConfigConstructable for TestImpl3 {
+        type Config = TestImpl3Config;
+
+        fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
+            let config: TestImpl3Config =
+                serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+            Ok(Self {
+                instance_id: instance_id.to_string(),
+                value: config.value,
+            })
+        }
+    }
+
+    impl TestTrait for TestImpl3 {
+        fn get_value(&self) -> i32 {
+            self.value
+        }
+    }
+
+    impl Named for TestImpl3 {
+        fn instance_id(&self) -> &str {
+            &self.instance_id
+        }
+    }
+
+    impl HasTestTraitMetadata for TestImpl3 {
+        fn metadata() -> String {
+            "TestImpl3: settings with a typed field".to_string()
         }
     }
 
@@ -449,16 +548,11 @@ mod tests {
         factory.register::<TestImpl2>("impl2");
 
         let cfg = serde_json::json!({ "value": 42 });
-        let global_config = crate::config::Config::default();
 
-        let inst1 = factory
-            .construct("impl1", "my-impl1", &cfg, &global_config)
-            .unwrap();
+        let inst1 = factory.construct("impl1", "my-impl1", &cfg).unwrap();
         assert_eq!(inst1.get_value(), 42);
 
-        let inst2 = factory
-            .construct("impl2", "my-impl2", &cfg, &global_config)
-            .unwrap();
+        let inst2 = factory.construct("impl2", "my-impl2", &cfg).unwrap();
         assert_eq!(inst2.get_value(), 84); // TestImpl2 doubles the value
     }
 
@@ -466,11 +560,50 @@ mod tests {
     fn test_factory_construct_unknown() {
         let factory = TestTraitFactory::new();
         let cfg = serde_json::json!({ "value": 42 });
-        let global_config = crate::config::Config::default();
 
-        let result = factory.construct("unknown", "unknown", &cfg, &global_config);
-        assert!(result.is_err());
-        assert!(result.err().unwrap().contains("Unknown instance type"));
+        let result = factory.construct("unknown", "unknown", &cfg);
+        assert_eq!(
+            result.err().unwrap(),
+            ConstructError::UnknownType {
+                type_name: "unknown".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn construct_reports_settings_it_cannot_read() {
+        let mut factory = TestTraitFactory::new();
+        factory.register::<TestImpl3>("impl3");
+
+        let err = factory
+            .construct(
+                "impl3",
+                "my-impl3",
+                &serde_json::json!({ "value": "not a number" }),
+            )
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&err, ConstructError::Settings { detail } if detail.contains("invalid type")),
+            "expected unreadable settings, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn construct_accepts_a_key_it_does_not_know() {
+        let mut factory = TestTraitFactory::new();
+        factory.register::<TestImpl3>("impl3");
+
+        // A configuration written by a later version carries keys this one
+        // has never heard of, and still names an instance this one can build.
+        let inst = factory
+            .construct(
+                "impl3",
+                "my-impl3",
+                &serde_json::json!({ "value": 7, "from_the_future": true }),
+            )
+            .unwrap();
+        assert_eq!(inst.get_value(), 7);
     }
 
     #[test]

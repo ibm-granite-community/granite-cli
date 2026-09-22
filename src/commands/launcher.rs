@@ -268,7 +268,7 @@ impl LauncherCommands {
         // Validate the binary now so the user gets immediate feedback.
         // validate_command respects command_path when set; falls back to PATH.
         let launcher = LAUNCHER_REGISTRY
-            .construct(launcher_type, &instance_id, &config, &ctx.config)
+            .construct(launcher_type, &instance_id, &config)
             .map_err(|e| anyhow::anyhow!("Failed to construct launcher: {e}"))?;
 
         match launcher.validate_command() {

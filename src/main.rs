@@ -377,12 +377,7 @@ pub struct AppContext {
 /// `main` that still reports via `eprintln!` rather than `ctx.ui`.
 fn construct_ui(output: &str) -> Box<dyn Ui> {
     UI_REGISTRY
-        .construct(
-            output,
-            output,
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        )
+        .construct(output, output, &serde_json::json!({}))
         .unwrap_or_else(|_| {
             eprintln!("Unknown output format '{output}'. Valid: terminal, plain, json, markdown");
             std::process::exit(1);
@@ -790,7 +785,7 @@ async fn run_launch(
     LauncherCommands::prelaunch(ctx, launcher_id).await?;
 
     let ui: &dyn Ui = &*ctx.ui;
-    let mut config = ctx.config.clone();
+    let config = ctx.config.clone();
 
     let lc = config
         .get_launcher(launcher_id)
@@ -826,9 +821,9 @@ async fn run_launch(
         None
     };
     if let Some(server) = &proxy_server {
-        config.model_proxy = Some(server.handle.clone());
         crate::proxy::register_proxy_routes(&config, &lc.enabled_capabilities, &server.handle, ui);
     }
+    let model_proxy = proxy_server.as_ref().map(|s| s.handle.clone());
 
     // Compute the tracker early so the LaunchContext can hold it (e.g. for Bob,
     // which has no model-configuration capability and so never makes a request
@@ -859,7 +854,7 @@ async fn run_launch(
     session::write_session_file(&session_meta).ok();
 
     let mut launcher = LAUNCHER_REGISTRY
-        .construct(&lc.launcher_type, &lc.launcher_id, &lc.config, &config)
+        .construct(&lc.launcher_type, &lc.launcher_id, &lc.config)
         .map_err(|e| anyhow::anyhow!("Failed to construct launcher: {e}"))?;
 
     let launch_ctx = LaunchContext {
@@ -868,6 +863,7 @@ async fn run_launch(
         base_env: std::collections::HashMap::new(),
         dry_run,
         usage_tracker: tracker.clone(),
+        model_proxy: model_proxy.clone(),
     };
 
     // Bind each enabled capability to the launcher before launching. Kept
@@ -888,7 +884,6 @@ async fn run_launch(
                 &cap_cfg.capability_type,
                 &cap_cfg.capability_id,
                 &cap_cfg.config,
-                &config,
             )
             .map_err(|e| anyhow::anyhow!("Failed to construct capability '{cap_id}': {e}"))?;
         // This path builds through the registry rather than through
@@ -898,7 +893,10 @@ async fn run_launch(
         // form that binds, so the bind below cannot run against an
         // unresolved capability.
         let capability = capability
-            .resolve_refs(&crate::models::ModelSource::from_config(&config))
+            .resolve_refs(&crate::models::ModelSource::with_proxy(
+                &config,
+                model_proxy.clone(),
+            ))
             .map_err(|e| anyhow::anyhow!("Capability '{cap_id}': {e}"))?;
         capability.on_setup().await?;
         launcher.bind_capability(capability.as_ref()).await?;

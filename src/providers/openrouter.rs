@@ -12,10 +12,14 @@ use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
     ProviderError, ProviderMetadata, ProviderType,
 };
-use crate::registry::{ConfigConstructable, Secret};
+use crate::registry::{ConfigConstructable, ConstructError, Secret};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenRouterProviderConfig {
+    /// OpenRouter is one hosted service, so this has a default rather than
+    /// being asked for: an instance that does not say otherwise talks to
+    /// `https://openrouter.ai/api`.
+    #[serde(default = "default_base_url")]
     pub base_url: String,
     pub api_key: Option<Secret>,
     #[serde(default = "default_timeout")]
@@ -38,10 +42,14 @@ fn default_health_endpoint() -> String {
     "/v1/models".to_string()
 }
 
+fn default_base_url() -> String {
+    "https://openrouter.ai/api".to_string()
+}
+
 impl Default for OpenRouterProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://openrouter.ai/api".to_string(),
+            base_url: default_base_url(),
             api_key: None,
             timeout_secs: 10,
             verify_ssl: true,
@@ -82,25 +90,21 @@ impl OpenRouterProvider {
 impl ConfigConstructable for OpenRouterProvider {
     type Config = OpenRouterProviderConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: OpenRouterProviderConfig =
-            serde_json::from_value(cfg.clone()).unwrap_or_default();
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .danger_accept_invalid_certs(!config.verify_ssl)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(ConstructError::settings)?;
 
-        Self {
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
             client,
-        }
+        })
     }
 }
 
@@ -213,8 +217,7 @@ mod tests {
             "api_key": "test-key",
             "timeout_secs": 30
         });
-        let provider =
-            OpenRouterProvider::new("my-openrouter", &cfg, &crate::config::Config::default());
+        let provider = OpenRouterProvider::new("my-openrouter", &cfg).unwrap();
         assert_eq!(provider.config.base_url, "https://api.openrouter.ai/v1");
         assert_eq!(
             provider.config.api_key,
@@ -226,8 +229,7 @@ mod tests {
     #[test]
     fn test_provider_function_endpoints() {
         let cfg = serde_json::json!({});
-        let provider =
-            OpenRouterProvider::new("my-openrouter", &cfg, &crate::config::Config::default());
+        let provider = OpenRouterProvider::new("my-openrouter", &cfg).unwrap();
         let endpoints = provider.function_endpoints();
         assert!(endpoints.contains_key(&ModelFunction::Chat));
         assert!(endpoints.contains_key(&ModelFunction::Embeddings));

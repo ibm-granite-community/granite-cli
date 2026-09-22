@@ -4,7 +4,7 @@ use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
     ProviderError, ProviderMetadata, ProviderType,
 };
-use crate::registry::{ConfigConstructable, Secret};
+use crate::registry::{ConfigConstructable, ConstructError, Secret};
 use crate::utils::ui::Ui;
 use crate::utils::ui::base::PullHandle;
 use async_trait::async_trait;
@@ -289,31 +289,27 @@ impl LlamaCppProvider {
 impl ConfigConstructable for LlamaCppProvider {
     type Config = LlamaCppProviderConfig;
 
-    fn new(
-        instance_id: &str,
-        cfg: &serde_json::Value,
-        _global_config: &crate::config::Config,
-    ) -> Self {
+    fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: LlamaCppProviderConfig =
-            serde_json::from_value(cfg.clone()).unwrap_or_default();
+            serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .danger_accept_invalid_certs(!config.verify_ssl)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(ConstructError::settings)?;
 
         let stream_client = reqwest::Client::builder()
             .danger_accept_invalid_certs(!config.verify_ssl)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(ConstructError::settings)?;
 
-        Self {
+        Ok(Self {
             instance_id: instance_id.to_string(),
             config,
             client,
             stream_client,
-        }
+        })
     }
 }
 
@@ -557,41 +553,28 @@ mod tests {
             "base_url": "http://example.com:9000",
             "timeout_secs": 30
         });
-        let provider =
-            LlamaCppProvider::new("my-llamacpp", &cfg, &crate::config::Config::default());
+        let provider = LlamaCppProvider::new("my-llamacpp", &cfg).unwrap();
         assert_eq!(provider.config.base_url, "http://example.com:9000");
         assert_eq!(provider.config.timeout_secs, 30);
     }
 
     #[test]
     fn test_can_run_model_accepts_gguf() {
-        let provider = LlamaCppProvider::new(
-            "my-llamacpp",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LlamaCppProvider::new("my-llamacpp", &serde_json::json!({})).unwrap();
         assert!(provider.can_run_model("gguf", "Q4_K_M"));
         assert!(provider.can_run_model("GGUF", "fp16"));
     }
 
     #[test]
     fn test_can_run_model_rejects_non_gguf() {
-        let provider = LlamaCppProvider::new(
-            "my-llamacpp",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LlamaCppProvider::new("my-llamacpp", &serde_json::json!({})).unwrap();
         assert!(!provider.can_run_model("safetensors", "fp16"));
         assert!(!provider.can_run_model("onnx", "fp32"));
     }
 
     #[test]
     fn test_model_alias_returns_hf_ref_for_gguf_variant() {
-        let provider = LlamaCppProvider::new(
-            "my-llamacpp",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LlamaCppProvider::new("my-llamacpp", &serde_json::json!({})).unwrap();
         let variant = ModelVariant {
             format: "GGUF".to_string(),
             precision: "Q4_K_M".to_string(),
@@ -606,11 +589,7 @@ mod tests {
 
     #[test]
     fn test_model_alias_returns_none_for_ollama_url() {
-        let provider = LlamaCppProvider::new(
-            "my-llamacpp",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LlamaCppProvider::new("my-llamacpp", &serde_json::json!({})).unwrap();
         let variant = ModelVariant {
             format: "Ollama".to_string(),
             precision: "Q4_K_M".to_string(),
@@ -625,11 +604,7 @@ mod tests {
 
     #[test]
     fn test_model_alias_returns_none_when_no_variant() {
-        let provider = LlamaCppProvider::new(
-            "my-llamacpp",
-            &serde_json::json!({}),
-            &crate::config::Config::default(),
-        );
+        let provider = LlamaCppProvider::new("my-llamacpp", &serde_json::json!({})).unwrap();
         assert_eq!(provider.model_alias("unused".to_string(), None), None);
     }
 

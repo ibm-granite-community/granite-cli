@@ -128,12 +128,7 @@ impl Discover {
             let default_config = PROVIDER_REGISTRY
                 .default_config(provider_type)
                 .unwrap_or_default();
-            let result = PROVIDER_REGISTRY.construct(
-                provider_type,
-                provider_type,
-                &default_config,
-                &ctx.config,
-            );
+            let result = PROVIDER_REGISTRY.construct(provider_type, provider_type, &default_config);
 
             match result {
                 Ok(provider) => match Self::run_health_check(&*provider).await {
@@ -312,7 +307,7 @@ impl Discover {
             .filter_map(|pid| ctx.config.get_provider(pid))
             .filter_map(|pc| {
                 PROVIDER_REGISTRY
-                    .construct(&pc.provider_type, &pc.provider_id, &pc.config, &ctx.config)
+                    .construct(&pc.provider_type, &pc.provider_id, &pc.config)
                     .ok()
                     .filter(|p| p.can_run_model(&variant.format, &variant.precision))
             })
@@ -338,12 +333,7 @@ impl Discover {
             let default_config = LAUNCHER_REGISTRY
                 .default_config(launcher_type)
                 .unwrap_or_default();
-            match LAUNCHER_REGISTRY.construct(
-                launcher_type,
-                launcher_type,
-                &default_config,
-                &ctx.config,
-            ) {
+            match LAUNCHER_REGISTRY.construct(launcher_type, launcher_type, &default_config) {
                 Ok(launcher) => match launcher.validate_command() {
                     Ok(path) => recommendations.push(Recommendation::Launcher {
                         launcher_type: launcher_type.to_string(),
@@ -840,14 +830,12 @@ fn matching_catalog_ids(m: &recommended_config::StringMatch) -> Vec<String> {
 /// type's default config. Same lookup as `candidate_variants`.
 fn provider_can_run(provider_id: &str, variant: &ModelVariant, ctx: &crate::AppContext) -> bool {
     let provider = match ctx.config.get_provider(provider_id) {
-        Some(pc) => {
-            PROVIDER_REGISTRY.construct(&pc.provider_type, &pc.provider_id, &pc.config, &ctx.config)
-        }
+        Some(pc) => PROVIDER_REGISTRY.construct(&pc.provider_type, &pc.provider_id, &pc.config),
         None => {
             let default_config = PROVIDER_REGISTRY
                 .default_config(provider_id)
                 .unwrap_or_default();
-            PROVIDER_REGISTRY.construct(provider_id, provider_id, &default_config, &ctx.config)
+            PROVIDER_REGISTRY.construct(provider_id, provider_id, &default_config)
         }
     };
     provider
@@ -1966,13 +1954,11 @@ impl SetupCommands {
             .filter_map(|pid| {
                 if let Some(pc) = ctx.config.get_provider(pid) {
                     PROVIDER_REGISTRY
-                        .construct(&pc.provider_type, &pc.provider_id, &pc.config, &ctx.config)
+                        .construct(&pc.provider_type, &pc.provider_id, &pc.config)
                         .ok()
                 } else {
                     let default_config = PROVIDER_REGISTRY.default_config(pid).unwrap_or_default();
-                    PROVIDER_REGISTRY
-                        .construct(pid, pid, &default_config, &ctx.config)
-                        .ok()
+                    PROVIDER_REGISTRY.construct(pid, pid, &default_config).ok()
                 }
             })
             .collect();
@@ -2467,7 +2453,7 @@ impl SetupCommands {
                     .get_provider(pid)
                     .and_then(|pc| {
                         PROVIDER_REGISTRY
-                            .construct(&pc.provider_type, &pc.provider_id, &pc.config, &ctx.config)
+                            .construct(&pc.provider_type, &pc.provider_id, &pc.config)
                             .ok()
                     })
                     .is_some_and(|p| p.can_run_model(&variant.format, &variant.precision))

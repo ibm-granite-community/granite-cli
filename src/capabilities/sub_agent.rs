@@ -74,20 +74,19 @@ macro_rules! declare_sub_agent_basic {
             fn new(
                 instance_id: &str,
                 cfg: &serde_json::Value,
-                _global_config: &$crate::config::Config,
-            ) -> Self {
-                let config: $config_struct =
-                    serde_json::from_value(cfg.clone()).unwrap_or_default();
+            ) -> Result<Self, $crate::registry::ConstructError> {
+                let config: $config_struct = serde_json::from_value(cfg.clone())
+                    .map_err($crate::registry::ConstructError::settings)?;
                 let description = $description_expr;
                 let prompt = $prompt_expr;
                 let tools = $tools_expr;
-                Self {
+                Ok(Self {
                     instance_id: instance_id.to_string(),
                     config,
                     description,
                     prompt,
                     tools,
-                }
+                })
             }
         }
 
@@ -263,20 +262,19 @@ macro_rules! declare_sub_agent_full {
             fn new(
                 instance_id: &str,
                 cfg: &serde_json::Value,
-                _global_config: &$crate::config::Config,
-            ) -> Self {
-                let config: $config_struct =
-                    serde_json::from_value(cfg.clone()).unwrap_or_default();
+            ) -> Result<Self, $crate::registry::ConstructError> {
+                let config: $config_struct = serde_json::from_value(cfg.clone())
+                    .map_err($crate::registry::ConstructError::settings)?;
                 let description = config.description.clone();
                 let prompt = config.prompt.clone();
                 let tools = config.tools.clone();
-                Self {
+                Ok(Self {
                     instance_id: instance_id.to_string(),
                     config,
                     description,
                     prompt,
                     tools,
-                }
+                })
             }
         }
 
@@ -413,77 +411,14 @@ mod tests {
     };
     use crate::capabilities::{CapabilityInfo, ResolvedCapability};
     use crate::config::{Config, ModelConfig, ProviderConfig};
-    use crate::models::{Model, ModelFunction};
-    use crate::providers::{
-        ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError,
-    };
-    use crate::registry::{ConfigConstructable, Secret};
-    use async_trait::async_trait;
+    use crate::models::ModelFunction;
+    use crate::providers::{ApiEndpoint, ApiType};
+    use crate::registry::ConfigConstructable;
+    use crate::utils::test_support::{FakeModel, FakeProvider};
+
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::sync::Arc;
-
-    #[derive(Clone, Default)]
-    struct FakeProvider {
-        instance_id: String,
-        base_url: String,
-        api_key: Option<Secret>,
-        verify_ssl: bool,
-        api_types: Vec<ApiType>,
-        endpoints: HashMap<ModelFunction, Vec<ApiEndpoint>>,
-        alias: Option<String>,
-    }
-
-    impl ConfigConstructable for FakeProvider {
-        type Config = crate::registry::NoConfig;
-        fn new(_: &str, _: &serde_json::Value, _: &crate::config::Config) -> Self {
-            unimplemented!("not used in tests")
-        }
-    }
-
-    impl crate::registry::Named for FakeProvider {
-        fn instance_id(&self) -> &str {
-            &self.instance_id
-        }
-    }
-
-    #[async_trait]
-    impl Provider for FakeProvider {
-        fn name(&self) -> &str {
-            "Fake Provider"
-        }
-        fn function_endpoints(&self) -> HashMap<ModelFunction, Vec<ApiEndpoint>> {
-            self.endpoints.clone()
-        }
-        fn supported_api_types(&self) -> Vec<ApiType> {
-            self.api_types.clone()
-        }
-        fn base_url(&self) -> &str {
-            &self.base_url
-        }
-        fn api_key(&self) -> Option<&Secret> {
-            self.api_key.as_ref()
-        }
-        fn verify_ssl(&self) -> bool {
-            self.verify_ssl
-        }
-        fn custom_headers(&self) -> Option<std::collections::HashMap<String, Secret>> {
-            None
-        }
-        fn supported_formats(&self) -> Vec<ModelFormat> {
-            vec![]
-        }
-        fn model_alias(
-            &self,
-            _model_id: String,
-            _variant: Option<&crate::models::ModelVariant>,
-        ) -> Option<String> {
-            self.alias.clone()
-        }
-        async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
-            unimplemented!("not used in tests")
-        }
-    }
 
     fn ok_provider() -> FakeProvider {
         let mut endpoints = HashMap::new();
@@ -499,62 +434,6 @@ mod tests {
             api_types: vec![ApiType::OpenAI, ApiType::Anthropic],
             endpoints,
             alias: None,
-        }
-    }
-
-    struct TestModel {
-        supported_functions: Vec<ModelFunction>,
-    }
-
-    impl ConfigConstructable for TestModel {
-        type Config = crate::registry::NoConfig;
-        fn new(_: &str, _: &serde_json::Value, _: &crate::config::Config) -> Self {
-            unimplemented!("not used in tests")
-        }
-    }
-
-    impl crate::registry::Named for TestModel {
-        fn instance_id(&self) -> &str {
-            "granite-3.1-8b-instruct"
-        }
-    }
-
-    impl Model for TestModel {
-        fn family(&self) -> &str {
-            "Test"
-        }
-        fn version(&self) -> &str {
-            "1.0"
-        }
-        fn size(&self) -> u64 {
-            1
-        }
-        fn context_length(&self) -> u64 {
-            4096
-        }
-        fn model_type(&self) -> &crate::models::ModelType {
-            &crate::models::ModelType::Text
-        }
-        fn huggingface_repo(&self) -> &str {
-            "test/test"
-        }
-        fn native_dtype(&self) -> &str {
-            "bfloat16"
-        }
-        fn architecture(&self) -> &crate::models::ModelArchitecture {
-            unimplemented!("not used in tests")
-        }
-        fn variants(&self) -> &[crate::models::ModelVariant] {
-            &[]
-        }
-        fn description(&self) -> Option<&str> {
-            None
-        }
-        fn tags(&self) -> &[String] {
-            &[]
-        }
-        fn supported_functions(&self) -> &[ModelFunction] {
-            &self.supported_functions
         }
     }
 
@@ -588,14 +467,12 @@ mod tests {
                 "prompt": "You are a meticulous code reviewer.",
                 "model_id": "granite-3.1-8b-instruct",
             }),
-            &config,
-        );
+        )
+        .unwrap();
         ResolvedSubAgentCapability {
             inner: cap,
             configured_model: crate::models::ConfiguredModel::for_test(
-                Arc::new(TestModel {
-                    supported_functions: functions,
-                }),
+                Arc::new(FakeModel::text(functions)),
                 Arc::new(provider),
                 None,
             ),
@@ -635,14 +512,12 @@ mod tests {
                 "tools": ["FileRead", "Search", {"Other": "SomeRawClaudeTool"}],
                 "model_id": "granite-3.1-8b-instruct",
             }),
-            &config,
-        );
+        )
+        .unwrap();
         let cap = ResolvedSubAgentCapability {
             inner: cap,
             configured_model: crate::models::ConfiguredModel::for_test(
-                Arc::new(TestModel {
-                    supported_functions: vec![ModelFunction::Chat],
-                }),
+                Arc::new(FakeModel::text(vec![ModelFunction::Chat])),
                 Arc::new(ok_provider()),
                 None,
             ),
