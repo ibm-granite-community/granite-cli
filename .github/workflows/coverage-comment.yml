@@ -1,0 +1,77 @@
+name: Coverage comment
+
+# Posts the coverage summary written by the "Coverage" job in ci.yml as a
+# comment on the pull request, and updates that comment on later runs.
+#
+# workflow_run runs this file from the default branch with a token that can
+# write to pull requests, including pull requests from forks. The artifact it
+# reads was produced by pull request code, so this workflow does not check out
+# or run any code: it only reads the pull request number and the comment body,
+# validates the number, and posts the body as text.
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] mitigations in the header comment
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: coverage-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+
+jobs:
+  comment:
+    name: Post coverage comment
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+
+    steps:
+      - name: Post or update comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          # Identifies the comment to update on later runs.
+          MARKER: "<!-- coverage-comment -->"
+        run: |
+          # The CI run uploads no comment when its tests fail before coverage
+          # is computed.
+          artifact=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[] | select(.name == "coverage-comment") | .id')
+          if [ -z "$artifact" ]; then
+            echo "No coverage-comment artifact in run ${RUN_ID}"
+            exit 0
+          fi
+          gh run download "$RUN_ID" --repo "$REPO" --name coverage-comment --dir coverage-comment
+
+          pr=$(head -c 20 coverage-comment/pr-number | tr -d '[:space:]')
+          if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
+            echo "Invalid pull request number"
+            exit 1
+          fi
+          # The number comes from the artifact. Comment only when that pull
+          # request's head is the commit the CI run tested; when it has moved
+          # on, a newer run will post its own result.
+          pr_sha=$(gh api "repos/${REPO}/pulls/${pr}" --jq '.head.sha')
+          if [ "$pr_sha" != "$HEAD_SHA" ]; then
+            echo "Pull request #${pr} head is ${pr_sha}, run tested ${HEAD_SHA}; skipping"
+            exit 0
+          fi
+
+          # A comment body is limited to 65536 characters.
+          { echo "$MARKER"; head -c 60000 coverage-comment/comment.md; } > body.md
+
+          comment=$(gh api --paginate "repos/${REPO}/issues/${pr}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${MARKER}\"))) | .id" \
+            | head -n 1)
+          if [ -n "$comment" ]; then
+            jq -n --rawfile body body.md '{body: $body}' \
+              | gh api --method PATCH "repos/${REPO}/issues/comments/${comment}" --input - > /dev/null
+          else
+            jq -n --rawfile body body.md '{body: $body}' \
+              | gh api --method POST "repos/${REPO}/issues/${pr}/comments" --input - > /dev/null
+          fi

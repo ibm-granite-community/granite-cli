@@ -134,7 +134,7 @@ jobs:
           status=0
           pipx run "diff-cover==${DIFF_COVER_VERSION}" lcov.info \
             --compare-branch="origin/${BASE_REF}" \
-            --format markdown:diff-cover.md \
+            --format markdown:diff-cover.md,json:diff-cover.json \
             --fail-under="$COVERAGE_MIN_DIFF" || status=$?
           cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
@@ -144,6 +144,7 @@ jobs:
         run: cargo llvm-cov report --summary-only --fail-under-lines "$COVERAGE_MIN_TOTAL"
 
       - name: Upload coverage reports
+        id: upload-reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -153,3 +154,66 @@ jobs:
             coverage/html
             diff-cover.md
           if-no-files-found: ignore
+
+      # Pull requests from forks run with a read-only token, so this job
+      # cannot comment on them. It uploads the comment body and the pull
+      # request number as the "coverage-comment" artifact, and
+      # coverage-comment.yml posts the comment.
+      - name: Write pull request comment
+        if: ${{ github.event_name == 'pull_request' && !cancelled() && hashFiles('coverage-summary.json') != '' }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPORT_URL: ${{ steps.upload-reports.outputs.artifact-url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Prints a pass or fail mark for a percentage against a minimum,
+          # using the same comparison as the checks above.
+          mark() { awk -v v="$1" -v m="$2" 'BEGIN { print (v < m) ? ":x:" : ":white_check_mark:" }'; }
+
+          total=$(jq '.data[0].totals.lines.percent' coverage-summary.json)
+          changed=0
+          {
+            printf '## Coverage\n\n'
+            printf '| | Line coverage | Minimum | |\n|---|---:|---:|:-:|\n'
+            printf '| Whole crate | %.2f%% | %s%% | %s |\n' \
+              "$total" "$COVERAGE_MIN_TOTAL" "$(mark "$total" "$COVERAGE_MIN_TOTAL")"
+            if [ -f diff-cover.json ]; then
+              changed=$(jq '.total_num_lines' diff-cover.json)
+              missing=$(jq '.total_num_violations' diff-cover.json)
+              if [ "$changed" -eq 0 ]; then
+                printf '| Changed lines | none with coverage data | %s%% | |\n' "$COVERAGE_MIN_DIFF"
+              else
+                diff=$(jq '.total_percent_covered' diff-cover.json)
+                printf '| Changed lines (%s of %s covered) | %.2f%% | %s%% | %s |\n' \
+                  "$((changed - missing))" "$changed" "$diff" "$COVERAGE_MIN_DIFF" \
+                  "$(mark "$diff" "$COVERAGE_MIN_DIFF")"
+              fi
+            fi
+            printf '\n'
+            # A comment body is limited to 65536 characters; the per-file
+            # listing goes to the job summary only when it is longer.
+            if [ -f diff-cover.md ] && [ "$changed" -gt 0 ]; then
+              if [ "$(wc -c < diff-cover.md)" -le 50000 ]; then
+                printf '<details><summary>Changed lines by file</summary>\n\n'
+                cat diff-cover.md
+                printf '\n</details>\n\n'
+              else
+                printf 'The list of changed lines by file is too long for a comment; it is in the workflow run summary.\n\n'
+              fi
+            fi
+            if [ -n "$REPORT_URL" ]; then
+              printf '[Coverage report (HTML and LCOV, zip)](%s) · ' "$REPORT_URL"
+            fi
+            printf '[Workflow run](%s)\n' "$RUN_URL"
+          } > comment.md
+          mkdir -p coverage-comment
+          mv comment.md coverage-comment/comment.md
+          echo "$PR_NUMBER" > coverage-comment/pr-number
+
+      - name: Upload pull request comment
+        if: ${{ github.event_name == 'pull_request' && !cancelled() && hashFiles('coverage-comment/comment.md') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-comment
+          path: coverage-comment
+          retention-days: 7
