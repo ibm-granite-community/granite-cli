@@ -89,11 +89,16 @@ fn search_match_reason(id: &str, m: &ModelMetadata, q: &str) -> Option<String> {
             // Use char-based indexing to avoid slicing inside a multi-byte
             // UTF-8 character, which would panic on non-ASCII descriptions.
             let char_pos = lower[..pos].chars().count();
+            // Collapse internal whitespace (newlines, tabs, multiple spaces)
+            // so that multi-line descriptions don't split a table row.
             let snippet: String = desc
                 .chars()
                 .skip(char_pos.saturating_sub(20))
                 .take(60)
-                .collect();
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             return Some(format!("description: \"…{}…\"", snippet.trim()));
         }
     }

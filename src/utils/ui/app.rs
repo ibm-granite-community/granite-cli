@@ -605,9 +605,9 @@ impl App {
                     return true;
                 }
                 // Also match against structured search_fields() (family, tags)
-                // via the Searchable trait's matches_query helper, so that e.g.
-                // searching "vision" surfaces models tagged "vision" even when
-                // the id doesn't contain it.
+                // via the Searchable trait's matches_query helper.
+                // Note: Models with a non-empty query take the early-return
+                // above and never reach this block.
                 match self.section {
                     Section::Providers => PROVIDER_REGISTRY
                         .entries()
@@ -779,18 +779,16 @@ impl App {
                 let configured_ids: std::collections::HashSet<&str> =
                     self.ctx.config.models.keys().map(|k| k.as_str()).collect();
 
-                // When a search is active, switch to search_rows so that:
-                //   • The MATCHED ON column is shown.
-                //   • Results are sorted by match priority (tag > id > family > desc).
-                //   • selected_id() uses the same ordering (see its impl above).
-                // When browsing without a query, use catalog_rows filtered by
-                // filtered_ids (which respects configured_only).
+                // While searching, list the matching models ranked by how
+                // they matched (tag, then id, family, description), with a
+                // MATCHED ON column saying why each one is listed.
+                // Unconfigured models are left out while the catalog is
+                // hidden. The cursor indexes rows through filtered_ids,
+                // which returns the same models in the same order.
+                // When browsing without a query, use catalog_rows filtered
+                // by filtered_ids (which respects configured_only).
                 let searching = !query.is_empty();
                 let (entries, header) = if searching {
-                    // model_search_rows applies configured_only and match-
-                    // priority sort — the same list filtered_ids returns for
-                    // Models+query, so row index, row_count, and selected_id
-                    // all stay in sync with the rendered table.
                     let rows = self.model_search_rows(query);
                     let h = Row::new(vec!["", "ID", "FAMILY", "SIZE", "TYPE", "MATCHED ON"]).style(
                         Style::default()
@@ -2382,6 +2380,54 @@ mod tests {
         assert!(
             !ids.is_empty(),
             "expected launchers matching tag 'agent'; got none"
+        );
+    }
+
+    // -- search with hide-catalog on ------------------------------------------
+
+    #[test]
+    fn search_with_hide_catalog_on_filters_to_configured_models_only() {
+        // Configure exactly one vision model so we can assert that search
+        // with hide-catalog respects configured_only[0].
+        let mut config = Config::default();
+        config.models.insert(
+            "granite-vision-3.2-2b".to_string(),
+            crate::config::ModelConfig {
+                model_id: "granite-vision-3.2-2b".to_string(),
+                model_type: "granite-vision-3.2-2b".to_string(),
+                provider_id: "ollama".to_string(),
+                variant: None,
+                config: serde_json::json!({}),
+            },
+        );
+        let mut a = App::new(crate::AppContext {
+            config,
+            ui: Arc::new(CaptureUi::default()),
+        });
+        // Manually enable hide-catalog (configured_only[0] = true).
+        a.configured_only[0] = true;
+
+        // filtered_ids for Models+query must only return the configured model
+        // (other vision models exist in the registry but are not configured).
+        let ids = a.filtered_ids("vision");
+        assert_eq!(
+            ids,
+            vec!["granite-vision-3.2-2b"],
+            "filtered_ids should only return configured models when hide-catalog is on"
+        );
+
+        // model_search_rows must apply the same filter.
+        let rows = a.model_search_rows("vision");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "granite-vision-3.2-2b");
+
+        // selected_id at row 0 must agree with filtered_ids.
+        a.mode = AppMode::Search("vision".to_string());
+        a.row = 0;
+        assert_eq!(
+            a.selected_id(),
+            Some("granite-vision-3.2-2b".to_string()),
+            "selected_id must index the same list as the rendered table"
         );
     }
 
