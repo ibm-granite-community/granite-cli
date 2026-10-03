@@ -1,5 +1,6 @@
 use crate::models::{ModelFunction, ModelVariant};
 use crate::registry::{ConfigConstructable, Secret};
+use crate::utils::Searchable;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -239,6 +240,14 @@ impl std::fmt::Display for ProviderMetadata {
     }
 }
 
+impl Searchable for ProviderMetadata {
+    fn search_fields(&self) -> Vec<&str> {
+        let mut fields: Vec<&str> = vec![self.name.as_str(), self.description.as_str()];
+        fields.extend(self.tags.iter().map(String::as_str));
+        fields
+    }
+}
+
 /*-- Shared Helpers ----------------------------------------------------------*/
 
 /// Shared HTTP health check implementation for providers.
@@ -445,5 +454,25 @@ mod tests {
             "Image Understanding"
         );
         assert_eq!(ModelFunction::Transcription.to_string(), "Transcription");
+    }
+
+    #[test]
+    fn searchable_fields_includes_name_description_and_tags() {
+        let meta = ProviderMetadata {
+            name: "Ollama".to_string(),
+            description: "Local Ollama server".to_string(),
+            provider_type: ProviderType::Local,
+            default_endpoint: "http://localhost:11434".to_string(),
+            supported_api_types: vec![ApiType::Ollama],
+            default_function_endpoints: HashMap::new(),
+            supported_formats: vec![],
+            authentication: vec![],
+            tags: vec!["local".to_string(), "gguf".to_string()],
+        };
+        let fields = meta.search_fields();
+        assert!(fields.contains(&"Ollama"));
+        assert!(fields.contains(&"Local Ollama server"));
+        assert!(fields.contains(&"local"));
+        assert!(fields.contains(&"gguf"));
     }
 }

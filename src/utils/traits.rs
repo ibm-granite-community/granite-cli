@@ -11,6 +11,14 @@ pub trait Searchable {
     /// The item ID is matched separately by the caller (it is the registry
     /// key, not a field on the metadata struct).
     fn search_fields(&self) -> Vec<&str>;
+
+    /// Whether any search field contains `query`, ignoring case.
+    /// `query` must already be lowercase.
+    fn matches_query(&self, query: &str) -> bool {
+        self.search_fields()
+            .iter()
+            .any(|f| f.to_lowercase().contains(query))
+    }
 }
 
 /*-- tests -------------------------------------------------------------------*/
@@ -72,5 +80,29 @@ mod searchable_tests {
         let fields = m.search_fields();
         assert!(fields.contains(&"instruct"));
         assert!(fields.contains(&"chat"));
+    }
+
+    #[test]
+    fn matches_query_matches_tag_only() {
+        let m = metadata("Granite 3.1", None, vec!["vision"]);
+        assert!(m.matches_query("vision"));
+    }
+
+    #[test]
+    fn matches_query_ignores_field_case() {
+        let m = metadata("Granite 3.1", Some("A Vision model"), vec![]);
+        assert!(m.matches_query("vision"));
+    }
+
+    #[test]
+    fn matches_query_no_match() {
+        let m = metadata("Granite 3.1", Some("A text model"), vec!["chat"]);
+        assert!(!m.matches_query("vision"));
+    }
+
+    #[test]
+    fn matches_query_matches_family() {
+        let m = metadata("Granite 3.1", None, vec![]);
+        assert!(m.matches_query("granite"));
     }
 }

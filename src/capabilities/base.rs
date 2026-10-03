@@ -3,6 +3,7 @@ use crate::capabilities::requirement::{
 };
 use crate::providers::ApiType;
 use crate::registry::{ConfigConstructable, Secret};
+use crate::utils::Searchable;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -371,6 +372,14 @@ impl std::fmt::Display for CapabilityMetadata {
     }
 }
 
+impl Searchable for CapabilityMetadata {
+    fn search_fields(&self) -> Vec<&str> {
+        let mut fields: Vec<&str> = vec![self.name.as_str(), self.description.as_str()];
+        fields.extend(self.tags.iter().map(String::as_str));
+        fields
+    }
+}
+
 /*-- Reference resolution ----------------------------------------------------*/
 
 /// Resolve the model a capability names, against the `ModelRequirement` its
@@ -544,5 +553,21 @@ mod mcp_binding_tests {
         }
         .to_canonical_json();
         assert!(!json.as_object().unwrap().contains_key("timeout"));
+    }
+
+    #[test]
+    fn searchable_fields_includes_name_description_and_tags() {
+        let meta = CapabilityMetadata {
+            name: "Vision MCP".to_string(),
+            description: "MCP tool providing image understanding".to_string(),
+            dependencies: vec![],
+            tags: vec!["vision".to_string(), "mcp".to_string()],
+            supported_binding_types: HashSet::new(),
+        };
+        let fields = meta.search_fields();
+        assert!(fields.contains(&"Vision MCP"));
+        assert!(fields.contains(&"MCP tool providing image understanding"));
+        assert!(fields.contains(&"vision"));
+        assert!(fields.contains(&"mcp"));
     }
 }

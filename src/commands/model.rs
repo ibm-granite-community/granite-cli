@@ -11,7 +11,6 @@ use crate::models::{
 use crate::providers::{
     PROVIDER_REGISTRY, Provider, ProviderMetadata, ProviderSource, ProviderType, PullResult,
 };
-use crate::utils::Searchable;
 use crate::utils::hardware::{HardwareProfile, detect_hardware};
 use crate::utils::prompt_from_schema;
 use crate::utils::ui::Ui;
@@ -45,6 +44,65 @@ fn sort_enriched_rows(rows: &mut [(Vec<String>, ModelMetadata)]) {
             .then_with(|| meta_b.size.cmp(&meta_a.size))
             .then_with(|| row_a[0].cmp(&row_b[0]))
     });
+}
+
+/// Numeric sort key for match priority: lower = more relevant.
+/// tag(0) > id(1) > family(2) > description(3)
+fn match_priority(matched_on: &str) -> u8 {
+    if matched_on.starts_with("tag:") {
+        0
+    } else if matched_on == "id" {
+        1
+    } else if matched_on == "family" {
+        2
+    } else {
+        3 // description
+    }
+}
+
+/// Returns a short human-readable label describing *why* a model matched
+/// `query`, or `None` if there is no match.
+///
+/// Priority: tags > id > family > description (short excerpt shown).
+fn search_match_reason(id: &str, m: &ModelMetadata, q: &str) -> Option<String> {
+    // Check tags first: match_priority ranks tag(0) above id(1), so the label
+    // and sort order must agree — a model that matches on both tag and id is
+    // reported as a tag match and sorted with the tag group.
+    let matching_tags: Vec<&str> = m
+        .tags
+        .iter()
+        .map(String::as_str)
+        .filter(|t| t.to_lowercase().contains(q))
+        .collect();
+    if !matching_tags.is_empty() {
+        return Some(format!("tag: {}", matching_tags.join(", ")));
+    }
+    if id.to_lowercase().contains(q) {
+        return Some("id".to_string());
+    }
+    if m.family.to_lowercase().contains(q) {
+        return Some("family".to_string());
+    }
+    if let Some(desc) = &m.description {
+        let lower = desc.to_lowercase();
+        if let Some(pos) = lower.find(q) {
+            // Use char-based indexing to avoid slicing inside a multi-byte
+            // UTF-8 character, which would panic on non-ASCII descriptions.
+            let char_pos = lower[..pos].chars().count();
+            // Collapse internal whitespace (newlines, tabs, multiple spaces)
+            // so that multi-line descriptions don't split a table row.
+            let snippet: String = desc
+                .chars()
+                .skip(char_pos.saturating_sub(20))
+                .take(60)
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(format!("description: \"…{}…\"", snippet.trim()));
+        }
+    }
+    None
 }
 
 pub struct ModelCommands;
@@ -118,24 +176,29 @@ impl ModelCommands {
         let models = MODEL_REGISTRY.entries();
         let mut rows: Vec<(Vec<String>, ModelMetadata)> = models
             .iter()
-            .filter(|(id, m)| {
-                id.to_lowercase().contains(&q)
-                    || m.search_fields()
-                        .iter()
-                        .any(|f| f.to_lowercase().contains(&q))
-            })
-            .map(|(id, m)| {
+            .filter_map(|(id, m)| {
+                let matched_on = search_match_reason(id, m, &q)?;
                 let row = vec![
                     id.to_string(),
                     m.family.clone(),
                     m.format_size(),
                     m.context_length.to_string(),
                     m.model_type.to_string(),
+                    matched_on,
                 ];
-                (row, m.clone())
+                Some((row, m.clone()))
             })
             .collect();
-        sort_enriched_rows(&mut rows);
+        // Sort by match priority first (tag > id > family > description),
+        // then by the usual family/version/size within each priority group.
+        rows.sort_by(|(row_a, meta_a), (row_b, meta_b)| {
+            match_priority(&row_a[5])
+                .cmp(&match_priority(&row_b[5]))
+                .then_with(|| meta_a.family.cmp(&meta_b.family))
+                .then_with(|| compare_versions_desc(&meta_a.version, &meta_b.version))
+                .then_with(|| meta_b.size.cmp(&meta_a.size))
+                .then_with(|| row_a[0].cmp(&row_b[0]))
+        });
         rows.into_iter().map(|(row, _)| row).collect()
     }
 
@@ -147,7 +210,7 @@ impl ModelCommands {
         }
         ctx.ui.table(
             &format!("Search results for '{}' ({} models)", query, rows.len()),
-            &["ID", "FAMILY", "SIZE", "CONTEXT", "TYPE"],
+            &["ID", "FAMILY", "SIZE", "CONTEXT", "TYPE", "MATCHED ON"],
             &rows,
         );
         Ok(())
@@ -1340,6 +1403,131 @@ mod tests {
         assert!(requirement.admits_instance(&provider));
     }
 
+    // -- match_priority -------------------------------------------------------
+
+    #[test]
+    fn match_priority_family_returns_2() {
+        assert_eq!(match_priority("family"), 2);
+    }
+
+    #[test]
+    fn match_priority_description_returns_3() {
+        assert_eq!(match_priority("description: \"…some text…\""), 3);
+    }
+
+    // -- search_match_reason --------------------------------------------------
+
+    #[test]
+    fn search_match_reason_returns_family_when_family_matches() {
+        // Use inline metadata: family matches, id and tags do not.
+        // This avoids depending on the live registry.
+        use crate::models::{LayerKind, LayerTypeCount, ModelArchitecture, ModelType};
+        let m = ModelMetadata {
+            family: "AlphaFamily".to_string(),
+            version: "1.0".to_string(),
+            size: 1_000_000_000,
+            context_length: 4096,
+            model_type: ModelType::Text,
+            huggingface_repo: "test/test".to_string(),
+            native_dtype: "bfloat16".to_string(),
+            architecture: ModelArchitecture {
+                num_hidden_layers: 1,
+                hidden_size: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 1,
+                layer_types: vec![LayerTypeCount {
+                    kind: LayerKind::FullAttention,
+                    count: 1,
+                }],
+            },
+            variants: vec![],
+            description: None,
+            tags: vec![],
+            supported_functions: vec![],
+        };
+        // "alphafamily" is in family but not in id or tags.
+        let result = search_match_reason("some-model-beta", &m, "alphafamily");
+        assert_eq!(result, Some("family".to_string()));
+    }
+
+    #[test]
+    fn search_match_reason_returns_none_when_no_field_matches() {
+        let models = MODEL_REGISTRY.entries();
+        let (id, m) = models.iter().next().expect("registry must not be empty");
+        let result = search_match_reason(id, m, "zzznomatchquery");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn search_match_reason_family_only_match() {
+        use crate::models::{LayerKind, LayerTypeCount, ModelArchitecture, ModelType};
+        // Construct metadata whose family matches but id and tags do not.
+        let m = ModelMetadata {
+            family: "UniqueFamily".to_string(),
+            version: "1.0".to_string(),
+            size: 1_000_000_000,
+            context_length: 4096,
+            model_type: ModelType::Text,
+            huggingface_repo: "test/test".to_string(),
+            native_dtype: "bfloat16".to_string(),
+            architecture: ModelArchitecture {
+                num_hidden_layers: 1,
+                hidden_size: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 1,
+                layer_types: vec![LayerTypeCount {
+                    kind: LayerKind::FullAttention,
+                    count: 1,
+                }],
+            },
+            variants: vec![],
+            description: None,
+            tags: vec![],
+            supported_functions: vec![],
+        };
+        let result = search_match_reason("some-model-id", &m, "uniquefamily");
+        assert_eq!(result, Some("family".to_string()));
+    }
+
+    #[test]
+    fn search_match_reason_description_collapses_whitespace_in_snippet() {
+        use crate::models::{LayerKind, LayerTypeCount, ModelArchitecture, ModelType};
+        let m = ModelMetadata {
+            family: "TestFamily".to_string(),
+            version: "1.0".to_string(),
+            size: 1_000_000_000,
+            context_length: 4096,
+            model_type: ModelType::Text,
+            huggingface_repo: "test/test".to_string(),
+            native_dtype: "bfloat16".to_string(),
+            architecture: ModelArchitecture {
+                num_hidden_layers: 1,
+                hidden_size: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 1,
+                layer_types: vec![LayerTypeCount {
+                    kind: LayerKind::FullAttention,
+                    count: 1,
+                }],
+            },
+            variants: vec![],
+            description: Some("First line.\nSecond line with target here.".to_string()),
+            tags: vec![],
+            supported_functions: vec![],
+        };
+        let result = search_match_reason("some-id", &m, "target");
+        assert!(result.is_some());
+        let label = result.unwrap();
+        // Newline must be collapsed — no raw \n in the output
+        assert!(
+            !label.contains('\n'),
+            "snippet must not contain newlines: {label:?}"
+        );
+    }
+
     // -- search ---------------------------------------------------------------
 
     #[test]
@@ -1382,6 +1570,23 @@ mod tests {
         assert!(!tables.is_empty());
         let (_, _, rows) = &tables[0];
         assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn search_tag_match_returns_rows() {
+        let ctx = empty_ctx();
+        // "vision" is a tag on docling and vision models in the catalog.
+        ModelCommands::search(&ctx, "vision").unwrap();
+        let tables = tables!(ctx);
+        assert!(!tables.is_empty());
+        let (_, _, rows) = &tables[0];
+        assert!(!rows.is_empty());
+        // r[5] is the MATCHED ON column; at least one row must be a tag match.
+        assert!(
+            rows.iter().any(|r| r[5].starts_with("tag:")),
+            "expected at least one tag: match, got: {:?}",
+            rows.iter().map(|r| &r[5]).collect::<Vec<_>>()
+        );
     }
 
     // ── recommend ─────────────────────────────────────────────────────────────

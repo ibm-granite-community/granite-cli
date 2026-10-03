@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::capabilities::{BindingType, ToolName};
 use crate::define_factory;
 use crate::registry::ConfigConstructable;
+use crate::utils::Searchable;
 use crate::utils::ui::Ui;
 
 use_channel!("LNCHR");
@@ -389,6 +390,18 @@ impl std::fmt::Display for LauncherMetadata {
     }
 }
 
+impl Searchable for LauncherMetadata {
+    fn search_fields(&self) -> Vec<&str> {
+        let mut fields: Vec<&str> = vec![
+            self.name.as_str(),
+            self.description.as_str(),
+            self.default_command.as_str(),
+        ];
+        fields.extend(self.tags.iter().map(String::as_str));
+        fields
+    }
+}
+
 /// Runtime context passed through the launch lifecycle.
 pub struct LaunchContext {
     pub launcher_id: String,
@@ -597,6 +610,22 @@ pub(crate) mod tests {
             tags: vec![],
         };
         assert_eq!(meta.to_string(), "A test launcher");
+    }
+
+    #[test]
+    fn searchable_fields_includes_name_description_command_and_tags() {
+        let meta = LauncherMetadata {
+            name: "Claude Code".to_string(),
+            description: "Anthropic's Claude Code CLI".to_string(),
+            default_command: "claude".to_string(),
+            supported_capabilities: HashSet::new(),
+            tags: vec!["claude".to_string(), "anthropic".to_string()],
+        };
+        let fields = meta.search_fields();
+        assert!(fields.contains(&"Claude Code"));
+        assert!(fields.contains(&"Anthropic's Claude Code CLI"));
+        assert!(fields.contains(&"claude"));
+        assert!(fields.contains(&"anthropic"));
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ use crate::commands::{
 use crate::dependency::Configured;
 use crate::models::MODEL_REGISTRY;
 use crate::providers::PROVIDER_REGISTRY;
+use crate::utils::Searchable;
 use crate::utils::ui::setup_pane::SetupPane;
 use crate::utils::ui::tui::{restore_terminal, setup_terminal};
 use crate::utils::ui::tui_ui::{Answer, OutputLine, TuiUi};
@@ -193,6 +194,10 @@ pub struct App {
     pub sessions: Vec<crate::session::SessionMeta>,
     /// When true (default), sessions with `finished_at` set are hidden.
     pub hide_inactive: bool,
+    /// The last confirmed search query (set when Enter is pressed in Search
+    /// mode). Kept so Browse mode continues to show filtered results after
+    /// the user commits a search — Esc clears it.
+    pub active_search: String,
 }
 
 impl App {
@@ -233,6 +238,7 @@ impl App {
             configured_only,
             sessions,
             hide_inactive,
+            active_search: String::new(),
         }
     }
 
@@ -353,11 +359,17 @@ impl App {
                 let mut q = query.clone();
                 match key.code {
                     KeyCode::Esc => {
-                        // Cancel: return to browse, leave row unchanged
+                        // Cancel: clear the committed search, return to full list
+                        self.active_search = String::new();
+                        self.row = 0;
+                        self.sync_table_state();
                         self.mode = AppMode::Browse;
                     }
                     KeyCode::Enter => {
-                        // Confirm: position cursor at first match, return to browse
+                        // Commit the current query: store it so Browse mode
+                        // continues to show filtered results. Cursor stays at
+                        // row 0 of the filtered list.
+                        self.active_search = q.clone();
                         self.row = 0;
                         self.sync_table_state();
                         self.mode = AppMode::Browse;
@@ -435,7 +447,10 @@ impl App {
         } else {
             let mode = self.mode.clone();
             match mode {
-                AppMode::Browse => self.render_browse(frame, inner[1], ""),
+                AppMode::Browse => {
+                    let q = self.active_search.clone();
+                    self.render_browse(frame, inner[1], &q);
+                }
                 AppMode::Search(ref q) => self.render_browse(frame, inner[1], q),
                 AppMode::Detail(ref id) => self.render_detail(frame, inner[1], id),
                 AppMode::InstancePick {
@@ -481,8 +496,37 @@ impl App {
     fn active_query(&self) -> &str {
         match &self.mode {
             AppMode::Search(q) => q.as_str(),
-            _ => "",
+            // In Browse mode, return the last committed search so the table
+            // stays filtered after the user presses Enter.
+            _ => self.active_search.as_str(),
         }
+    }
+
+    /// Returns a short label describing why `id` / `metadata` matched `query`
+    /// for Providers, Launchers, and Capabilities sections. Used to populate
+    /// the MATCHED ON column when a search is active.
+    /// Returns `"id"` when the id contains the query, otherwise `"tag: …"` for
+    /// the first matching tag, otherwise `"name"` for a name/description match.
+    fn catalog_match_reason(
+        id: &str,
+        metadata: &dyn crate::utils::Searchable,
+        query: &str,
+    ) -> String {
+        let q = query.to_lowercase();
+        if id.to_lowercase().contains(&q) {
+            return "id".to_string();
+        }
+        // Check individual search_fields for a tag prefix match first.
+        for field in metadata.search_fields() {
+            if field.to_lowercase().contains(&q) {
+                // If the field looks like a short tag (no spaces), label it tag:
+                if !field.contains(' ') {
+                    return format!("tag: {field}");
+                }
+                return "name".to_string();
+            }
+        }
+        "id".to_string()
     }
 
     /// Index into `self.configured_only` for sections that support the toggle,
@@ -497,18 +541,39 @@ impl App {
         }
     }
 
+    /// Model search rows filtered by the hide-catalog flag.
+    /// Used by both `render_browse` (to build the table) and `filtered_ids`
+    /// (to derive ids in match-priority order), so that `row_count` and
+    /// `selected_id` always index the same list as the rendered table.
+    fn model_search_rows(&self, query: &str) -> Vec<Vec<String>> {
+        let only = self.configured_only[0];
+        let configured_ids: std::collections::HashSet<&str> =
+            self.ctx.config.models.keys().map(|k| k.as_str()).collect();
+        ModelCommands::search_rows(query)
+            .into_iter()
+            .filter(|r| !only || configured_ids.contains(r[0].as_str()))
+            .collect()
+    }
+
     fn filtered_ids(&self, query: &str) -> Vec<String> {
         let q = query.to_lowercase();
         // IDs must be returned in the same order as the browse table renders
         // them so that self.row correctly indexes the highlighted entry.
         //
-        // Models: catalog_rows uses sort_enriched_rows (family/version/size),
-        //         not alphabetical — derive IDs from there.
-        // Recommend: recommend_rows_cache is sorted by variant size; preserve
-        //            that order instead of re-sorting alphabetically.
-        // Providers/Launchers/Capabilities: render code sorts by key, so
-        //                                   alphabetical sort here is correct.
+        // Models with a query: the table renders model_search_rows (match-
+        //   priority order), so return its ids directly so that row_count
+        //   and selected_id follow the same list.
+        // Models without a query: catalog_rows (family/version/size order).
+        // Recommend: recommend_rows_cache (variant size order).
+        // Providers/Launchers/Capabilities: alphabetical (matches render).
         // Hardware: no selectable rows.
+        if self.section == Section::Models && !q.is_empty() {
+            return self
+                .model_search_rows(query)
+                .into_iter()
+                .map(|r| r[0].clone())
+                .collect();
+        }
         let ids: Vec<String> = match self.section {
             Section::Models => {
                 let only = self.configured_only[0];
@@ -574,11 +639,21 @@ impl App {
                 v.sort();
                 v
             }
-            Section::Recommend => self
-                .recommend_rows_cache
-                .iter()
-                .map(|r| r[0].clone())
-                .collect(),
+            Section::Recommend => {
+                // Filter by id substring when a query is active.
+                let cache_ids: Vec<String> = self
+                    .recommend_rows_cache
+                    .iter()
+                    .map(|r| r[0].clone())
+                    .collect();
+                if q.is_empty() {
+                    return cache_ids;
+                }
+                return cache_ids
+                    .into_iter()
+                    .filter(|id| id.to_lowercase().contains(&q))
+                    .collect();
+            }
             Section::Sessions => {
                 return self
                     .sessions
@@ -592,12 +667,39 @@ impl App {
             Section::Hardware => vec![],
         };
         if q.is_empty() {
-            ids
-        } else {
-            ids.into_iter()
-                .filter(|id| id.to_lowercase().contains(&q))
-                .collect()
+            return ids;
         }
+        ids.into_iter()
+            .filter(|id| {
+                if id.to_lowercase().contains(&q) {
+                    return true;
+                }
+                // Also match against structured search_fields() (family, tags)
+                // via the Searchable trait's matches_query helper, so that e.g.
+                // searching "vision" surfaces models tagged "vision" even when
+                // the id doesn't contain it.
+                match self.section {
+                    Section::Providers => PROVIDER_REGISTRY
+                        .entries()
+                        .get(id.as_str())
+                        .map(|m| m.matches_query(&q))
+                        .unwrap_or(false),
+                    Section::Launchers => crate::launchers::LAUNCHER_REGISTRY
+                        .entries()
+                        .get(id.as_str())
+                        .map(|m| m.matches_query(&q))
+                        .unwrap_or(false),
+                    Section::Capabilities => crate::capabilities::CAPABILITY_REGISTRY
+                        .entries()
+                        .get(id.as_str())
+                        .map(|m| m.matches_query(&q))
+                        .unwrap_or(false),
+                    // Models with query: handled by early-return above.
+                    // Recommend/Sessions/Hardware: id-only match is correct.
+                    _ => false,
+                }
+            })
+            .collect()
     }
 
     fn row_count(&self) -> usize {
@@ -743,23 +845,42 @@ impl App {
 
         match self.section {
             Section::Models => {
-                let filtered_ids = self.filtered_ids(query);
-                // Use the shared data layer — catalog_rows returns [id, family, size, context, type]
-                let all_rows = ModelCommands::catalog_rows(None);
-                let entries: Vec<Vec<String>> = all_rows
-                    .into_iter()
-                    .filter(|r| filtered_ids.contains(&r[0]))
-                    .collect();
-
                 // Model instances are keyed by model ID directly
                 let configured_ids: std::collections::HashSet<&str> =
                     self.ctx.config.models.keys().map(|k| k.as_str()).collect();
 
-                let header = Row::new(vec!["", "ID", "FAMILY", "SIZE", "TYPE"]).style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                );
+                // When a search is active, switch to search_rows so that:
+                //   • The MATCHED ON column is shown.
+                //   • Results are sorted by match priority (tag > id > family > desc).
+                //   • selected_id() uses the same ordering (see its impl above).
+                // When browsing without a query, use catalog_rows filtered by
+                // filtered_ids (which respects configured_only).
+                let searching = !query.is_empty();
+                let (entries, header) = if searching {
+                    // model_search_rows applies configured_only and match-
+                    // priority sort — the same list filtered_ids returns for
+                    // Models+query, so row index, row_count, and selected_id
+                    // all stay in sync with the rendered table.
+                    let rows = self.model_search_rows(query);
+                    let h = Row::new(vec!["", "ID", "FAMILY", "SIZE", "TYPE", "MATCHED ON"]).style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    (rows, h)
+                } else {
+                    let filtered_ids = self.filtered_ids(query);
+                    let rows = ModelCommands::catalog_rows(None)
+                        .into_iter()
+                        .filter(|r| filtered_ids.contains(&r[0]))
+                        .collect();
+                    let h = Row::new(vec!["", "ID", "FAMILY", "SIZE", "TYPE"]).style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    (rows, h)
+                };
 
                 let rows: Vec<Row> = entries
                     .iter()
@@ -777,37 +898,59 @@ impl App {
                         } else {
                             Cell::from("")
                         };
-                        // columns: [0]=id [1]=family [2]=size [3]=context [4]=type
-                        Row::new(vec![
-                            marker,
-                            Cell::from(r[0].clone()),
-                            Cell::from(r[1].clone()),
-                            Cell::from(r[2].clone()),
-                            Cell::from(r[4].clone()),
-                        ])
-                        .style(style)
+                        if searching {
+                            // search_rows: [0]=id [1]=family [2]=size [3]=context [4]=type [5]=matched_on
+                            Row::new(vec![
+                                marker,
+                                Cell::from(r[0].clone()),
+                                Cell::from(r[1].clone()),
+                                Cell::from(r[2].clone()),
+                                Cell::from(r[4].clone()),
+                                Cell::from(r[5].clone()),
+                            ])
+                            .style(style)
+                        } else {
+                            // catalog_rows: [0]=id [1]=family [2]=size [3]=context [4]=type
+                            Row::new(vec![
+                                marker,
+                                Cell::from(r[0].clone()),
+                                Cell::from(r[1].clone()),
+                                Cell::from(r[2].clone()),
+                                Cell::from(r[4].clone()),
+                            ])
+                            .style(style)
+                        }
                     })
                     .collect();
 
-                let table =
-                    Table::new(
-                        rows,
-                        [
-                            Constraint::Length(2),
-                            Constraint::Percentage(43),
-                            Constraint::Percentage(25),
-                            Constraint::Percentage(10),
-                            Constraint::Percentage(20),
-                        ],
-                    )
-                    .header(header)
-                    .block(Block::default().borders(Borders::ALL).title(
-                        if self.configured_only[0] {
+                let widths: &[Constraint] = if searching {
+                    &[
+                        Constraint::Length(2),
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(18),
+                        Constraint::Percentage(8),
+                        Constraint::Percentage(12),
+                        Constraint::Percentage(30),
+                    ]
+                } else {
+                    &[
+                        Constraint::Length(2),
+                        Constraint::Percentage(43),
+                        Constraint::Percentage(25),
+                        Constraint::Percentage(10),
+                        Constraint::Percentage(20),
+                    ]
+                };
+
+                let table = Table::new(rows, widths.to_vec()).header(header).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(if self.configured_only[0] {
                             " Models [s: show catalog] "
                         } else {
                             " Models [h: hide catalog] "
-                        },
-                    ));
+                        }),
+                );
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
@@ -833,7 +976,13 @@ impl App {
                     .map(|c| c.provider_type.clone())
                     .collect();
 
-                let header = Row::new(vec!["", "ID", "DEFAULT URL"]).style(
+                let searching = !query.is_empty();
+                let header = if searching {
+                    Row::new(vec!["", "ID", "DEFAULT URL", "MATCHED ON"])
+                } else {
+                    Row::new(vec!["", "ID", "DEFAULT URL"])
+                }
+                .style(
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -853,32 +1002,53 @@ impl App {
                         } else {
                             Cell::from("")
                         };
-                        Row::new(vec![
-                            marker,
-                            Cell::from(id.to_string()),
-                            Cell::from(p.default_endpoint.clone()),
-                        ])
+                        if searching {
+                            let reason = Self::catalog_match_reason(
+                                id,
+                                p as &dyn crate::utils::Searchable,
+                                query,
+                            );
+                            Row::new(vec![
+                                marker,
+                                Cell::from(id.to_string()),
+                                Cell::from(p.default_endpoint.clone()),
+                                Cell::from(reason),
+                            ])
+                        } else {
+                            Row::new(vec![
+                                marker,
+                                Cell::from(id.to_string()),
+                                Cell::from(p.default_endpoint.clone()),
+                            ])
+                        }
                         .style(style)
                     })
                     .collect();
 
-                let table =
-                    Table::new(
-                        rows,
-                        [
-                            Constraint::Length(2),
-                            Constraint::Percentage(30),
-                            Constraint::Percentage(68),
-                        ],
-                    )
-                    .header(header)
-                    .block(Block::default().borders(Borders::ALL).title(
-                        if self.configured_only[1] {
+                let widths: &[Constraint] = if searching {
+                    &[
+                        Constraint::Length(2),
+                        Constraint::Percentage(28),
+                        Constraint::Percentage(44),
+                        Constraint::Percentage(24),
+                    ]
+                } else {
+                    &[
+                        Constraint::Length(2),
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(68),
+                    ]
+                };
+
+                let table = Table::new(rows, widths.to_vec()).header(header).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(if self.configured_only[1] {
                             " Providers [s: show catalog] "
                         } else {
                             " Providers [h: hide catalog] "
-                        },
-                    ));
+                        }),
+                );
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
@@ -907,7 +1077,13 @@ impl App {
                     .map(|c| c.launcher_type.clone())
                     .collect();
 
-                let header = Row::new(vec!["", "ID", "DEFAULT COMMAND"]).style(
+                let searching = !query.is_empty();
+                let header = if searching {
+                    Row::new(vec!["", "ID", "DEFAULT COMMAND", "MATCHED ON"])
+                } else {
+                    Row::new(vec!["", "ID", "DEFAULT COMMAND"])
+                }
+                .style(
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -927,32 +1103,53 @@ impl App {
                         } else {
                             Cell::from("")
                         };
-                        Row::new(vec![
-                            marker,
-                            Cell::from(id.to_string()),
-                            Cell::from(l.default_command.clone()),
-                        ])
+                        if searching {
+                            let reason = Self::catalog_match_reason(
+                                id,
+                                l as &dyn crate::utils::Searchable,
+                                query,
+                            );
+                            Row::new(vec![
+                                marker,
+                                Cell::from(id.to_string()),
+                                Cell::from(l.default_command.clone()),
+                                Cell::from(reason),
+                            ])
+                        } else {
+                            Row::new(vec![
+                                marker,
+                                Cell::from(id.to_string()),
+                                Cell::from(l.default_command.clone()),
+                            ])
+                        }
                         .style(style)
                     })
                     .collect();
 
-                let table =
-                    Table::new(
-                        rows,
-                        [
-                            Constraint::Length(2),
-                            Constraint::Percentage(30),
-                            Constraint::Percentage(68),
-                        ],
-                    )
-                    .header(header)
-                    .block(Block::default().borders(Borders::ALL).title(
-                        if self.configured_only[2] {
+                let widths: &[Constraint] = if searching {
+                    &[
+                        Constraint::Length(2),
+                        Constraint::Percentage(28),
+                        Constraint::Percentage(44),
+                        Constraint::Percentage(24),
+                    ]
+                } else {
+                    &[
+                        Constraint::Length(2),
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(68),
+                    ]
+                };
+
+                let table = Table::new(rows, widths.to_vec()).header(header).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(if self.configured_only[2] {
                             " Launchers [s: show catalog] "
                         } else {
                             " Launchers [h: hide catalog] "
-                        },
-                    ));
+                        }),
+                );
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
@@ -981,7 +1178,13 @@ impl App {
                     .map(|c| c.capability_type.clone())
                     .collect();
 
-                let header = Row::new(vec!["", "ID", "DESCRIPTION"]).style(
+                let searching = !query.is_empty();
+                let header = if searching {
+                    Row::new(vec!["", "ID", "DESCRIPTION", "MATCHED ON"])
+                } else {
+                    Row::new(vec!["", "ID", "DESCRIPTION"])
+                }
+                .style(
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -1001,40 +1204,67 @@ impl App {
                         } else {
                             Cell::from("")
                         };
-                        Row::new(vec![
-                            marker,
-                            Cell::from(id.to_string()),
-                            Cell::from(c.description.clone()),
-                        ])
+                        if searching {
+                            let reason = Self::catalog_match_reason(
+                                id,
+                                c as &dyn crate::utils::Searchable,
+                                query,
+                            );
+                            Row::new(vec![
+                                marker,
+                                Cell::from(id.to_string()),
+                                Cell::from(c.description.clone()),
+                                Cell::from(reason),
+                            ])
+                        } else {
+                            Row::new(vec![
+                                marker,
+                                Cell::from(id.to_string()),
+                                Cell::from(c.description.clone()),
+                            ])
+                        }
                         .style(style)
                     })
                     .collect();
 
-                let table =
-                    Table::new(
-                        rows,
-                        [
-                            Constraint::Length(2),
-                            Constraint::Percentage(30),
-                            Constraint::Percentage(68),
-                        ],
-                    )
-                    .header(header)
-                    .block(Block::default().borders(Borders::ALL).title(
-                        if self.configured_only[3] {
+                let widths: &[Constraint] = if searching {
+                    &[
+                        Constraint::Length(2),
+                        Constraint::Percentage(28),
+                        Constraint::Percentage(44),
+                        Constraint::Percentage(24),
+                    ]
+                } else {
+                    &[
+                        Constraint::Length(2),
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(68),
+                    ]
+                };
+
+                let table = Table::new(rows, widths.to_vec()).header(header).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(if self.configured_only[3] {
                             " Capabilities [s: show catalog] "
                         } else {
                             " Capabilities [h: hide catalog] "
-                        },
-                    ));
+                        }),
+                );
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
             Section::Recommend => {
-                let all_rows = &self.recommend_rows_cache;
-
                 let configured_ids: std::collections::HashSet<&str> =
                     self.ctx.config.models.keys().map(|k| k.as_str()).collect();
+
+                // Filter by query when a search is active (same set as filtered_ids).
+                let q = query.to_lowercase();
+                let visible_rows: Vec<&Vec<String>> = self
+                    .recommend_rows_cache
+                    .iter()
+                    .filter(|r| q.is_empty() || r[0].to_lowercase().contains(&q))
+                    .collect();
 
                 // columns: [0]=id [1]=size [2]=variant [3]=type [4]=fit [5]=providers
                 let header = Row::new(vec![
@@ -1052,10 +1282,11 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 );
 
-                let rows: Vec<Row> = all_rows
+                let rows: Vec<Row> = visible_rows
                     .iter()
                     .enumerate()
                     .map(|(i, r)| {
+                        let r = *r;
                         let style = if i == self.row {
                             Style::default().bg(Color::DarkGray)
                         } else if i % 2 == 0 {
@@ -1547,6 +1778,14 @@ impl App {
                             Span::raw(api_types),
                         ]),
                         Line::from(vec![Span::styled("Formats: ", bold), Span::raw(formats)]),
+                        Line::from(vec![
+                            Span::styled("Tags: ", bold),
+                            Span::raw(if p.tags.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                p.tags.join(", ")
+                            }),
+                        ]),
                         Line::from(""),
                         Line::from(Span::styled("Endpoints:", bold)),
                     ];
@@ -1606,6 +1845,14 @@ impl App {
                         Line::from(vec![
                             Span::styled("Supported capabilities: ", bold),
                             Span::raw(supported_caps),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("Tags: ", bold),
+                            Span::raw(if l.tags.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                l.tags.join(", ")
+                            }),
                         ]),
                         Line::from(""),
                         Line::from(Span::styled("Configured instances:", bold)),
@@ -2207,13 +2454,16 @@ mod tests {
     }
 
     #[test]
-    fn search_esc_returns_to_browse_without_changing_row() {
+    fn search_esc_returns_to_browse_and_resets_row() {
         let mut a = app();
         a.row = 3;
+        a.active_search = "prev".to_string();
         a.mode = AppMode::Search("gran".to_string());
         a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(a.mode, AppMode::Browse);
-        assert_eq!(a.row, 3);
+        // Esc cancels the search: active_search cleared, row reset to 0
+        assert_eq!(a.active_search, "");
+        assert_eq!(a.row, 0);
     }
 
     #[test]
@@ -2255,7 +2505,20 @@ mod tests {
         let a = app();
         let ids = a.filtered_ids("3.1");
         assert!(!ids.is_empty());
-        assert!(ids.iter().all(|id| id.contains("3.1")));
+        // Every returned id must have matched on the query — either the id
+        // itself contains "3.1", or one of its search_fields() does (e.g. the
+        // family "Granite 3.1"). This is stronger than `any` and equivalent to
+        // the original `all` assertion on main, extended to cover field matches.
+        assert!(ids.iter().all(|id| {
+            if id.contains("3.1") {
+                return true;
+            }
+            MODEL_REGISTRY
+                .entries()
+                .get(id.as_str())
+                .map(|m| m.matches_query("3.1"))
+                .unwrap_or(false)
+        }));
     }
 
     #[test]
@@ -2263,6 +2526,109 @@ mod tests {
         let a = app();
         let ids = a.filtered_ids("zzznomatch");
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn filtered_ids_matches_model_by_tag_not_id() {
+        // "granite-docling-258M" has tag "vision" but id does not contain "vision".
+        // The fix ensures tag-based matches are included in the TUI results.
+        let a = app();
+        let ids = a.filtered_ids("docling");
+        // Confirm at least one docling model is present via id match first
+        assert!(!ids.is_empty(), "expected docling models by id");
+
+        // Now test a tag-only match: search "vision" must return models whose
+        // id contains "vision" OR whose tags contain "vision" (e.g. docling).
+        let ids_vision = a.filtered_ids("vision");
+        assert!(
+            !ids_vision.is_empty(),
+            "expected vision models from tag or id"
+        );
+        // granite-docling-258M has tag "vision" but id does not contain "vision"
+        assert!(
+            ids_vision.iter().any(|id| id.contains("docling")),
+            "expected docling model to appear via tag:vision match; got {ids_vision:?}"
+        );
+    }
+
+    #[test]
+    fn filtered_ids_tag_match_provider_section() {
+        // Switch to Providers section and search for "local" — ollama/llamacpp
+        // have that tag, even though their registry id doesn't contain "local".
+        let mut a = app();
+        a.section = Section::Providers;
+        let ids = a.filtered_ids("local");
+        assert!(
+            !ids.is_empty(),
+            "expected providers matching tag 'local'; got none"
+        );
+        assert!(
+            ids.iter().any(|id| id == "ollama" || id == "llama-cpp"),
+            "expected ollama or llama-cpp to match via tag 'local'; got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn filtered_ids_tag_match_launcher_section() {
+        // Switch to Launchers section and search for "agent" — goose/hermes/openclaw
+        // have that tag.
+        let mut a = app();
+        a.section = Section::Launchers;
+        let ids = a.filtered_ids("agent");
+        assert!(
+            !ids.is_empty(),
+            "expected launchers matching tag 'agent'; got none"
+        );
+    }
+
+    #[test]
+    fn filtered_ids_tag_match_capability_section() {
+        let mut a = app();
+        a.section = Section::Capabilities;
+        // "agent" is a tag on agent-model and sub-agent capabilities.
+        let ids = a.filtered_ids("agent");
+        assert!(
+            !ids.is_empty(),
+            "expected capabilities matching tag 'agent'; got none"
+        );
+    }
+
+    // -- selected_id ----------------------------------------------------------
+
+    #[test]
+    fn selected_id_returns_first_id_at_row_zero() {
+        let a = app();
+        let expected = a.filtered_ids("").into_iter().next();
+        assert_eq!(a.selected_id(), expected);
+    }
+
+    #[test]
+    fn selected_id_returns_none_when_row_exceeds_count() {
+        let mut a = app();
+        // Hardware section has no rows.
+        a.section = Section::Hardware;
+        a.row = 99;
+        assert_eq!(a.selected_id(), None);
+    }
+
+    #[test]
+    fn selected_id_advances_with_row() {
+        let mut a = app();
+        let ids = a.filtered_ids("");
+        if ids.len() >= 2 {
+            a.row = 1;
+            assert_eq!(a.selected_id(), ids.into_iter().nth(1));
+        }
+    }
+
+    #[test]
+    fn selected_id_in_search_mode_uses_search_order() {
+        let mut a = app();
+        a.mode = AppMode::Search("vision".to_string());
+        a.row = 0;
+        // Must equal filtered_ids("vision").nth(0) which uses model_search_rows
+        let expected = a.filtered_ids("vision").into_iter().next();
+        assert_eq!(a.selected_id(), expected);
     }
 
     // -- detail scroll --------------------------------------------------------
@@ -2341,6 +2707,31 @@ mod tests {
         for row in ModelCommands::recommend_rows(None, None, &[], false, &*ui, &profile) {
             assert_eq!(row.len(), 6, "each recommend row must have 6 columns");
         }
+    }
+
+    #[test]
+    fn recommend_search_filters_by_id_substring() {
+        let mut a = app();
+        a.section = Section::Recommend;
+        // If the cache is empty (no hardware profile in test), filtered_ids returns
+        // nothing — that's fine. The important thing is that when rows are present,
+        // only matching ones are returned.
+        if a.recommend_rows_cache.is_empty() {
+            // Nothing to assert — cache is built lazily from hardware profile.
+            return;
+        }
+        // Use the id of the first row as a guaranteed match.
+        let first_id = a.recommend_rows_cache[0][0].clone();
+        let query = &first_id[..4.min(first_id.len())];
+        let matches = a.filtered_ids(query);
+        assert!(
+            matches
+                .iter()
+                .all(|id| id.to_lowercase().contains(&query.to_lowercase())),
+            "every returned id must contain the query substring"
+        );
+        // Empty query returns all rows.
+        assert_eq!(a.filtered_ids("").len(), a.recommend_rows_cache.len());
     }
 
     #[test]
@@ -2680,5 +3071,249 @@ mod tests {
             vec!["stale-session"],
             "stale session must show when hide_inactive=false"
         );
+    }
+
+    // -- catalog_match_reason -------------------------------------------------
+
+    #[test]
+    fn catalog_match_reason_returns_id_when_id_matches() {
+        // id "claude" contains query "clau" → matched on id regardless of search_fields
+        struct FakeMeta;
+        impl crate::utils::Searchable for FakeMeta {
+            fn search_fields(&self) -> Vec<&str> {
+                vec![]
+            }
+        }
+        let reason =
+            App::catalog_match_reason("claude", &FakeMeta as &dyn crate::utils::Searchable, "clau");
+        assert_eq!(reason, "id");
+    }
+
+    #[test]
+    fn catalog_match_reason_returns_tag_when_tag_matches() {
+        // Use a capability whose id does NOT match but a search_field (tag) does.
+        // Pick a known capability — "agent-model" has tags but not "agen" in the id prefix check.
+        // We directly construct a fake Searchable to avoid catalog coupling.
+        struct FakeMeta {
+            fields: Vec<&'static str>,
+        }
+        impl crate::utils::Searchable for FakeMeta {
+            fn search_fields(&self) -> Vec<&str> {
+                self.fields.clone()
+            }
+        }
+        let meta = FakeMeta {
+            fields: vec!["vision", "instruct"],
+        };
+        // id "zzz" does not match query "vision"; tag "vision" does match and has no spaces
+        let reason =
+            App::catalog_match_reason("zzz", &meta as &dyn crate::utils::Searchable, "vision");
+        assert_eq!(reason, "tag: vision");
+    }
+
+    #[test]
+    fn catalog_match_reason_returns_name_when_field_has_spaces() {
+        struct FakeMeta {
+            fields: Vec<&'static str>,
+        }
+        impl crate::utils::Searchable for FakeMeta {
+            fn search_fields(&self) -> Vec<&str> {
+                self.fields.clone()
+            }
+        }
+        let meta = FakeMeta {
+            fields: vec!["granite base model"],
+        };
+        // id "zzz" doesn't match; field has spaces → "name"
+        let reason =
+            App::catalog_match_reason("zzz", &meta as &dyn crate::utils::Searchable, "granite");
+        assert_eq!(reason, "name");
+    }
+
+    #[test]
+    fn catalog_match_reason_falls_back_to_id_when_nothing_matches() {
+        struct FakeMeta;
+        impl crate::utils::Searchable for FakeMeta {
+            fn search_fields(&self) -> Vec<&str> {
+                vec![]
+            }
+        }
+        // Neither id nor any field matches — fallback is "id"
+        let reason =
+            App::catalog_match_reason("zzz", &FakeMeta as &dyn crate::utils::Searchable, "xyz");
+        assert_eq!(reason, "id");
+    }
+
+    // -- configured_only_idx --------------------------------------------------
+
+    #[test]
+    fn configured_only_idx_models_is_zero() {
+        assert_eq!(App::configured_only_idx(&Section::Models), Some(0));
+    }
+
+    #[test]
+    fn configured_only_idx_providers_is_one() {
+        assert_eq!(App::configured_only_idx(&Section::Providers), Some(1));
+    }
+
+    #[test]
+    fn configured_only_idx_launchers_is_two() {
+        assert_eq!(App::configured_only_idx(&Section::Launchers), Some(2));
+    }
+
+    #[test]
+    fn configured_only_idx_capabilities_is_three() {
+        assert_eq!(App::configured_only_idx(&Section::Capabilities), Some(3));
+    }
+
+    #[test]
+    fn configured_only_idx_recommend_is_none() {
+        assert_eq!(App::configured_only_idx(&Section::Recommend), None);
+    }
+
+    #[test]
+    fn configured_only_idx_sessions_is_none() {
+        assert_eq!(App::configured_only_idx(&Section::Sessions), None);
+    }
+
+    #[test]
+    fn configured_only_idx_hardware_is_none() {
+        assert_eq!(App::configured_only_idx(&Section::Hardware), None);
+    }
+
+    // -- active_query ---------------------------------------------------------
+
+    #[test]
+    fn active_query_in_browse_returns_active_search() {
+        let mut a = app();
+        a.active_search = "granite".to_string();
+        a.mode = AppMode::Browse;
+        assert_eq!(a.active_query(), "granite");
+    }
+
+    #[test]
+    fn active_query_in_search_mode_returns_live_query() {
+        let mut a = app();
+        a.active_search = "old".to_string();
+        a.mode = AppMode::Search("new".to_string());
+        assert_eq!(a.active_query(), "new");
+    }
+
+    #[test]
+    fn active_query_in_detail_returns_active_search() {
+        let mut a = app();
+        a.active_search = "filter".to_string();
+        a.mode = AppMode::Detail("some-id".to_string());
+        assert_eq!(a.active_query(), "filter");
+    }
+
+    // -- filtered_ids hardware arm / empty-query early return -----------------
+
+    #[test]
+    fn filtered_ids_hardware_section_always_empty() {
+        let mut a = app();
+        a.section = Section::Hardware;
+        assert!(a.filtered_ids("").is_empty());
+        assert!(a.filtered_ids("anything").is_empty());
+    }
+
+    #[test]
+    fn filtered_ids_empty_query_returns_all_for_providers() {
+        let mut a = app();
+        a.section = Section::Providers;
+        let all = a.filtered_ids("");
+        let registry_len = crate::providers::PROVIDER_REGISTRY.entries().len();
+        assert_eq!(all.len(), registry_len);
+    }
+
+    #[test]
+    fn filtered_ids_empty_query_returns_all_for_launchers() {
+        let mut a = app();
+        a.section = Section::Launchers;
+        let all = a.filtered_ids("");
+        let registry_len = crate::launchers::LAUNCHER_REGISTRY.entries().len();
+        assert_eq!(all.len(), registry_len);
+    }
+
+    #[test]
+    fn filtered_ids_empty_query_returns_all_for_capabilities() {
+        let mut a = app();
+        a.section = Section::Capabilities;
+        let all = a.filtered_ids("");
+        let registry_len = crate::capabilities::CAPABILITY_REGISTRY.entries().len();
+        assert_eq!(all.len(), registry_len);
+    }
+
+    // -- Providers / Launchers / Capabilities search filter -------------------
+
+    #[test]
+    fn filtered_ids_providers_substring_match() {
+        let mut a = app();
+        a.section = Section::Providers;
+        // "ollama" is a known provider id
+        let ids = a.filtered_ids("ollama");
+        assert!(
+            ids.iter().any(|id| id.contains("ollama")),
+            "expected 'ollama' in filtered provider ids; got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn filtered_ids_launchers_substring_match() {
+        let mut a = app();
+        a.section = Section::Launchers;
+        // "claude" is a known launcher id
+        let ids = a.filtered_ids("claude");
+        assert!(
+            ids.iter().any(|id| id.contains("claude")),
+            "expected 'claude' in filtered launcher ids; got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn filtered_ids_launchers_no_match_returns_empty() {
+        let mut a = app();
+        a.section = Section::Launchers;
+        let ids = a.filtered_ids("zzzz_no_match_zzzz");
+        assert!(ids.is_empty(), "expected empty; got {ids:?}");
+    }
+
+    #[test]
+    fn filtered_ids_capabilities_no_match_returns_empty() {
+        let mut a = app();
+        a.section = Section::Capabilities;
+        let ids = a.filtered_ids("zzzz_no_match_zzzz");
+        assert!(ids.is_empty(), "expected empty; got {ids:?}");
+    }
+
+    // -- search Enter commits filter, Esc clears it ---------------------------
+
+    #[test]
+    fn search_enter_commits_active_search() {
+        let mut a = app();
+        a.mode = AppMode::Search("goose".to_string());
+        a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.mode, AppMode::Browse);
+        assert_eq!(a.active_search, "goose");
+    }
+
+    #[test]
+    fn active_query_after_enter_returns_committed_search() {
+        let mut a = app();
+        a.mode = AppMode::Search("3.3".to_string());
+        a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // After Enter, active_query() must return the committed search in Browse mode
+        assert_eq!(a.active_query(), "3.3");
+    }
+
+    #[test]
+    fn search_esc_clears_active_search() {
+        let mut a = app();
+        a.active_search = "prev-filter".to_string();
+        a.mode = AppMode::Search("typing".to_string());
+        a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(a.mode, AppMode::Browse);
+        assert_eq!(a.active_search, "");
+        assert_eq!(a.active_query(), "");
     }
 }
