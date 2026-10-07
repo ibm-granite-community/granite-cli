@@ -23,7 +23,7 @@ macro_rules! declare_sub_agent_basic {
         $tools_expr:expr;
         $known_type:expr
     ) => {
-        #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
+        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Validate)]
         pub struct $config_struct {
             /// Key into the configured models map (the user-chosen instance ID) for
             /// the model this sub-agent runs on.
@@ -207,7 +207,7 @@ macro_rules! declare_sub_agent_full {
         $known_type:expr;
         {$($config_fields:tt)*}
     ) => {
-        #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
+        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Validate)]
         pub struct $config_struct {
             /// Shown to the main agent so it can decide when to delegate to this
             /// sub-agent -- the same role Claude Code's own subagent `description`

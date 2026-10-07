@@ -55,7 +55,7 @@ impl ConfigPathTranslator for recommended_config::RecommendedConfiguration {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub models: HashMap<String, ModelConfig>,
     pub providers: HashMap<String, ProviderConfig>,
@@ -64,7 +64,7 @@ pub struct Config {
     pub recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Instance id -- the config/file key this model is stored under.
     /// Defaults to `model_type` (see `commands::ModelCommands::setup`), but
@@ -80,6 +80,19 @@ pub struct ModelConfig {
     /// `"custom"` instance). `{}` for catalog models, which take no config
     /// beyond `provider_config`.
     pub config: serde_json::Value,
+}
+
+#[cfg(test)]
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            model_id: String::new(),
+            model_type: String::new(),
+            provider_id: String::new(),
+            variant: None,
+            config: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

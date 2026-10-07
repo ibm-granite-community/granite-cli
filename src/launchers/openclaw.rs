@@ -43,6 +43,10 @@ pub struct OpenClawLauncher {
 impl ConfigConstructable for OpenClawLauncher {
     type Config = OpenClawLauncherConfig;
 
+    fn default_config() -> Option<serde_json::Value> {
+        serde_json::to_value(Self::Config::default()).ok()
+    }
+
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: OpenClawLauncherConfig =
             serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;

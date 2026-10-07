@@ -50,6 +50,10 @@ pub struct GooseLauncher {
 impl ConfigConstructable for GooseLauncher {
     type Config = GooseLauncherConfig;
 
+    fn default_config() -> Option<serde_json::Value> {
+        serde_json::to_value(Self::Config::default()).ok()
+    }
+
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: GooseLauncherConfig =
             serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;

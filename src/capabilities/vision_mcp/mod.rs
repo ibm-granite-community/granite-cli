@@ -64,17 +64,6 @@ fn default_max_image_bytes() -> u64 {
     50 * 1024 * 1024
 }
 
-impl Default for VisionMCPCapabilityConfig {
-    fn default() -> Self {
-        Self {
-            model_id: String::new(),
-            timeout_seconds: default_timeout_seconds(),
-            max_image_bytes: default_max_image_bytes(),
-            extra_headers: HashMap::new(),
-        }
-    }
-}
-
 /*-- VisionMCPCapability -----------------------------------------------------------*/
 
 pub struct VisionMCPCapability {

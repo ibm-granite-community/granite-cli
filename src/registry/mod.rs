@@ -49,8 +49,8 @@ impl std::error::Error for ConstructError {}
 /// Provides construction from a configuration object.
 pub trait ConfigConstructable {
     /// The structured config type for this implementation.
-    /// Must implement `JsonSchema + Serialize + Default`.
-    type Config: schemars::JsonSchema + serde::Serialize + Default;
+    /// Must implement `JsonSchema + Serialize`.
+    type Config: schemars::JsonSchema + serde::Serialize;
 
     /// Construct with the instance's configured name and its own config.
     ///
@@ -72,6 +72,12 @@ pub trait ConfigConstructable {
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError>
     where
         Self: Sized;
+
+    /// Return the serialized default configuration for this implementation,
+    /// or `None` if the configuration type has no default.
+    fn default_config() -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// Lets a factory-constructed instance report the configured name it was built
@@ -160,7 +166,7 @@ macro_rules! define_factory {
 
                 /// Default config value for this implementation
                 #[allow(unused)]
-                fn default_config(&self) -> serde_json::Value;
+                fn default_config(&self) -> Option<serde_json::Value>;
             }
 
             /// Trait that implementations must provide to supply metadata.
@@ -176,7 +182,7 @@ macro_rules! define_factory {
             where
                 T: $trait
                     + [<Has $trait Metadata>]
-                    + ConfigConstructable<Config: schemars::JsonSchema + serde::Serialize + Default>
+                    + ConfigConstructable<Config: schemars::JsonSchema + serde::Serialize>
                     + Send
                     + Sync
                     + 'static,
@@ -197,9 +203,8 @@ macro_rules! define_factory {
                     schemars::schema_for!(<T as ConfigConstructable>::Config)
                 }
 
-                fn default_config(&self) -> serde_json::Value {
-                    serde_json::to_value(<T as ConfigConstructable>::Config::default())
-                        .unwrap_or_default()
+                fn default_config(&self) -> Option<serde_json::Value> {
+                    T::default_config()
                 }
             }
 
@@ -236,7 +241,7 @@ macro_rules! define_factory {
                 where
                     T: $trait
                         + ConfigConstructable<
-                            Config: schemars::JsonSchema + serde::Serialize + Default,
+                            Config: schemars::JsonSchema + serde::Serialize,
                         > + [<Has $trait Metadata>]
                         + Send
                         + Sync
@@ -345,7 +350,7 @@ macro_rules! define_factory {
                 /// * `None` - If name not registered
                 #[allow(unused)]
                 pub(crate) fn default_config(&self, name: &str) -> Option<serde_json::Value> {
-                    self.registry.get(name).map(|x| x.default_config())
+                    self.registry.get(name).and_then(|x| x.default_config())
                 }
             }
         }
@@ -388,6 +393,10 @@ mod tests {
     impl ConfigConstructable for TestImpl1 {
         type Config = NoConfig;
 
+        fn default_config() -> Option<serde_json::Value> {
+            serde_json::to_value(Self::Config::default()).ok()
+        }
+
         fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
             let value = cfg.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             Ok(Self {
@@ -423,6 +432,10 @@ mod tests {
 
     impl ConfigConstructable for TestImpl2 {
         type Config = TestImpl2Config;
+
+        fn default_config() -> Option<serde_json::Value> {
+            serde_json::to_value(TestImpl2Config::default()).ok()
+        }
 
         fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
             let value = cfg.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
@@ -664,5 +677,14 @@ mod tests {
     fn test_default_config_unknown() {
         let factory = TestTraitFactory::new();
         assert!(factory.default_config("unknown").is_none());
+    }
+
+    #[test]
+    fn test_default_config_none_when_not_overridden() {
+        let mut factory = TestTraitFactory::new();
+        factory.register::<TestImpl3>("impl3");
+
+        // TestImpl3 does not override default_config(), so None is returned.
+        assert!(factory.default_config("impl3").is_none());
     }
 }

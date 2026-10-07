@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenAIProviderConfig {
     /// Base URL for the OpenAI-compatible API
+    #[serde(default = "default_openai_url")]
     pub base_url: String,
 
     /// API key for authentication (optional for local providers)
@@ -43,6 +44,10 @@ pub struct OpenAIProviderConfig {
     pub model_aliases: Option<HashMap<String, String>>,
 }
 
+fn default_openai_url() -> String {
+    "http://localhost:8080".to_string()
+}
+
 fn default_timeout() -> u64 {
     10
 }
@@ -58,11 +63,11 @@ fn default_health_endpoint() -> String {
 impl Default for OpenAIProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:8080".to_string(),
+            base_url: default_openai_url(),
             api_key: None,
-            timeout_secs: 10,
-            verify_ssl: true,
-            health_check_endpoint: "/v1/models".to_string(),
+            timeout_secs: default_timeout(),
+            verify_ssl: default_verify_ssl(),
+            health_check_endpoint: default_health_endpoint(),
             function_endpoints: None,
             custom_headers: None,
             model_aliases: None,
@@ -106,6 +111,10 @@ impl OpenAIProvider {
 
 impl ConfigConstructable for OpenAIProvider {
     type Config = OpenAIProviderConfig;
+
+    fn default_config() -> Option<serde_json::Value> {
+        serde_json::to_value(Self::Config::default()).ok()
+    }
 
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: OpenAIProviderConfig =

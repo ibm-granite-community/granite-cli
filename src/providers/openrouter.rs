@@ -19,7 +19,7 @@ pub struct OpenRouterProviderConfig {
     /// OpenRouter is one hosted service, so this has a default rather than
     /// being asked for: an instance that does not say otherwise talks to
     /// `https://openrouter.ai/api`.
-    #[serde(default = "default_base_url")]
+    #[serde(default = "default_openrouter_url")]
     pub base_url: String,
     pub api_key: Option<Secret>,
     #[serde(default = "default_timeout")]
@@ -42,17 +42,17 @@ fn default_health_endpoint() -> String {
     "/v1/models".to_string()
 }
 
-fn default_base_url() -> String {
+fn default_openrouter_url() -> String {
     "https://openrouter.ai/api".to_string()
 }
 
 impl Default for OpenRouterProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: default_base_url(),
+            base_url: default_openrouter_url(),
             api_key: None,
-            timeout_secs: 10,
-            verify_ssl: true,
+            timeout_secs: default_timeout(),
+            verify_ssl: default_verify_ssl(),
             health_check_endpoint: default_health_endpoint(),
         }
     }
@@ -89,6 +89,10 @@ impl OpenRouterProvider {
 
 impl ConfigConstructable for OpenRouterProvider {
     type Config = OpenRouterProviderConfig;
+
+    fn default_config() -> Option<serde_json::Value> {
+        serde_json::to_value(Self::Config::default()).ok()
+    }
 
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: OpenRouterProviderConfig =

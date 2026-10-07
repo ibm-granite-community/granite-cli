@@ -54,6 +54,10 @@ pub struct HermesLauncher {
 impl ConfigConstructable for HermesLauncher {
     type Config = HermesLauncherConfig;
 
+    fn default_config() -> Option<serde_json::Value> {
+        serde_json::to_value(Self::Config::default()).ok()
+    }
+
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: HermesLauncherConfig =
             serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
