@@ -179,6 +179,7 @@ pub(crate) async fn run_command(
 
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
+    cmd.current_dir(&ctx.working_dir);
     for binding in &translated_overlay {
         cmd.env(&binding.key, &binding.value);
     }
@@ -290,6 +291,7 @@ pub(crate) async fn run_command_captured(
 
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
+    cmd.current_dir(&ctx.working_dir);
     for binding in &translated_overlay {
         cmd.env(&binding.key, &binding.value);
     }
