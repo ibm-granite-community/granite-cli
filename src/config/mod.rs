@@ -82,19 +82,6 @@ pub struct ModelConfig {
     pub config: serde_json::Value,
 }
 
-#[cfg(test)]
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            model_id: String::new(),
-            model_type: String::new(),
-            provider_id: String::new(),
-            variant: None,
-            config: serde_json::Value::Object(serde_json::Map::new()),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub provider_id: String,
