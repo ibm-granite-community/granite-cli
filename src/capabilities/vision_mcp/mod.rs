@@ -37,7 +37,7 @@ use tokio::sync::Mutex;
 
 /*-- VisionMCPCapabilityConfig ----------------------------------------------------*/
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Validate)]
 pub struct VisionMCPCapabilityConfig {
     /// Key into the configured models map (the user-chosen instance ID) for
     /// the vision-language model this capability serves.
@@ -62,6 +62,17 @@ fn default_timeout_seconds() -> u64 {
 
 fn default_max_image_bytes() -> u64 {
     50 * 1024 * 1024
+}
+
+impl Default for VisionMCPCapabilityConfig {
+    fn default() -> Self {
+        Self {
+            model_id: String::new(),
+            timeout_seconds: default_timeout_seconds(),
+            max_image_bytes: default_max_image_bytes(),
+            extra_headers: HashMap::new(),
+        }
+    }
 }
 
 /*-- VisionMCPCapability -----------------------------------------------------------*/
