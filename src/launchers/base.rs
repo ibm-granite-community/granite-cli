@@ -698,9 +698,10 @@ pub(crate) mod tests {
     async fn run_command_non_dry_run_executes() {
         use crate::utils::ui::backends::plain::PlainOutput;
         let ui = PlainOutput;
+        let dir = tempfile::tempdir().unwrap();
         let ctx = LaunchContext {
             launcher_id: "test".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: dir.path().to_path_buf(),
             base_env: HashMap::new(),
             dry_run: false,
             usage_tracker: None,
@@ -793,5 +794,69 @@ pub(crate) mod tests {
 
         assert_eq!(resolved.len(), 2);
         assert_eq!(*launcher.bound.lock().unwrap(), enabled);
+    }
+
+    #[tokio::test]
+    async fn run_command_captured_subprocess_sees_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = LaunchContext {
+            launcher_id: "test".to_string(),
+            working_dir: dir.path().to_path_buf(),
+            base_env: HashMap::new(),
+            dry_run: false,
+            usage_tracker: None,
+            model_proxy: None,
+        };
+
+        #[cfg(unix)]
+        let (binary, args): (PathBuf, Vec<String>) = (PathBuf::from("/bin/pwd"), vec![]);
+        #[cfg(windows)]
+        let (binary, args): (PathBuf, Vec<String>) = (
+            PathBuf::from("cmd"),
+            vec!["/C".to_string(), "cd".to_string()],
+        );
+
+        let (status, stdout, _) = run_command_captured(binary, &[], &args, &ctx)
+            .await
+            .unwrap();
+        assert!(status.success());
+        let reported = PathBuf::from(stdout.trim());
+        assert_eq!(
+            reported.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_subprocess_sees_working_dir() {
+        use crate::utils::ui::backends::plain::PlainOutput;
+        let ui = PlainOutput;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+
+        let ctx = LaunchContext {
+            launcher_id: "test".to_string(),
+            working_dir: dir.path().to_path_buf(),
+            base_env: HashMap::new(),
+            dry_run: false,
+            usage_tracker: None,
+            model_proxy: None,
+        };
+
+        #[cfg(unix)]
+        let (binary, args): (PathBuf, Vec<String>) = (
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), "touch marker".to_string()],
+        );
+        #[cfg(windows)]
+        let (binary, args): (PathBuf, Vec<String>) = (
+            PathBuf::from("cmd"),
+            vec!["/C".to_string(), "type nul > marker".to_string()],
+        );
+
+        let status = run_command(binary, &[], &args, &ctx, &ui).await.unwrap();
+        assert!(status.success());
+        assert!(marker.exists());
     }
 }
