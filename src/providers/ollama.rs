@@ -17,7 +17,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OllamaProviderConfig {
     /// Base URL for the Ollama API
-    #[serde(default = "default_ollama_url")]
+    #[serde(default = "default_base_url")]
     pub base_url: String,
 
     /// API key for authentication (optional)
@@ -36,7 +36,7 @@ pub struct OllamaProviderConfig {
     pub health_check_endpoint: String,
 }
 
-fn default_ollama_url() -> String {
+fn default_base_url() -> String {
     "http://localhost:11434".to_string()
 }
 
@@ -55,7 +55,7 @@ fn default_ollama_health_endpoint() -> String {
 impl Default for OllamaProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: default_ollama_url(),
+            base_url: default_base_url(),
             api_key: None,
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),
@@ -182,10 +182,6 @@ impl OllamaProvider {
 
 impl ConfigConstructable for OllamaProvider {
     type Config = OllamaProviderConfig;
-
-    fn default_config() -> Option<serde_json::Value> {
-        serde_json::to_value(Self::Config::default()).ok()
-    }
 
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: OllamaProviderConfig =

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenAIProviderConfig {
     /// Base URL for the OpenAI-compatible API
-    #[serde(default = "default_openai_url")]
+    #[serde(default = "default_base_url")]
     pub base_url: String,
 
     /// API key for authentication (optional for local providers)
@@ -44,7 +44,7 @@ pub struct OpenAIProviderConfig {
     pub model_aliases: Option<HashMap<String, String>>,
 }
 
-fn default_openai_url() -> String {
+fn default_base_url() -> String {
     "http://localhost:8080".to_string()
 }
 
@@ -63,7 +63,7 @@ fn default_health_endpoint() -> String {
 impl Default for OpenAIProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: default_openai_url(),
+            base_url: default_base_url(),
             api_key: None,
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),
@@ -111,10 +111,6 @@ impl OpenAIProvider {
 
 impl ConfigConstructable for OpenAIProvider {
     type Config = OpenAIProviderConfig;
-
-    fn default_config() -> Option<serde_json::Value> {
-        serde_json::to_value(Self::Config::default()).ok()
-    }
 
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: OpenAIProviderConfig =
