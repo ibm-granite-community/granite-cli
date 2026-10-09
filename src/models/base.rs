@@ -396,7 +396,7 @@ impl std::fmt::Display for ModelType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
 pub struct ModelVariant {
     pub format: String,
     pub precision: String,

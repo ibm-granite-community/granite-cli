@@ -361,7 +361,7 @@ impl ResetPlan {
 /// fields that did not need replacing. Construction reads settings and does no
 /// I/O, so trying a few is cheap.
 fn plan_reset(kind: RefKind, type_name: &str, current: &serde_json::Value) -> Option<ResetPlan> {
-    let defaults = default_settings(kind, type_name)?;
+    let defaults = default_settings(kind, type_name);
     let (Some(current_fields), Some(default_fields)) = (current.as_object(), defaults.as_object())
     else {
         return constructs(kind, type_name, &defaults).then(|| ResetPlan {
@@ -420,7 +420,7 @@ fn constructs(kind: RefKind, type_name: &str, settings: &serde_json::Value) -> b
 }
 
 /// A type's default settings, as its registry entry declares them.
-fn default_settings(kind: RefKind, type_name: &str) -> Option<serde_json::Value> {
+fn default_settings(kind: RefKind, type_name: &str) -> serde_json::Value {
     match kind {
         RefKind::Launcher => crate::launchers::LAUNCHER_REGISTRY.default_config(type_name),
         RefKind::Capability => crate::capabilities::CAPABILITY_REGISTRY.default_config(type_name),
@@ -703,8 +703,7 @@ mod tests {
             settings.get("timeout_secs"),
             crate::providers::PROVIDER_REGISTRY
                 .default_config("ollama")
-                .as_ref()
-                .and_then(|defaults| defaults.get("timeout_secs")),
+                .get("timeout_secs"),
             "the field that could not be read now holds its type's default"
         );
         assert_eq!(

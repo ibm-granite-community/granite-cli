@@ -51,8 +51,8 @@ impl Default for OpenRouterProviderConfig {
         Self {
             base_url: default_base_url(),
             api_key: None,
-            timeout_secs: 10,
-            verify_ssl: true,
+            timeout_secs: default_timeout(),
+            verify_ssl: default_verify_ssl(),
             health_check_endpoint: default_health_endpoint(),
         }
     }
