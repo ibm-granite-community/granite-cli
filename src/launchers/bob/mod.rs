@@ -75,10 +75,6 @@ pub struct BobLauncher {
 impl ConfigConstructable for BobLauncher {
     type Config = BobLauncherConfig;
 
-    fn default_config() -> Option<serde_json::Value> {
-        serde_json::to_value(Self::Config::default()).ok()
-    }
-
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: BobLauncherConfig =
             serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;

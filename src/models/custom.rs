@@ -16,7 +16,7 @@ use crate::registry::{ConfigConstructable, ConstructError, Named};
 /// deliberately not configurable -- `CustomModel` always reports an empty
 /// one, so `context_fit` degrades to `ContextFit::None` for custom models
 /// rather than prompting for a full per-layer memory shape.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct CustomModelConfig {
     pub family: String,
     #[serde(default)]

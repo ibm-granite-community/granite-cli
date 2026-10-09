@@ -53,10 +53,6 @@ pub struct PiLauncher {
 impl ConfigConstructable for PiLauncher {
     type Config = PiLauncherConfig;
 
-    fn default_config() -> Option<serde_json::Value> {
-        serde_json::to_value(Self::Config::default()).ok()
-    }
-
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: PiLauncherConfig =
             serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
