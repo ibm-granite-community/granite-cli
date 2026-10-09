@@ -337,19 +337,18 @@ macro_rules! define_factory {
                     self.registry.get(name).map(|x| x.config_schema())
                 }
 
-                /// Get the default config value for a specific implementation by name.
+                /// Returns the default config for the named registration, or an
+                /// empty object if the name is not registered.
                 ///
                 /// # Arguments
                 ///
                 /// * `name` - The name of the implementation
-                ///
-                /// # Returns
-                ///
-                /// * `Some(value)` - Default config value, if found
-                /// * `None` - If name not registered
                 #[allow(unused)]
-                pub(crate) fn default_config(&self, name: &str) -> Option<serde_json::Value> {
-                    self.registry.get(name).map(|x| x.default_config())
+                pub(crate) fn default_config(&self, name: &str) -> serde_json::Value {
+                    self.registry
+                        .get(name)
+                        .map(|x| x.default_config())
+                        .unwrap_or_else(|| serde_json::json!({}))
                 }
             }
         }
@@ -651,22 +650,22 @@ mod tests {
         factory.register::<TestImpl1>("impl1");
 
         // TestImpl1 uses NoConfig, which serializes to an empty object.
-        let value = factory.default_config("impl1").unwrap();
+        let value = factory.default_config("impl1");
         assert_eq!(value, serde_json::json!({}));
     }
 
     #[test]
-    fn test_default_config_from_struct_default() {
+    fn test_default_config_uses_override() {
         let mut factory = TestTraitFactory::new();
         factory.register::<TestImpl2>("impl2");
 
-        let value = factory.default_config("impl2").unwrap();
+        let value = factory.default_config("impl2");
         assert_eq!(value, serde_json::json!({ "value": 0 }));
     }
 
     #[test]
     fn test_default_config_unknown() {
         let factory = TestTraitFactory::new();
-        assert!(factory.default_config("unknown").is_none());
+        assert_eq!(factory.default_config("unknown"), serde_json::json!({}));
     }
 }

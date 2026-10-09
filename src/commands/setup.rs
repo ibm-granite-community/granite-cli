@@ -126,8 +126,7 @@ impl Discover {
 
             // Construct a transient instance with default config and run health check
             let default_config = PROVIDER_REGISTRY
-                .default_config(provider_type)
-                .unwrap_or_else(|| serde_json::json!({}));
+                .default_config(provider_type);
             let result = PROVIDER_REGISTRY.construct(provider_type, provider_type, &default_config);
 
             match result {
@@ -333,8 +332,7 @@ impl Discover {
 
             // Construct a transient instance with default config
             let default_config = LAUNCHER_REGISTRY
-                .default_config(launcher_type)
-                .unwrap_or_else(|| serde_json::json!({}));
+                .default_config(launcher_type);
             match LAUNCHER_REGISTRY.construct(launcher_type, launcher_type, &default_config) {
                 Ok(launcher) => match launcher.validate_command() {
                     Ok(path) => recommendations.push(Recommendation::Launcher {
@@ -839,8 +837,7 @@ fn provider_can_run(provider_id: &str, variant: &ModelVariant, ctx: &crate::AppC
         Some(pc) => PROVIDER_REGISTRY.construct(&pc.provider_type, &pc.provider_id, &pc.config),
         None => {
             let default_config = PROVIDER_REGISTRY
-                .default_config(provider_id)
-                .unwrap_or_else(|| serde_json::json!({}));
+                .default_config(provider_id);
             PROVIDER_REGISTRY.construct(provider_id, provider_id, &default_config)
         }
     };
@@ -1964,8 +1961,7 @@ impl SetupCommands {
                         .ok()
                 } else {
                     let default_config = PROVIDER_REGISTRY
-                        .default_config(pid)
-                        .unwrap_or_else(|| serde_json::json!({}));
+                        .default_config(pid);
                     PROVIDER_REGISTRY.construct(pid, pid, &default_config).ok()
                 }
             })
@@ -2210,8 +2206,7 @@ impl SetupCommands {
             }
             ui.info(&format!("\nConfiguring provider: {provider_id}..."));
             let default_config = PROVIDER_REGISTRY
-                .default_config(provider_id)
-                .unwrap_or_else(|| serde_json::json!({}));
+                .default_config(provider_id);
 
             let provider_config = crate::config::ProviderConfig {
                 provider_id: provider_id.clone(),
@@ -2240,8 +2235,7 @@ impl SetupCommands {
             }
             ui.info(&format!("\nConfiguring launcher: {launcher_id}..."));
             let default_config = LAUNCHER_REGISTRY
-                .default_config(launcher_id)
-                .unwrap_or_else(|| serde_json::json!({}));
+                .default_config(launcher_id);
 
             let launcher_config = crate::config::LauncherConfig {
                 launcher_id: launcher_id.to_string(),
@@ -2335,8 +2329,7 @@ impl SetupCommands {
                 capability_id: cap_type.to_string(),
                 capability_type: cap_type.to_string(),
                 config: CAPABILITY_REGISTRY
-                    .default_config(cap_type)
-                    .unwrap_or_else(|| serde_json::json!({})),
+                    .default_config(cap_type),
             };
             let Some(cap_model_ids) = Self::capability_model_ids(
                 cap_type,
@@ -2360,8 +2353,7 @@ impl SetupCommands {
             ui.info(&format!("\nConfiguring capability: {cap_type}..."));
 
             let mut config = CAPABILITY_REGISTRY
-                .default_config(cap_type)
-                .unwrap_or_else(|| serde_json::json!({}));
+                .default_config(cap_type);
 
             // Set each resolved model dependency slot
             for (config_key, model_id) in &cap_model_ids {
@@ -3826,8 +3818,7 @@ mod tests {
                 provider_id: "lm-studio".to_string(),
                 provider_type: "lm-studio".to_string(),
                 config: PROVIDER_REGISTRY
-                    .default_config("lm-studio")
-                    .unwrap_or_else(|| serde_json::json!({})),
+                    .default_config("lm-studio"),
             },
         );
         let selected: HashSet<String> = ["lm-studio".to_string()].into_iter().collect();
@@ -4851,7 +4842,7 @@ mod tests {
         let ctx = ctx_with_provider(
             "my-ollama",
             "ollama",
-            PROVIDER_REGISTRY.default_config("ollama").unwrap(),
+            PROVIDER_REGISTRY.default_config("ollama"),
         );
 
         let selection = SetupCommands::auto_selection(
