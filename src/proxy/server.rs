@@ -340,6 +340,57 @@ fn model_from_body(body: &[u8]) -> Option<String> {
     model
 }
 
+/// Converts Codex's private agent-to-agent input items into the standard
+/// Responses API message shape understood by OpenAI-compatible providers and
+/// removes opaque encrypted content that those providers cannot consume.
+fn normalize_agent_messages(body: axum::body::Bytes) -> axum::body::Bytes {
+    let Ok(mut request) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(input) = request
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return body;
+    };
+
+    let mut changed = false;
+    for item in input {
+        if let Some(content) = item
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let original_len = content.len();
+            content.retain(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) != Some("encrypted_content")
+            });
+            changed |= content.len() != original_len;
+        }
+
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("agent_message") {
+            continue;
+        }
+        let content = item
+            .get("content")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        *item = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": content,
+        });
+        changed = true;
+    }
+
+    if changed {
+        serde_json::to_vec(&request)
+            .map(axum::body::Bytes::from)
+            .unwrap_or(body)
+    } else {
+        body
+    }
+}
+
 /// Headers that must not be blindly forwarded in either direction:
 /// connection-specific framing that's re-derived for the new connection.
 /// Auth headers (`authorization`/`x-api-key`) are handled separately per
@@ -396,7 +447,7 @@ async fn forward(
     headers: HeaderMap,
     body: Body,
 ) -> anyhow::Result<Response> {
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await?;
+    let body_bytes = normalize_agent_messages(axum::body::to_bytes(body, usize::MAX).await?);
     let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let (target, label, forward_path) = {
         let table = state.routing.read().unwrap();
@@ -984,6 +1035,56 @@ mod tests {
     #[test]
     fn model_from_body_returns_none_for_non_json() {
         assert_eq!(model_from_body(b"not json"), None);
+    }
+
+    #[test]
+    fn normalize_agent_messages_converts_only_agent_messages_in_responses_input() {
+        let normalized = normalize_agent_messages(axum::body::Bytes::from_static(
+            br#"{"model":"sub-agent","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"keep"}]},{"type":"agent_message","author":"/root","recipient":"/root/explore","content":[{"type":"input_text","text":"delegate this task"}]}]}"#,
+        ));
+        let request: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+
+        assert_eq!(request["input"][0]["type"], "message");
+        assert_eq!(request["input"][1]["type"], "message");
+        assert_eq!(request["input"][1]["role"], "user");
+        assert_eq!(
+            request["input"][1]["content"][0]["text"],
+            "delegate this task"
+        );
+        assert!(request["input"][1].get("author").is_none());
+        assert!(request["input"][1].get("recipient").is_none());
+    }
+
+    #[test]
+    fn normalize_agent_messages_removes_unsupported_encrypted_content_blocks() {
+        let normalized = normalize_agent_messages(axum::body::Bytes::from_static(
+            br#"{"model":"sub-agent","input":[{"type":"agent_message","content":[{"type":"input_text","text":"delegate this task"},{"type":"encrypted_content","data":"opaque"}]},{"type":"message","role":"user","content":[{"type":"encrypted_content","data":"opaque"},{"type":"input_text","text":"keep"}]}]}"#,
+        ));
+        let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+
+        assert_eq!(
+            value["input"][0],
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "delegate this task"}],
+            })
+        );
+        assert_eq!(
+            value["input"][1]["content"],
+            serde_json::json!([{"type": "input_text", "text": "keep"}])
+        );
+    }
+
+    #[test]
+    fn normalize_agent_messages_leaves_non_json_and_unrelated_input_unchanged() {
+        let plain = axum::body::Bytes::from_static(b"not json");
+        assert_eq!(normalize_agent_messages(plain.clone()), plain);
+
+        let request = axum::body::Bytes::from_static(
+            br#"{"input":[{"type":"message","role":"user","content":"keep"}]}"#,
+        );
+        assert_eq!(normalize_agent_messages(request.clone()), request);
     }
 
     #[test]

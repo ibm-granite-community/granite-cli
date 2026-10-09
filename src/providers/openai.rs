@@ -84,14 +84,26 @@ pub struct OpenAIProvider {
 impl OpenAIProvider {
     fn default_function_endpoints() -> HashMap<ModelFunction, Vec<ApiEndpoint>> {
         let mut map = HashMap::new();
-        map.insert(ModelFunction::Chat, vec![ApiEndpoint::OpenAIChat]);
-        map.insert(ModelFunction::ToolCalling, vec![ApiEndpoint::OpenAIChat]);
-        map.insert(ModelFunction::Thinking, vec![ApiEndpoint::OpenAIChat]);
+        map.insert(
+            ModelFunction::Chat,
+            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+        );
+        map.insert(
+            ModelFunction::ToolCalling,
+            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+        );
+        map.insert(
+            ModelFunction::Thinking,
+            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+        );
         map.insert(
             ModelFunction::ImageUnderstanding,
-            vec![ApiEndpoint::OpenAIChat],
+            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
         );
-        map.insert(ModelFunction::Guardian, vec![ApiEndpoint::OpenAIChat]);
+        map.insert(
+            ModelFunction::Guardian,
+            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+        );
         map.insert(
             ModelFunction::Embeddings,
             vec![ApiEndpoint::OpenAIEmbeddings],
@@ -423,6 +435,35 @@ mod tests {
         assert!(endpoints.contains_key(&ModelFunction::Chat));
         assert!(endpoints.contains_key(&ModelFunction::Embeddings));
         assert!(endpoints.contains_key(&ModelFunction::Transcription));
+    }
+
+    #[test]
+    fn responses_api_is_first_chat_completions_is_fallback_for_agent_functions() {
+        use crate::providers::base::ApiEndpoint;
+        let provider = OpenAIProvider::new(
+            "my-openai",
+            &serde_json::json!({ "base_url": "http://localhost:8080" }),
+        )
+        .unwrap();
+        for function in &[
+            ModelFunction::Chat,
+            ModelFunction::ToolCalling,
+            ModelFunction::Thinking,
+            ModelFunction::ImageUnderstanding,
+            ModelFunction::Guardian,
+        ] {
+            let eps = provider.endpoints_for_function(function);
+            assert_eq!(
+                eps.first(),
+                Some(&ApiEndpoint::OpenAIResponses),
+                "{function:?}: expected OpenAIResponses as first endpoint"
+            );
+            assert_eq!(
+                eps.get(1),
+                Some(&ApiEndpoint::OpenAIChat),
+                "{function:?}: expected OpenAIChat as fallback endpoint"
+            );
+        }
     }
 
     #[test]

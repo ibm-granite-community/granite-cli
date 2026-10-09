@@ -40,6 +40,8 @@ pub enum ApiEndpoint {
     OpenAIEmbeddings,
     /// /v1/audio/transcriptions
     OpenAIAudioTranscription,
+    /// /responses
+    OpenAIResponses,
     /// /api/chat
     OllamaChat,
     /// /api/embeddings
@@ -54,7 +56,8 @@ impl ApiEndpoint {
         match self {
             ApiEndpoint::OpenAIChat
             | ApiEndpoint::OpenAIEmbeddings
-            | ApiEndpoint::OpenAIAudioTranscription => ApiType::OpenAI,
+            | ApiEndpoint::OpenAIAudioTranscription
+            | ApiEndpoint::OpenAIResponses => ApiType::OpenAI,
 
             ApiEndpoint::OllamaChat | ApiEndpoint::OllamaEmbeddings => ApiType::Ollama,
 
@@ -68,6 +71,7 @@ impl ApiEndpoint {
             ApiEndpoint::OpenAIChat => "/v1/chat/completions",
             ApiEndpoint::OpenAIEmbeddings => "/v1/embeddings",
             ApiEndpoint::OpenAIAudioTranscription => "/v1/audio/transcriptions",
+            ApiEndpoint::OpenAIResponses => "/v1/responses",
             ApiEndpoint::OllamaChat => "/api/chat",
             ApiEndpoint::OllamaEmbeddings => "/api/embeddings",
             ApiEndpoint::AnthropicMessages => "/v1/messages",
@@ -77,7 +81,10 @@ impl ApiEndpoint {
     /// Returns the model functions this endpoint provides
     pub fn provides_functions(&self) -> Vec<ModelFunction> {
         match self {
-            ApiEndpoint::OpenAIChat | ApiEndpoint::OllamaChat | ApiEndpoint::AnthropicMessages => {
+            ApiEndpoint::OpenAIChat
+            | ApiEndpoint::OllamaChat
+            | ApiEndpoint::AnthropicMessages
+            | ApiEndpoint::OpenAIResponses => {
                 vec![
                     ModelFunction::Chat,
                     ModelFunction::ToolCalling,
