@@ -780,7 +780,8 @@ mod tests {
                     } => config_key,
                     _ => continue,
                 };
-                let mut settings = crate::capabilities::CAPABILITY_REGISTRY.default_config(type_name);
+                let mut settings =
+                    crate::capabilities::CAPABILITY_REGISTRY.default_config(type_name);
                 settings[config_key.as_str()] = serde_json::json!("");
 
                 let err = crate::capabilities::CAPABILITY_REGISTRY
