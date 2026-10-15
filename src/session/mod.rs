@@ -83,14 +83,20 @@ pub struct SessionMeta {
 /// Generate a unique session ID for this launch.
 ///
 /// Format: `{escaped_cwd}@{YYYYMMDDTHHMMSS}_{hex8}`
-/// where `escaped_cwd` has every `/` replaced with `"---"`, and `hex8` is 8
-/// hex characters derived from the current nanosecond timestamp, process ID,
-/// and a per-process monotonic counter.
+/// where `escaped_cwd` has path separators and drive-letter colons replaced
+/// with `"---"`, and `hex8` is 8 hex characters derived from the current
+/// nanosecond timestamp, process ID, and a per-process monotonic counter.
 pub fn generate_session_id() -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let escaped_cwd = cwd.replace('/', config::PATH_DELIM);
+    let escaped_cwd = escape_working_dir(&cwd);
+    alog_channel!(
+        MessageLevel::Debug2,
+        "Escaped CWD {} -> {}",
+        cwd,
+        escaped_cwd
+    );
 
     let epoch = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -266,6 +272,10 @@ fn update_session_file(session_id: &str, f: impl FnOnce(&mut SessionMeta)) -> an
     Ok(())
 }
 
+fn escape_working_dir(working_dir: &str) -> String {
+    working_dir.replace(['/', '\\', ':'], config::PATH_DELIM)
+}
+
 /// Counter used by [`short_suffix`] to guarantee uniqueness across calls
 /// within the same process.
 static SUFFIX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -317,6 +327,26 @@ mod tests {
         let a = generate_session_id();
         let b = generate_session_id();
         assert_ne!(a, b, "consecutive session IDs must differ");
+    }
+
+    #[test]
+    fn windows_working_dir_produces_a_flat_session_filename() {
+        let _home = TestConfigHome::new();
+        let escaped = escape_working_dir(r"C:\Users\alice\project");
+        assert_eq!(escaped, "C------Users---alice---project");
+
+        let session_id = format!("{escaped}@20250101T120000_deadbeef");
+        write_session_file(&make_meta(&session_id, "claude")).unwrap();
+        assert!(
+            Config::sessions_dir()
+                .unwrap()
+                .join(format!("{session_id}.yaml"))
+                .is_file()
+        );
+        assert_eq!(
+            read_session_file(&session_id).unwrap().session_id,
+            session_id
+        );
     }
 
     #[test]

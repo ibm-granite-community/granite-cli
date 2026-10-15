@@ -108,6 +108,18 @@ fn ollama_model_ref(url: &str) -> Option<String> {
     })
 }
 
+/// The name Ollama stores a variant under after `POST /api/pull`, which is
+/// also the name requests must use to reach it.
+///
+/// - `https://ollama.com/...` URLs resolve through [`ollama_model_ref`].
+/// - Hugging Face URLs resolve to `hf.co/<repo>:<precision>`.
+/// - Any other URL returns `None`.
+fn ollama_pull_name(variant: &ModelVariant) -> Option<String> {
+    ollama_model_ref(&variant.url).or_else(|| {
+        hf_repo_id(&variant.url).map(|repo| format!("hf.co/{}:{}", repo, variant.precision))
+    })
+}
+
 /// A single NDJSON line from Ollama's `POST /api/pull` progress stream.
 #[derive(Debug, Deserialize)]
 struct OllamaPullProgress {
@@ -252,7 +264,7 @@ impl Provider for OllamaProvider {
         _model_id: String,
         variant: Option<&crate::models::ModelVariant>,
     ) -> Option<String> {
-        variant.and_then(|v| ollama_model_ref(&v.url))
+        variant.and_then(ollama_pull_name)
     }
 
     async fn health_check(&self) -> Result<HealthStatus, ProviderError> {
@@ -271,16 +283,12 @@ impl Provider for OllamaProvider {
         variant: &ModelVariant,
         ui: &dyn Ui,
     ) -> Result<crate::providers::PullResult, ProviderError> {
-        let model_ref = if let Some(name) = ollama_model_ref(&variant.url) {
-            name
-        } else if let Some(repo) = hf_repo_id(&variant.url) {
-            format!("hf.co/{}:{}", repo, variant.precision)
-        } else {
-            return Err(ProviderError::Other(format!(
+        let model_ref = ollama_pull_name(variant).ok_or_else(|| {
+            ProviderError::Other(format!(
                 "cannot determine an Ollama model reference for {} variant {}/{}",
                 model.family, variant.format, variant.precision
-            )));
-        };
+            ))
+        })?;
 
         let label = format!(
             "{} ({} {})",
@@ -632,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_alias_returns_none_for_non_ollama_variant() {
+    fn test_model_alias_returns_hf_ref_for_gguf_variant() {
         let provider = OllamaProvider::new("my-ollama", &serde_json::json!({})).unwrap();
         let variant = ModelVariant {
             format: "GGUF".to_string(),
@@ -642,6 +650,45 @@ mod tests {
         };
         assert_eq!(
             provider.model_alias("unused".to_string(), Some(&variant)),
+            Some("hf.co/ibm-granite/granite-4.1-8b-GGUF:Q4_K_M".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_alias_returns_none_for_unknown_url() {
+        let provider = OllamaProvider::new("my-ollama", &serde_json::json!({})).unwrap();
+        let variant = ModelVariant {
+            format: "GGUF".to_string(),
+            precision: "Q4_K_M".to_string(),
+            size_gb: Some(5.3),
+            url: "https://example.com/models/granite-4.1-8b-Q4_K_M.gguf".to_string(),
+        };
+        assert_eq!(
+            provider.model_alias("unused".to_string(), Some(&variant)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_ollama_pull_name_resolves_ollama_and_hf_urls() {
+        let variant = |url: &str| ModelVariant {
+            format: "GGUF".to_string(),
+            precision: "Q4_K_M".to_string(),
+            size_gb: None,
+            url: url.to_string(),
+        };
+        assert_eq!(
+            ollama_pull_name(&variant("https://ollama.com/library/granite4.1:8b")),
+            Some("granite4.1:8b".to_string())
+        );
+        assert_eq!(
+            ollama_pull_name(&variant(
+                "https://huggingface.co/ibm-granite/granite-4.2-30b-GGUF/blob/main/granite-4.2-30b-Q4_K_M.gguf"
+            )),
+            Some("hf.co/ibm-granite/granite-4.2-30b-GGUF:Q4_K_M".to_string())
+        );
+        assert_eq!(
+            ollama_pull_name(&variant("https://example.com/granite.gguf")),
             None
         );
     }

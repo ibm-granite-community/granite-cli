@@ -351,7 +351,15 @@ impl LauncherCommands {
     /// Deletes the launcher's config file and removes it from the in-memory
     /// config. After this call `launcher list` will no longer show the entry
     /// and `granite-cli launch <id>` will return an error.
-    pub fn remove(ctx: &mut crate::AppContext, launcher_id: &str) -> Result<()> {
+    ///
+    /// `policy` controls what happens to dependents: `Cascade` removes them
+    /// too, `Refuse` aborts, `Leave` strands them. `None` asks interactively
+    /// or leaves in non-interactive sessions.
+    pub fn remove(
+        ctx: &mut crate::AppContext,
+        launcher_id: &str,
+        policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
+    ) -> Result<()> {
         if ctx.config().get_launcher(launcher_id).is_none() {
             anyhow::bail!("No launcher configured with id '{launcher_id}'. Nothing to remove.");
         }
@@ -361,13 +369,14 @@ impl LauncherCommands {
             ctx,
             RefKind::Launcher,
             launcher_id,
+            policy,
         )? {
             crate::commands::shared::remediation::Removal::Cancel => {
                 ctx.ui.info(&format!("Keeping launcher '{launcher_id}'."));
                 return Ok(());
             }
             crate::commands::shared::remediation::Removal::Proceed { with } => {
-                crate::commands::shared::remediation::remove_all(ctx, &with)?;
+                crate::commands::shared::remediation::remove_all(ctx, &with, policy)?;
             }
         }
 
@@ -839,7 +848,7 @@ mod tests {
         let mut ctx = ctx_with_launcher("my-claude", "claude");
         assert!(ctx.config().get_launcher("my-claude").is_some());
 
-        LauncherCommands::remove(&mut ctx, "my-claude").unwrap();
+        LauncherCommands::remove(&mut ctx, "my-claude", None).unwrap();
 
         assert!(ctx.config().get_launcher("my-claude").is_none());
         let infos = infos!(ctx);
@@ -853,7 +862,7 @@ mod tests {
     #[test]
     fn remove_nonexistent_launcher_returns_err() {
         let mut ctx = test_ctx();
-        let result = LauncherCommands::remove(&mut ctx, "doesnt-exist");
+        let result = LauncherCommands::remove(&mut ctx, "doesnt-exist", None);
         assert!(result.is_err());
         assert!(
             result
@@ -867,7 +876,7 @@ mod tests {
     fn list_does_not_show_removed_launcher() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_launcher("my-claude", "claude");
-        LauncherCommands::remove(&mut ctx, "my-claude").unwrap();
+        LauncherCommands::remove(&mut ctx, "my-claude", None).unwrap();
         LauncherCommands::list(&ctx).unwrap();
         let tables = tables!(ctx);
         let (_, _, rows) = &tables[0];

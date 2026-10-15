@@ -243,7 +243,7 @@ impl Config {
     /// runtime used by PE binaries doesn't translate `/proc` the same way
     /// Linux processes do). We prefer the `/proc/sys/kernel/osrelease` file
     /// which WSL consistently exposes, then fall back to `/proc/version`.
-    fn is_wsl() -> bool {
+    pub(crate) fn is_wsl() -> bool {
         // Method 1: Check /proc/sys/kernel/osrelease (works for PE binaries under WSL)
         if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
             let lower = s.to_lowercase();

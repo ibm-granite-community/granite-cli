@@ -192,6 +192,8 @@ pub(crate) async fn run_command(
     // in WSL) fail with os error 193 ("%1 is not a valid Win32 application")
     // when spawned directly. In those cases, fall back to invoking through
     // `cmd.exe /C`, which handles PE format compatibility correctly.
+    let working_dir = ctx.working_dir.clone();
+
     #[cfg(windows)]
     let (binary_fallback, args_fallback, overlay_fallback) =
         (binary.clone(), args.to_vec(), translated_overlay);
@@ -199,21 +201,29 @@ pub(crate) async fn run_command(
     tokio::task::spawn_blocking(move || -> anyhow::Result<std::process::ExitStatus> {
         let mut spawn_cmd = cmd;
 
-        // In WSL, the parent's CWD may be a WSL path that gets translated to
-        // a UNC path for Windows processes. If the binary is on a Windows
-        // drive, set the CWD to that drive's root to avoid the UNC issue.
+        // Always set the subprocess CWD to the caller's working directory so
+        // the launched tool starts in the right place regardless of platform.
+        spawn_cmd.current_dir(&working_dir);
+
+        // In WSL, the parent's CWD is a WSL path that Windows child processes
+        // cannot navigate to (it becomes an unusable UNC path). Override with
+        // the drive root so the PE binary at least starts somewhere valid.
+        // This must only fire under WSL -- on native Windows the working_dir
+        // set above is already a proper Windows path and must not be replaced.
         #[cfg(windows)]
-        if let Some(drive) = binary_fallback.parent().and_then(|p| {
-            p.to_str().and_then(|s| {
-                let chars: Vec<char> = s.chars().collect();
-                if chars.len() >= 2 && chars[1] == ':' {
-                    Some(format!("{}\\", &s[..2]))
-                } else {
-                    None
-                }
-            })
-        }) {
-            spawn_cmd.current_dir(drive);
+        if crate::config::Config::is_wsl() {
+            if let Some(drive) = binary_fallback.parent().and_then(|p| {
+                p.to_str().and_then(|s| {
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() >= 2 && chars[1] == ':' {
+                        Some(format!("{}\\", &s[..2]))
+                    } else {
+                        None
+                    }
+                })
+            }) {
+                spawn_cmd.current_dir(drive);
+            }
         }
 
         let mut child = match spawn_cmd.spawn() {
@@ -303,6 +313,8 @@ pub(crate) async fn run_command_captured(
     // in WSL) fail with os error 193 ("%1 is not a valid Win32 application")
     // when spawned directly. In those cases, fall back to invoking through
     // `cmd.exe /C`, which handles PE format compatibility correctly.
+    let working_dir = ctx.working_dir.clone();
+
     #[cfg(windows)]
     let (binary_fallback, args_fallback, overlay_fallback) =
         (binary.clone(), args.to_vec(), translated_overlay);
@@ -311,21 +323,29 @@ pub(crate) async fn run_command_captured(
         move || -> anyhow::Result<(std::process::ExitStatus, String, String)> {
             let mut spawn_cmd = cmd;
 
-            // In WSL, the parent's CWD may be a WSL path that gets translated to
-            // a UNC path for Windows processes. If the binary is on a Windows
-            // drive, set the CWD to that drive's root to avoid the UNC issue.
+            // Always set the subprocess CWD to the caller's working directory so
+            // the launched tool starts in the right place regardless of platform.
+            spawn_cmd.current_dir(&working_dir);
+
+            // In WSL, the parent's CWD is a WSL path that Windows child processes
+            // cannot navigate to (it becomes an unusable UNC path). Override with
+            // the drive root so the PE binary at least starts somewhere valid.
+            // This must only fire under WSL -- on native Windows the working_dir
+            // set above is already a proper Windows path and must not be replaced.
             #[cfg(windows)]
-            if let Some(drive) = binary_fallback.parent().and_then(|p| {
-                p.to_str().and_then(|s| {
-                    let chars: Vec<char> = s.chars().collect();
-                    if chars.len() >= 2 && chars[1] == ':' {
-                        Some(format!("{}\\", &s[..2]))
-                    } else {
-                        None
-                    }
-                })
-            }) {
-                spawn_cmd.current_dir(drive);
+            if crate::config::Config::is_wsl() {
+                if let Some(drive) = binary_fallback.parent().and_then(|p| {
+                    p.to_str().and_then(|s| {
+                        let chars: Vec<char> = s.chars().collect();
+                        if chars.len() >= 2 && chars[1] == ':' {
+                            Some(format!("{}\\", &s[..2]))
+                        } else {
+                            None
+                        }
+                    })
+                }) {
+                    spawn_cmd.current_dir(drive);
+                }
             }
 
             let output = match spawn_cmd.output() {
@@ -698,7 +718,7 @@ pub(crate) mod tests {
         let ui = PlainOutput;
         let ctx = LaunchContext {
             launcher_id: "test".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: std::env::temp_dir(),
             base_env: HashMap::new(),
             dry_run: false,
             usage_tracker: None,
