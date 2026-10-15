@@ -89,7 +89,7 @@ impl Sources {
             providers,
             models,
             capabilities,
-            launchers: Arc::new(LauncherSource::from_config(config)),
+            launchers: Arc::new(LauncherSource::new(config)),
         }
     }
 

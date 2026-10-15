@@ -185,12 +185,10 @@ mod tests {
         }
     }
 
-    impl ProviderSource {
-        /// Providers carrying their real connection details, for a test that
-        /// needs no other kind. Commands ask the application context.
-        pub(crate) fn from_config(config: &crate::config::Config) -> Self {
-            Self::with_proxy(config, None)
-        }
+    /// Providers carrying their real connection details, for a test that
+    /// needs no other kind. Commands ask the application context.
+    fn source(config: &crate::config::Config) -> ProviderSource {
+        ProviderSource::with_proxy(config, None)
     }
 
     fn config_with_two_named_instances() -> Config {
@@ -218,7 +216,7 @@ mod tests {
             },
         );
 
-        let source = ProviderSource::from_config(&config);
+        let source = source(&config);
         let err = source.get("ollama").err().unwrap().to_string();
         assert!(
             err.contains("provider 'ollama'") && err.contains("invalid type"),
@@ -238,7 +236,7 @@ mod tests {
             },
         );
 
-        let source = ProviderSource::from_config(&config);
+        let source = source(&config);
         let err = source.get("mystery").err().unwrap().to_string();
         assert!(
             err.contains("mystery") && err.contains("not-a-provider-type"),
@@ -249,7 +247,7 @@ mod tests {
     #[test]
     fn provider_source_constructs_one_instance_per_named_provider() {
         let config = config_with_two_named_instances();
-        let source = ProviderSource::from_config(&config);
+        let source = source(&config);
 
         let mut ids: Vec<String> = source.instances().into_iter().map(|(id, _)| id).collect();
         ids.sort();
@@ -275,7 +273,7 @@ mod tests {
     #[test]
     fn resolve_surfaces_all_matching_named_instances() {
         let config = config_with_two_named_instances();
-        let source = ProviderSource::from_config(&config);
+        let source = source(&config);
 
         let resolution = resolve(&AnyGguf, &source);
         let mut ids = resolution.existing_instances;

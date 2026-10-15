@@ -780,7 +780,12 @@ pub(crate) mod tests {
                 },
             );
         }
-        crate::capabilities::CapabilitySource::from_config(&config)
+        let providers =
+            std::sync::Arc::new(crate::providers::ProviderSource::with_proxy(&config, None));
+        let models = std::sync::Arc::new(crate::models::ModelSource::with_providers(
+            &config, providers,
+        ));
+        crate::capabilities::CapabilitySource::with_models(&config, models)
     }
 
     #[tokio::test]

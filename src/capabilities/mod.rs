@@ -217,22 +217,21 @@ mod tests {
         config
     }
 
-    impl CapabilitySource {
-        /// Capabilities over a model source of their own, for a test that needs
-        /// no other kind. Commands ask the application context.
-        #[cfg(test)]
-        pub(crate) fn from_config(config: &crate::config::Config) -> Self {
-            Self::with_models(
-                config,
-                std::sync::Arc::new(crate::models::ModelSource::from_config(config)),
-            )
-        }
+    /// Capabilities over model and provider sources built for one test.
+    /// Commands ask the application context for the shared source set.
+    fn source(config: &crate::config::Config) -> CapabilitySource {
+        let providers =
+            std::sync::Arc::new(crate::providers::ProviderSource::with_proxy(config, None));
+        let models = std::sync::Arc::new(crate::models::ModelSource::with_providers(
+            config, providers,
+        ));
+        CapabilitySource::with_models(config, models)
     }
 
     #[test]
     fn capability_source_constructs_one_instance_per_named_capability() {
         let config = one_chat_capability();
-        let source = CapabilitySource::from_config(&config);
+        let source = source(&config);
         let ids: Vec<String> = source.instances().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec!["chat".to_string()]);
     }
@@ -291,7 +290,7 @@ mod tests {
 
                 // A type whose requirement a model with no functions meets
                 // has nothing to report.
-                let Err(error) = CapabilitySource::from_config(&config).build("under-test") else {
+                let Err(error) = source(&config).build("under-test") else {
                     continue;
                 };
                 assert!(
@@ -416,7 +415,7 @@ mod tests {
             .capabilities
             .insert("broken".to_string(), agent_model_config("broken", "gone"));
 
-        let source = CapabilitySource::from_config(&config);
+        let source = source(&config);
 
         let err = source
             .get("broken")
@@ -467,7 +466,7 @@ mod tests {
             },
         );
 
-        let source = CapabilitySource::from_config(&config);
+        let source = source(&config);
         let err = source.get("broken").err().unwrap().to_string();
         assert!(
             err.contains("capability 'broken'") && err.contains("invalid type"),
@@ -490,7 +489,7 @@ mod tests {
             },
         );
 
-        let source = CapabilitySource::from_config(&config);
+        let source = source(&config);
         assert!(source.instances().is_empty());
     }
 
@@ -504,7 +503,7 @@ mod tests {
 
         // No model entry, so constructing `chat` would panic inside
         // ConfiguredModel::resolve. It is skipped before reaching that.
-        let source = CapabilitySource::from_config(&config);
+        let source = source(&config);
         assert!(source.instances().is_empty());
     }
 

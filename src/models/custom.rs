@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn new_populates_fields_from_config() {
+    fn new_populates_all_fields() {
         let cfg = serde_json::json!({
             "family": "My Local Model",
             "version": "1.0",
