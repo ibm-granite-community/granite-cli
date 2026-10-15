@@ -166,7 +166,7 @@ impl HasProviderMetadata for OpenRouterProvider {
             description: "Hosted provider for accessing multiple AI models via the OpenRouter API"
                 .to_string(),
             provider_type: ProviderType::Hosted,
-            default_endpoint: "https://openrouter.ai/api".to_string(),
+            default_base_urls: vec!["https://openrouter.ai/api".to_string()],
             supported_api_types: vec![ApiType::OpenAI],
             default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: vec![ModelFormat::OpenRouter],

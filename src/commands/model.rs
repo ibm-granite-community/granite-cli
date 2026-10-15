@@ -1371,7 +1371,7 @@ mod tests {
             name: "Test Provider".to_string(),
             description: "".to_string(),
             provider_type: ProviderType::Local,
-            default_endpoint: "http://localhost".to_string(),
+            default_base_urls: vec!["http://localhost".to_string()],
             supported_api_types: vec![],
             default_function_endpoints: std::collections::HashMap::new(),
             supported_formats: formats,

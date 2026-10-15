@@ -31,7 +31,7 @@ impl ProviderCommands {
                     id.to_string(),
                     api_types,
                     formats,
-                    p.default_endpoint.clone(),
+                    p.formatted_default_base_urls(),
                 ];
                 if wide {
                     let endpoints = p
@@ -60,12 +60,12 @@ impl ProviderCommands {
                 "ID",
                 "API TYPES",
                 "FORMATS",
-                "DEFAULT URL",
+                "DEFAULT URLS",
                 "DESCRIPTION",
                 "ENDPOINTS",
             ]
         } else {
-            &["ID", "API TYPES", "FORMATS", "DEFAULT URL"]
+            &["ID", "API TYPES", "FORMATS", "DEFAULT URLS"]
         };
 
         ctx.ui.table(
@@ -126,7 +126,7 @@ impl ProviderCommands {
                     ("Name", md.name.clone()),
                     ("Description", md.description.clone()),
                     ("Type", md.provider_type.to_string()),
-                    ("Default URL", md.default_endpoint.clone()),
+                    ("Default URLs", md.formatted_default_base_urls()),
                 ];
 
                 let api_types = md
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(tables.len(), 1);
         let (_, headers, _) = &tables[0];
         assert!(headers.contains(&"ID".to_string()));
-        assert!(headers.contains(&"DEFAULT URL".to_string()));
+        assert!(headers.contains(&"DEFAULT URLS".to_string()));
         assert!(headers.contains(&"API TYPES".to_string()));
         assert!(headers.contains(&"FORMATS".to_string()));
         assert!(!headers.contains(&"DESCRIPTION".to_string()));
@@ -531,6 +531,22 @@ mod tests {
         let tables = tables!(ctx);
         let (_, _, rows) = &tables[0];
         assert!(rows.iter().any(|r| r[0] == "openai-compatible"));
+    }
+
+    #[test]
+    fn catalog_displays_all_default_urls_in_order() {
+        let ctx = test_ctx();
+        ProviderCommands::catalog(&ctx, false).unwrap();
+        let tables = tables!(ctx);
+        let (_, _, rows) = &tables[0];
+        let llama_cpp = rows.iter().find(|row| row[0] == "llama-cpp").unwrap();
+        let openai = rows
+            .iter()
+            .find(|row| row[0] == "openai-compatible")
+            .unwrap();
+
+        assert_eq!(llama_cpp[3], "http://localhost:8080, http://localhost:9931");
+        assert_eq!(openai[3], "-");
     }
 
     // -- list -----------------------------------------------------------------

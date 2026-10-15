@@ -217,7 +217,7 @@ pub struct ProviderMetadata {
     pub name: String,
     pub description: String,
     pub provider_type: ProviderType,
-    pub default_endpoint: String,
+    pub default_base_urls: Vec<String>,
 
     /// API types this provider implementation supports (AND logic)
     pub supported_api_types: Vec<ApiType>,
@@ -228,6 +228,16 @@ pub struct ProviderMetadata {
     pub supported_formats: Vec<ModelFormat>,
     pub authentication: Vec<AuthType>,
     pub tags: Vec<String>,
+}
+
+impl ProviderMetadata {
+    pub(crate) fn formatted_default_base_urls(&self) -> String {
+        if self.default_base_urls.is_empty() {
+            "-".to_string()
+        } else {
+            self.default_base_urls.join(", ")
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderMetadata {
@@ -462,7 +472,7 @@ mod tests {
             name: "Ollama".to_string(),
             description: "Local Ollama server".to_string(),
             provider_type: ProviderType::Local,
-            default_endpoint: "http://localhost:11434".to_string(),
+            default_base_urls: vec!["http://localhost:11434".to_string()],
             supported_api_types: vec![ApiType::Ollama],
             default_function_endpoints: HashMap::new(),
             supported_formats: vec![],

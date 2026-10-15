@@ -329,7 +329,7 @@ mod tests {
             name: "Test Provider".to_string(),
             description: "test".to_string(),
             provider_type: crate::providers::ProviderType::Local,
-            default_endpoint: "http://localhost".to_string(),
+            default_base_urls: vec!["http://localhost".to_string()],
             supported_api_types: api_types,
             default_function_endpoints,
             supported_formats: vec![],

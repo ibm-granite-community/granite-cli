@@ -274,7 +274,7 @@ impl HasProviderMetadata for OpenAIProvider {
             name: "OpenAI Compatible Provider".to_string(),
             description: "Provider for OpenAI-compatible API endpoints supporting chat, embeddings, and audio transcription".to_string(),
             provider_type: ProviderType::Hosted,
-            default_endpoint: "http://localhost:8080".to_string(),
+            default_base_urls: vec![],
             supported_api_types: vec![ApiType::OpenAI],
             default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: vec![
@@ -348,6 +348,7 @@ mod tests {
     fn test_provider_metadata() {
         let meta = OpenAIProvider::metadata();
         assert_eq!(meta.name, "OpenAI Compatible Provider");
+        assert!(meta.default_base_urls.is_empty());
         assert!(meta.supported_api_types.contains(&ApiType::OpenAI));
         assert!(
             meta.default_function_endpoints

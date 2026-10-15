@@ -1,5 +1,6 @@
 // Standard
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -31,6 +32,7 @@ pub enum Recommendation {
         provider_name: String,
         health_healthy: bool,
         health_error: Option<String>,
+        discovered_base_url: Option<String>,
     },
     Model {
         model_id: String,
@@ -124,40 +126,34 @@ impl Discover {
                 continue;
             }
 
-            // Construct a transient instance with default config and run health check
             let default_config = PROVIDER_REGISTRY
                 .default_config(provider_type)
                 .unwrap_or_default();
-            let result = PROVIDER_REGISTRY.construct(provider_type, provider_type, &default_config);
+            let (discovered_base_url, health_error) =
+                first_healthy_base_url(&metadata.default_base_urls, |base_url| {
+                    let mut config = default_config.clone();
+                    async move {
+                        if !config.is_object() {
+                            return Err("Default provider config is not an object".to_string());
+                        }
+                        config["base_url"] = serde_json::Value::String(base_url);
+                        let provider = PROVIDER_REGISTRY
+                            .construct(provider_type, provider_type, &config)
+                            .map_err(|e| format!("Could not construct provider: {e}"))?;
+                        Self::run_health_check(&*provider)
+                            .await
+                            .map_err(|e| format!("Health check failed: {e}"))
+                    }
+                })
+                .await;
 
-            match result {
-                Ok(provider) => match Self::run_health_check(&*provider).await {
-                    Ok(status) => recommendations.push(Recommendation::Provider {
-                        provider_type,
-                        provider_name: metadata.name.clone(),
-                        health_healthy: status.healthy,
-                        health_error: status.error,
-                    }),
-                    Err(e) => recommendations.push(Recommendation::Provider {
-                        provider_type,
-                        provider_name: metadata.name.clone(),
-                        health_healthy: false,
-                        health_error: Some(format!("Health check failed: {e}")),
-                    }),
-                },
-                Err(_) => {
-                    // Provider could not be constructed (e.g., missing schema).
-                    // Still recommend it — user may need to configure it manually.
-                    recommendations.push(Recommendation::Provider {
-                        provider_type,
-                        provider_name: metadata.name.clone(),
-                        health_healthy: false,
-                        health_error: Some(
-                            "Could not construct provider with default config".to_string(),
-                        ),
-                    });
-                }
-            }
+            recommendations.push(Recommendation::Provider {
+                provider_type,
+                provider_name: metadata.name.clone(),
+                health_healthy: discovered_base_url.is_some(),
+                health_error,
+                discovered_base_url,
+            });
         }
 
         configured.sort();
@@ -872,6 +868,38 @@ struct AutoSelection {
     /// launcher type -> the capability types its recommended config lists,
     /// whether or not they resolved
     recommended_capability_types_by_launcher: HashMap<String, HashSet<String>>,
+}
+
+async fn first_healthy_base_url<F, Fut>(
+    base_urls: &[String],
+    mut probe: F,
+) -> (Option<String>, Option<String>)
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = std::result::Result<HealthStatus, String>>,
+{
+    if base_urls.is_empty() {
+        return (
+            None,
+            Some("No default base URLs are available for discovery".to_string()),
+        );
+    }
+
+    let mut failures = Vec::new();
+    for base_url in base_urls {
+        match probe(base_url.clone()).await {
+            Ok(status) if status.healthy => {
+                return (Some(base_url.clone()), status.error);
+            }
+            Ok(status) => failures.push(format!(
+                "{base_url}: {}",
+                status.error.unwrap_or_else(|| "unhealthy".to_string())
+            )),
+            Err(error) => failures.push(format!("{base_url}: {error}")),
+        }
+    }
+
+    (None, Some(failures.join("; ")))
 }
 
 /// Healthy provider types found among a discovery pass's recommendations.
@@ -1779,6 +1807,7 @@ impl SetupCommands {
                     provider_name,
                     health_healthy,
                     health_error,
+                    ..
                 } if *health_healthy => Some((
                     provider_type.to_string(),
                     provider_name,
@@ -2207,9 +2236,19 @@ impl SetupCommands {
                 continue;
             }
             ui.info(&format!("\nConfiguring provider: {provider_id}..."));
-            let default_config = PROVIDER_REGISTRY
+            let mut default_config = PROVIDER_REGISTRY
                 .default_config(provider_id)
                 .unwrap_or_default();
+            if let Some(base_url) = discovery.recommendations.iter().find_map(|rec| match rec {
+                Recommendation::Provider {
+                    provider_type,
+                    discovered_base_url: Some(base_url),
+                    ..
+                } if *provider_type == provider_id => Some(base_url),
+                _ => None,
+            }) {
+                default_config["base_url"] = base_url.clone().into();
+            }
 
             let provider_config = crate::config::ProviderConfig {
                 provider_id: provider_id.clone(),
@@ -2717,7 +2756,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, ModelConfig, ProviderConfig};
     use crate::utils::ui::base::tests::CaptureUi;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn test_ctx() -> crate::AppContext {
         crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()))
@@ -2783,6 +2822,37 @@ mod tests {
     }
 
     // -- discover_providers ----------------------------------------------------
+
+    #[tokio::test]
+    async fn provider_discovery_uses_the_first_healthy_base_url() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&attempts);
+        let base_urls = vec![
+            "http://localhost:8080".to_string(),
+            "http://localhost:9931".to_string(),
+            "http://localhost:10000".to_string(),
+        ];
+
+        let (base_url, error) = first_healthy_base_url(&base_urls, move |base_url| {
+            let observed = Arc::clone(&observed);
+            async move {
+                observed.lock().unwrap().push(base_url.clone());
+                Ok(HealthStatus {
+                    healthy: base_url.ends_with(":9931"),
+                    latency: std::time::Duration::ZERO,
+                    error: (!base_url.ends_with(":9931")).then(|| "not running".to_string()),
+                })
+            }
+        })
+        .await;
+
+        assert_eq!(base_url.as_deref(), Some("http://localhost:9931"));
+        assert_eq!(error, None);
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["http://localhost:8080", "http://localhost:9931"]
+        );
+    }
 
     #[tokio::test]
     async fn discover_providers_skips_configured() {
@@ -4279,6 +4349,7 @@ mod tests {
                     provider_name: "Ollama".to_string(),
                     health_healthy: true,
                     health_error: None,
+                    discovered_base_url: Some("http://localhost:11434".to_string()),
                 },
                 Recommendation::Capability {
                     capability_type: "sub-agent-explore".to_string(),
@@ -4475,6 +4546,7 @@ mod tests {
                     provider_name: "Ollama".to_string(),
                     health_healthy: false,
                     health_error: Some("not running".to_string()),
+                    discovered_base_url: None,
                 },
             ],
             all_model_candidates: vec![],
@@ -4511,6 +4583,46 @@ mod tests {
     }
 
     // -- configure_all guards --------------------------------------------------
+
+    #[tokio::test]
+    async fn configure_all_persists_the_discovered_provider_base_url() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = test_ctx();
+        let discovered_base_url = "http://localhost:9931";
+        let discovery = DiscoveryResult {
+            recommendations: vec![Recommendation::Provider {
+                provider_type: "llama-cpp",
+                provider_name: "llama.cpp".to_string(),
+                health_healthy: true,
+                health_error: None,
+                discovered_base_url: Some(discovered_base_url.to_string()),
+            }],
+            all_model_candidates: vec![],
+            configured_provider_ids: vec![],
+            configured_model_ids: vec![],
+            configured_launcher_ids: vec![],
+            configured_capability_ids: vec![],
+        };
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::from(["llama-cpp".to_string()]),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ctx.config().get_provider("llama-cpp").unwrap().config["base_url"],
+            discovered_base_url
+        );
+    }
 
     #[tokio::test]
     async fn configure_all_does_not_clobber_manually_configured_provider() {
