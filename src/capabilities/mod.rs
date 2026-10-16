@@ -264,9 +264,7 @@ mod tests {
                         variant: None,
                     },
                 );
-                let mut settings = CAPABILITY_REGISTRY
-                    .default_config(type_name)
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let mut settings = CAPABILITY_REGISTRY.default_config(type_name);
                 // Defaults can leave required text empty, such as a generic
                 // sub-agent's description and prompt, which would fail
                 // construction before the model is reached.

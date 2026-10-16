@@ -262,8 +262,7 @@ impl LauncherCommands {
             .config()
             .get_launcher(&instance_id)
             .map(|lc| lc.config.clone())
-            .or_else(|| LAUNCHER_REGISTRY.default_config(launcher_type))
-            .unwrap_or_else(|| serde_json::json!({}));
+            .unwrap_or_else(|| LAUNCHER_REGISTRY.default_config(launcher_type));
         alog_channel!(MessageLevel::Debug3, "Defaults: {:#?}", defaults);
 
         let config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;

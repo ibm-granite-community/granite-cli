@@ -206,8 +206,7 @@ impl CapabilityCommands {
             })?;
         let defaults = existing_config
             .map(|c| c.config.clone())
-            .or_else(|| CAPABILITY_REGISTRY.default_config(capability_type))
-            .unwrap_or_else(|| serde_json::json!({}));
+            .unwrap_or_else(|| CAPABILITY_REGISTRY.default_config(capability_type));
 
         // Phase A: prompt for everything except dependency-resolved fields --
         // those are picked from configured instances below, never free-typed.

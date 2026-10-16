@@ -48,7 +48,7 @@ struct LMStudioJobStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LMStudioProviderConfig {
     /// Base URL for the LM Studio server
-    #[serde(default = "default_lmstudio_url")]
+    #[serde(default = "default_base_url")]
     pub base_url: String,
 
     /// API key for authentication (optional)
@@ -67,7 +67,7 @@ pub struct LMStudioProviderConfig {
     pub health_check_endpoint: String,
 }
 
-fn default_lmstudio_url() -> String {
+fn default_base_url() -> String {
     "http://localhost:1234".to_string()
 }
 
@@ -86,7 +86,7 @@ fn default_lmstudio_health_endpoint() -> String {
 impl Default for LMStudioProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: default_lmstudio_url(),
+            base_url: default_base_url(),
             api_key: None,
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),

@@ -737,8 +737,7 @@ impl ModelCommands {
         let defaults = existing_config
             .as_ref()
             .map(|c| c.config.clone())
-            .or_else(|| MODEL_REGISTRY.default_config(model_type))
-            .unwrap_or_else(|| serde_json::json!({}));
+            .unwrap_or_else(|| MODEL_REGISTRY.default_config(model_type));
         let model_specific_cfg = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
 
         // Construct a live, provider-less instance now -- this replaces the
