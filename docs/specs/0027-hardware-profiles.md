@@ -1030,7 +1030,7 @@ one to `local`.
 - `src/commands/provider.rs`
 - `src/providers/base.rs` (`ProviderType::Hosted`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 

@@ -119,6 +119,20 @@ pub(crate) struct ProviderConfig {
     #[serde(rename = "type")]
     pub(crate) provider_type: String,
     pub(crate) config: serde_json::Value,
+    /// The hardware profile this provider runs on, which fit is estimated
+    /// against. `None` for a file saved before this field existed: fit is
+    /// estimated against `local`, and the file is saved without the field
+    /// until the user chooses a link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hardware: Option<hardware::HardwareLink>,
+}
+
+impl ProviderConfig {
+    /// The hardware profile fit is estimated against: the saved link, or
+    /// `local` when none is saved.
+    pub(crate) fn hardware_link(&self) -> hardware::HardwareLink {
+        self.hardware.clone().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -940,6 +954,7 @@ impl Default for ProviderConfig {
             provider_id: String::new(),
             provider_type: String::new(),
             config: serde_json::Value::Object(serde_json::Map::new()),
+            hardware: Some(hardware::HardwareLink::Local),
         }
     }
 }
@@ -1123,6 +1138,7 @@ mod tests {
         let result = config.insert_provider(
             "p1",
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "p1".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
@@ -1340,5 +1356,29 @@ mod tests {
 
         assert!(config.get_hardware("spark").is_none());
         assert!(!hardware_dir().join("spark.yaml").exists());
+    }
+
+    #[test]
+    fn not_specified_survives_a_save_and_load() {
+        let _home = TestConfigHome::new();
+        let mut config = Config::new().unwrap();
+        config
+            .insert_provider(
+                "vllm-lab",
+                ProviderConfig {
+                    provider_id: "vllm-lab".to_string(),
+                    provider_type: "openai-compatible".to_string(),
+                    config: serde_json::json!({}),
+                    hardware: Some(hardware::HardwareLink::Unspecified),
+                },
+            )
+            .unwrap();
+
+        let reloaded = Config::new().unwrap();
+
+        assert_eq!(
+            reloaded.get_provider("vllm-lab").unwrap().hardware,
+            Some(hardware::HardwareLink::Unspecified)
+        );
     }
 }
