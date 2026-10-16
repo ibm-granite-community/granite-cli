@@ -103,6 +103,18 @@ fn search_match_reason(id: &str, m: &ModelMetadata, q: &str) -> Option<String> {
 
 pub(crate) struct ModelCommands;
 
+/// For a hardware profile other than `local` with no provider linked to
+/// it, the PROVIDERS column reads "none linked". For `local`, it keeps
+/// reading "none" when no provider can run the variant, as it did before
+/// providers were linked.
+fn mark_none_linked(rows: &mut [Vec<String>], hardware_id: &str, on_hardware: &[String]) {
+    if hardware_id != crate::config::hardware::LOCAL_HARDWARE_ID && on_hardware.is_empty() {
+        for row in rows {
+            *row.last_mut().unwrap() = "none linked".to_string();
+        }
+    }
+}
+
 /// Whether every provider type that runs variants of `format` is hosted.
 /// Such a variant states no size because the hosted provider does not
 /// publish one.
@@ -398,6 +410,46 @@ impl ModelCommands {
         rows
     }
 
+    /// The rows `model recommend --hardware <hardware_id>` shows without
+    /// `--providers`: the recommended models, and those whose fit is not
+    /// available. `model recommend` and the TUI Recommend section both build
+    /// their rows here, so they show the same rows for a hardware profile.
+    pub(crate) fn recommend_rows_for_hardware(
+        ctx: &crate::AppContext,
+        filter_type: Option<&ModelType>,
+        wide: bool,
+        hardware_id: &str,
+        hardware: &HardwareProfile,
+    ) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+        let source = ctx.sources().providers();
+        let instances = source.instances();
+        let on_hardware = crate::commands::HardwareCommands::providers_on(ctx, hardware_id);
+        let display: Vec<(String, std::sync::Arc<dyn Provider>)> = instances
+            .iter()
+            .filter(|(id, _)| on_hardware.contains(id))
+            .cloned()
+            .collect();
+        // The providers on this hardware choose the variant. A profile no
+        // provider is linked to yet is judged by every provider, so it
+        // still answers "would this machine do?".
+        let candidates: Vec<&dyn Provider> = if display.is_empty() {
+            instances.iter().map(|(_, p)| &**p).collect()
+        } else {
+            display.iter().map(|(_, p)| &**p).collect()
+        };
+        let mut rows = Self::recommend_rows(
+            filter_type,
+            Some(&candidates),
+            &display,
+            wide,
+            ctx.ui.as_ref(),
+            hardware,
+        );
+        mark_none_linked(&mut rows, hardware_id, &on_hardware);
+        let unavailable = Self::fit_unavailable_rows(filter_type, Some(&candidates), &rows);
+        (rows, unavailable)
+    }
+
     /// Resolves the `--providers` flag against configured providers.
     ///
     /// - `providers_arg` empty: use all configured+enabled providers.
@@ -431,15 +483,9 @@ impl ModelCommands {
         let providers: Option<Vec<&dyn Provider>> = if skip_all {
             None
         } else if providers_arg.is_empty() {
-            // Variants are chosen from what the providers on this hardware
-            // can run. A profile no provider is linked to yet is judged by
-            // every provider, so it still answers "would this machine do?".
-            let candidates: Vec<&dyn Provider> = if display.is_empty() {
-                instances.iter().map(|(_, p)| &**p).collect()
-            } else {
-                display.iter().map(|(_, p)| &**p).collect()
-            };
-            Some(candidates)
+            // Chosen by `recommend_rows_for_hardware` below; the list only
+            // tells whether any provider is configured.
+            Some(instances.iter().map(|(_, p)| &**p).collect())
         } else {
             let unknown: Vec<&str> = providers_arg
                 .iter()
@@ -471,24 +517,28 @@ impl ModelCommands {
             )
         };
 
-        let table_rows = Self::recommend_rows(
-            filter_type.as_ref(),
-            providers.as_deref(),
-            &display,
-            wide,
-            ctx.ui.as_ref(),
-            hardware,
-        );
-        // For `local`, the column keeps reading "none" when no provider can
-        // run the variant, as it did before providers were linked.
-        let mut table_rows = table_rows;
-        if hardware_id != crate::config::hardware::LOCAL_HARDWARE_ID && on_hardware.is_empty() {
-            for row in &mut table_rows {
-                *row.last_mut().unwrap() = "none linked".to_string();
-            }
-        }
-        let unavailable =
-            Self::fit_unavailable_rows(filter_type.as_ref(), providers.as_deref(), &table_rows);
+        let (table_rows, unavailable) = if providers_arg.is_empty() {
+            Self::recommend_rows_for_hardware(
+                ctx,
+                filter_type.as_ref(),
+                wide,
+                hardware_id,
+                hardware,
+            )
+        } else {
+            let mut rows = Self::recommend_rows(
+                filter_type.as_ref(),
+                providers.as_deref(),
+                &display,
+                wide,
+                ctx.ui.as_ref(),
+                hardware,
+            );
+            mark_none_linked(&mut rows, hardware_id, &on_hardware);
+            let unavailable =
+                Self::fit_unavailable_rows(filter_type.as_ref(), providers.as_deref(), &rows);
+            (rows, unavailable)
+        };
         let show_unavailable = || {
             if !unavailable.is_empty() {
                 ctx.ui.table(

@@ -25,6 +25,8 @@ pub(crate) enum Hint {
     ToggleCatalog { hidden: bool },
     /// `[i] Show inactive` / `[i] Hide inactive` — toggle inactive sessions.
     ToggleInactive { hidden: bool },
+    /// `[h] Next profile` — show Recommend for the next hardware profile.
+    NextHardware,
     /// `[Space] Toggle` — toggle a multi-select item.
     Toggle,
     /// `[typing] <label>` — free-text input; label is e.g. `"Filter"` or `"Edit"`.
@@ -62,6 +64,7 @@ impl std::fmt::Display for Hint {
             Hint::ToggleCatalog { hidden: false } => write!(f, "[c] Hide catalog"),
             Hint::ToggleInactive { hidden: true } => write!(f, "[i] Show inactive"),
             Hint::ToggleInactive { hidden: false } => write!(f, "[i] Hide inactive"),
+            Hint::NextHardware => write!(f, "[h] Next profile"),
             Hint::Toggle => write!(f, "[Space] Toggle"),
             Hint::Typing(label) => write!(f, "[typing] {label}"),
             Hint::ConfirmYN => write!(f, "[y/n/←→/hl] Select"),
@@ -185,6 +188,11 @@ mod tests {
             Hint::ToggleCatalog { hidden: false }.to_string(),
             "[c] Hide catalog"
         );
+    }
+
+    #[test]
+    fn next_hardware() {
+        assert_eq!(Hint::NextHardware.to_string(), "[h] Next profile");
     }
 
     #[test]
