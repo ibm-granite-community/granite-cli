@@ -39,37 +39,6 @@ pub(crate) struct HardwareSetupArgs {
 }
 
 impl HardwareCommands {
-    /// Key-value fields for the hardware detail panel, from detection.
-    /// Shared by the CLI command and the TUI.
-    pub(crate) fn hardware_fields() -> Vec<(&'static str, String)> {
-        let profile = detect_hardware();
-        let gb = |figure: Option<f64>| {
-            figure
-                .map(|v| format!("{v:.2} GB"))
-                .unwrap_or_else(|| "None".to_string())
-        };
-        vec![
-            (
-                "CPU Cores",
-                profile
-                    .machine
-                    .cpu_cores
-                    .map(|cores| cores.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-            ),
-            ("CPU Architecture", profile.machine.cpu_arch.clone()),
-            ("RAM", gb(profile.memory.ram_gb())),
-            (
-                "GPU Vendor",
-                profile
-                    .gpu_vendor
-                    .clone()
-                    .unwrap_or_else(|| "None".to_string()),
-            ),
-            ("VRAM", gb(profile.memory.vram_gb())),
-        ]
-    }
-
     /// `granite-cli hardware` with no subcommand: the local hardware profile
     /// and its mode.
     pub(crate) fn show(ctx: &mut AppContext) -> Result<()> {
@@ -80,19 +49,7 @@ impl HardwareCommands {
     /// `hardware catalog`: the built-in devices and their sizes, grouped by
     /// family in catalog order, or one family with `--family`.
     pub(crate) fn catalog(ctx: &AppContext, family: Option<&str>) -> Result<()> {
-        let family = family.map(find_family).transpose()?;
-        let rows: Vec<Vec<String>> = HARDWARE_CATALOG
-            .iter()
-            .filter(|e| family.is_none_or(|f| e.family == f))
-            .map(|e| {
-                vec![
-                    e.family.clone(),
-                    e.id.clone(),
-                    e.name.clone(),
-                    catalog_memory(e),
-                ]
-            })
-            .collect();
+        let rows = Self::catalog_rows(family)?;
         ctx.ui.table(
             &format!(
                 "Hardware Catalog ({})",
@@ -117,6 +74,140 @@ impl HardwareCommands {
         Self::info_detail(ctx, id, unused.as_ref())
     }
 
+    /// The detail fields of configured hardware profile `id`, for `hardware
+    /// info` and the TUI's detail pane. `unused` is a detection of this
+    /// machine that differs from `local`'s figures and that this run did not
+    /// take; see [`Self::compare_local`].
+    pub(crate) fn info_fields(
+        ctx: &AppContext,
+        id: &str,
+        unused: Option<&HardwareProfile>,
+    ) -> Result<Vec<(&'static str, String)>> {
+        let hardware = ctx
+            .config()
+            .get_hardware(id)
+            .ok_or_else(|| not_configured(ctx, id))?;
+        let mut fields: Vec<(&'static str, String)> =
+            vec![("Type", hardware.hardware_type.clone())];
+        if let Some(entry) = hardware_catalog::find(&hardware.hardware_type) {
+            fields.push(("Device", entry.name.clone()));
+        }
+        if let Some(local) = hardware.local_settings() {
+            fields.push(("Mode", mode_label(local.mode).to_string()));
+            if let Some(detected) = unused.or(local.detected.as_ref()) {
+                fields.push((
+                    "Detected",
+                    format!("{} (not used)", detected.memory_summary()),
+                ));
+            }
+        }
+        match ctx.hardware_profile(id) {
+            Ok(p) => {
+                let gb = |v: Option<f64>| v.map(|v| format!("{v:.2} GB"));
+                fields.push(("Memory", p.memory_summary()));
+                if let Some(vram) = gb(p.memory.vram_gb()) {
+                    fields.push(("Accelerator memory", vram));
+                }
+                if let Some(ram) = gb(p.memory.ram_gb()) {
+                    fields.push(("System memory", ram));
+                }
+                fields.push(("Headroom", headroom_label(&p)));
+                fields.push((
+                    "Usable for models",
+                    format!("{:.2} GB", p.usable_memory_gb()),
+                ));
+                let MachineInfo {
+                    os,
+                    cpu_cores,
+                    cpu_arch,
+                } = p.machine;
+                let text = |s: String| (!s.is_empty()).then_some(s);
+                let descriptive = [
+                    ("GPU Vendor", p.gpu_vendor),
+                    ("OS", text(os)),
+                    ("CPU Architecture", text(cpu_arch)),
+                    ("CPU Cores", cpu_cores.map(|c| c.to_string())),
+                ];
+                fields.extend(
+                    descriptive
+                        .into_iter()
+                        .filter_map(|(k, v)| v.map(|v| (k, v))),
+                );
+            }
+            Err(e) => fields.push(("Problem", ctx.ui.warn_mark(&format!("⚠ {e}")))),
+        }
+        fields.push(("Providers", providers_on(ctx, id).join(", ")));
+        Ok(fields)
+    }
+
+    /// Rows for the configured hardware profiles, `local` first:
+    /// [id, type, memory, providers, notes]. Shared by `hardware list` and
+    /// the TUI. `unused` is as for [`Self::info_fields`].
+    pub(crate) fn configured_rows(
+        ctx: &AppContext,
+        unused: Option<&HardwareProfile>,
+    ) -> Vec<Vec<String>> {
+        let config = ctx.config();
+        let mut ids: Vec<&String> = config.hardware.keys().collect();
+        ids.sort_by_key(|id| (id.as_str() != LOCAL_HARDWARE_ID, id.as_str()));
+        ids.into_iter()
+            .map(|id| {
+                let hardware = &config.hardware[id];
+                let (memory, problem) = match ctx.hardware_profile(id) {
+                    Ok(p) => (p.memory_summary(), None),
+                    Err(e) => ("-".to_string(), Some(ctx.ui.warn_mark(&format!("⚠ {e}")))),
+                };
+                vec![
+                    id.clone(),
+                    hardware.hardware_type.clone(),
+                    memory,
+                    providers_on(ctx, id).join(", "),
+                    problem.unwrap_or_else(|| notes(hardware, unused)),
+                ]
+            })
+            .collect()
+    }
+
+    /// Rows for the built-in catalog, or one family of it: [family, id,
+    /// name, memory], in catalog order. Shared by `hardware catalog` and the
+    /// TUI, which puts the id first.
+    pub(crate) fn catalog_rows(family: Option<&str>) -> Result<Vec<Vec<String>>> {
+        let family = family.map(find_family).transpose()?;
+        Ok(HARDWARE_CATALOG
+            .iter()
+            .filter(|e| family.is_none_or(|f| e.family == f))
+            .map(|e| {
+                vec![
+                    e.family.clone(),
+                    e.id.clone(),
+                    e.name.clone(),
+                    catalog_memory(e),
+                ]
+            })
+            .collect())
+    }
+
+    /// The detail fields of catalog entry `id`, for the TUI's detail pane.
+    pub(crate) fn catalog_fields(id: &str) -> Option<Vec<(&'static str, String)>> {
+        let entry = hardware_catalog::find(id)?;
+        let mut fields = vec![
+            ("Name", entry.name.clone()),
+            ("Memory", catalog_memory(entry)),
+            ("Family", entry.family.clone()),
+        ];
+        if let Some(vendor) = &entry.vendor {
+            fields.push(("Vendor", vendor.clone()));
+        }
+        for size in &entry.sizes {
+            let usable = entry.profile(size).usable_memory_gb();
+            fields.push((
+                "Usable for models",
+                format!("{:.2} GB at {} GB", usable, format_gb(size.memory_gb)),
+            ));
+        }
+        Some(fields)
+    }
+
     /// `hardware setup`: create or change a hardware profile from a catalog
     /// entry, from typed figures (`custom`), or set up `local`. Returns the id
     /// of the profile saved. `model recommend` and `provider setup` reuse
@@ -124,6 +215,12 @@ impl HardwareCommands {
     pub(crate) fn setup(ctx: &mut AppContext, args: HardwareSetupArgs) -> Result<String> {
         let interactive = can_prompt(ctx);
         Self::setup_with(ctx, args, interactive, detect_hardware)
+    }
+
+    /// The `hardware setup` steps for a caller that can always ask, such as
+    /// the TUI setup pane, whatever stdin is.
+    pub(crate) fn setup_asking(ctx: &mut AppContext, args: HardwareSetupArgs) -> Result<String> {
+        Self::setup_with(ctx, args, true, detect_hardware)
     }
 
     /// `hardware remove <id>`. `local` cannot be removed. When providers are
@@ -225,15 +322,11 @@ impl HardwareCommands {
             ctx.ui.warn_stderr(&e.to_string());
         }
     }
-}
 
-/*-- private --*/
-
-impl HardwareCommands {
     /// [`Self::check_local`], returning the detection that differs from the
     /// figures in use when this run keeps the stored figures without
-    /// recording it, so `hardware list` and `info` can show it.
-    fn compare_local(
+    /// recording it, so `hardware list`, `info` and the TUI can show it.
+    pub(crate) fn compare_local(
         ctx: &mut AppContext,
         detect: impl FnOnce() -> HardwareProfile,
         can_prompt: bool,
@@ -443,7 +536,11 @@ impl HardwareCommands {
             .map_err(|e| anyhow!("hardware profile '{id}': {e}"))?;
         Ok((id, profile))
     }
+}
 
+/*-- private --*/
+
+impl HardwareCommands {
     fn show_with(
         ctx: &mut AppContext,
         detect: impl FnOnce() -> HardwareProfile,
@@ -453,88 +550,16 @@ impl HardwareCommands {
         Self::info_detail(ctx, LOCAL_HARDWARE_ID, unused.as_ref())
     }
 
-    /// `unused` is a detection of this machine that differs from `local`'s
-    /// figures and that this run did not take; see [`Self::compare_local`].
+    /// `unused` is as for [`Self::info_fields`].
     fn info_detail(ctx: &AppContext, id: &str, unused: Option<&HardwareProfile>) -> Result<()> {
-        let hardware = ctx
-            .config()
-            .get_hardware(id)
-            .ok_or_else(|| not_configured(ctx, id))?;
-        let mut fields: Vec<(&str, String)> = vec![("Type", hardware.hardware_type.clone())];
-        if let Some(entry) = hardware_catalog::find(&hardware.hardware_type) {
-            fields.push(("Device", entry.name.clone()));
-        }
-        if let Some(local) = hardware.local_settings() {
-            fields.push(("Mode", mode_label(local.mode).to_string()));
-            if let Some(detected) = unused.or(local.detected.as_ref()) {
-                fields.push((
-                    "Detected",
-                    format!("{} (not used)", detected.memory_summary()),
-                ));
-            }
-        }
-        match ctx.hardware_profile(id) {
-            Ok(p) => {
-                let gb = |v: Option<f64>| v.map(|v| format!("{v:.2} GB"));
-                fields.push(("Memory", p.memory_summary()));
-                if let Some(vram) = gb(p.memory.vram_gb()) {
-                    fields.push(("Accelerator memory", vram));
-                }
-                if let Some(ram) = gb(p.memory.ram_gb()) {
-                    fields.push(("System memory", ram));
-                }
-                fields.push(("Headroom", headroom_label(&p)));
-                fields.push((
-                    "Usable for models",
-                    format!("{:.2} GB", p.usable_memory_gb()),
-                ));
-                let MachineInfo {
-                    os,
-                    cpu_cores,
-                    cpu_arch,
-                } = p.machine;
-                let text = |s: String| (!s.is_empty()).then_some(s);
-                let descriptive = [
-                    ("GPU Vendor", p.gpu_vendor),
-                    ("OS", text(os)),
-                    ("CPU Architecture", text(cpu_arch)),
-                    ("CPU Cores", cpu_cores.map(|c| c.to_string())),
-                ];
-                fields.extend(
-                    descriptive
-                        .into_iter()
-                        .filter_map(|(k, v)| v.map(|v| (k, v))),
-                );
-            }
-            Err(e) => fields.push(("Problem", ctx.ui.warn_mark(&format!("⚠ {e}")))),
-        }
-        fields.push(("Providers", providers_on(ctx, id).join(", ")));
+        let fields = Self::info_fields(ctx, id, unused)?;
         ctx.ui.detail(&format!("Hardware Profile '{id}'"), &fields);
         Ok(())
     }
 
-    /// `unused` is as for [`Self::info_detail`].
+    /// `unused` is as for [`Self::info_fields`].
     fn list_table(ctx: &AppContext, unused: Option<&HardwareProfile>) {
-        let config = ctx.config();
-        let mut ids: Vec<&String> = config.hardware.keys().collect();
-        ids.sort_by_key(|id| (id.as_str() != LOCAL_HARDWARE_ID, id.as_str()));
-        let rows: Vec<Vec<String>> = ids
-            .into_iter()
-            .map(|id| {
-                let hardware = &config.hardware[id];
-                let (memory, problem) = match ctx.hardware_profile(id) {
-                    Ok(p) => (p.memory_summary(), None),
-                    Err(e) => ("-".to_string(), Some(ctx.ui.warn_mark(&format!("⚠ {e}")))),
-                };
-                vec![
-                    id.clone(),
-                    hardware.hardware_type.clone(),
-                    memory,
-                    providers_on(ctx, id).join(", "),
-                    problem.unwrap_or_else(|| notes(hardware, unused)),
-                ]
-            })
-            .collect();
+        let rows = Self::configured_rows(ctx, unused);
         ctx.ui.table(
             &format!(
                 "Configured Hardware ({})",

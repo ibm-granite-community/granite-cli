@@ -16,6 +16,7 @@ use ratatui::{
 use crate::commands::{
     CapabilityCommands, HardwareCommands, LauncherCommands, ModelCommands, ProviderCommands,
 };
+use crate::config::hardware::LOCAL_HARDWARE_ID;
 use crate::dependency::Configured;
 use crate::models::{MODEL_REGISTRY, ModelMetadata};
 use crate::providers::PROVIDER_REGISTRY;
@@ -221,17 +222,29 @@ struct App {
     pub(crate) mode: AppMode,
     table_state: TableState,
     detail_scroll: usize,
-    /// Cached once at startup — recomputing this requires `detect_hardware()`
-    /// (DXGI/NVML/Metal calls) on every render, which is the main cause of
-    /// sluggish arrow-key navigation on Windows.
-    recommend_rows_cache: Vec<Vec<String>>,
+    /// Recommend rows per hardware profile id, computed the first time that
+    /// profile is shown and kept until configuration changes, so moving
+    /// between profiles with `h` does not estimate fit again.
+    recommend_rows_cache: std::collections::HashMap<String, Vec<Vec<String>>>,
+    /// The hardware profiles Recommend can show, `local` first.
+    recommend_hardware: Vec<String>,
+    /// Index into `recommend_hardware` of the profile Recommend shows.
+    recommend_hw: usize,
+    /// Why a profile's Recommend rows are empty when its figures cannot be
+    /// looked up, by profile id, so the title can say so.
+    recommend_problems: std::collections::HashMap<String, String>,
+    /// A detection of this machine that differs from `local`'s figures and
+    /// that the start-up check did not take, shown in the Hardware section
+    /// as `hardware list` shows it.
+    unused_local_detection: Option<crate::utils::hardware::HardwareProfile>,
     /// Active in-pane setup wizard, if one is running.
     setup_pane: Option<SetupPane>,
     /// Per-section toggle: when true, only rows whose catalog type has at least
     /// one configured instance are shown.  Defaults to true for a section when
     /// it has any configured instances at startup, false otherwise.
-    /// Indices: 0=Models, 1=Providers, 2=Launchers, 3=Capabilities.
-    configured_only: [bool; 4],
+    /// Indices: 0=Models, 1=Providers, 2=Launchers, 3=Capabilities,
+    /// 4=Hardware (configured profiles when true, the catalog when false).
+    configured_only: [bool; 5],
     /// Cached list of session metadata loaded from disk, newest-first.
     /// Reloaded on each idle tick when the Sessions section is active.
     pub(crate) sessions: Vec<crate::session::SessionMeta>,
@@ -240,51 +253,45 @@ struct App {
     /// Per-section committed search query (set when Enter is pressed in Search
     /// mode). Kept so Browse mode continues to show filtered results after
     /// the user commits a search — Esc clears the current section's slot.
-    /// Indices: 0=Models, 1=Providers, 2=Launchers, 3=Capabilities, 4=Recommend.
-    /// Sessions and Hardware are not searchable and have no slot.
-    active_search: [String; 5],
+    /// Indices: 0=Models, 1=Providers, 2=Launchers, 3=Capabilities, 4=Recommend,
+    /// 5=Hardware. Sessions is not searchable and has no slot.
+    active_search: [String; 6],
 }
 
 impl App {
     pub(crate) fn new(ctx: crate::AppContext) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
-        let recommend_rows_cache = {
-            let source = ctx.sources().providers();
-            let instances = source.instances();
-            let providers: Vec<&dyn crate::providers::Provider> =
-                instances.iter().map(|(_, p)| &**p).collect();
-            ModelCommands::recommend_rows(
-                None,
-                Some(&providers),
-                &instances,
-                false,
-                ctx.ui.as_ref(),
-                &crate::utils::hardware::detect_hardware(),
-            )
-        };
+        let recommend_hardware = Self::recommend_hardware_ids(&ctx);
         let configured_only = [
             !ctx.config().models.is_empty(),       // Models
             !ctx.config().providers.is_empty(),    // Providers
             !ctx.config().launchers.is_empty(),    // Launchers
             !ctx.config().capabilities.is_empty(), // Capabilities
+            !ctx.config().hardware.is_empty(),     // Hardware
         ];
         let sessions = Self::load_sessions();
         let hide_inactive = true;
-        Self {
+        let mut app = Self {
             ctx,
             section: Section::Models,
             row: 0,
             mode: AppMode::Browse,
             table_state,
             detail_scroll: 0,
-            recommend_rows_cache,
+            recommend_rows_cache: std::collections::HashMap::new(),
+            recommend_hardware,
+            recommend_hw: 0,
+            recommend_problems: std::collections::HashMap::new(),
+            unused_local_detection: None,
             setup_pane: None,
             configured_only,
             sessions,
             hide_inactive,
             active_search: Default::default(),
-        }
+        };
+        app.ensure_recommend_rows();
+        app
     }
 
     /// Handle a key event and return an [`AppAction`].
@@ -446,6 +453,11 @@ impl App {
                         self.sync_table_state();
                     }
                 }
+                KeyCode::Char('h') => {
+                    if self.section == Section::Recommend {
+                        self.next_recommend_hardware();
+                    }
+                }
                 KeyCode::Char('i') => {
                     if self.section == Section::Sessions {
                         self.hide_inactive = !self.hide_inactive;
@@ -518,6 +530,9 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let id = id.clone();
+                    if self.section == Section::Hardware {
+                        return self.hardware_setup_action(&id);
+                    }
                     if let Some(instances) = self.existing_instances(&id) {
                         self.mode = AppMode::InstancePick {
                             type_id: id,
@@ -603,6 +618,152 @@ impl App {
     }
 
     /*-- private --*/
+
+    /// The Recommend rows for the hardware profile Recommend shows.
+    fn recommend_rows(&self) -> &[Vec<String>] {
+        self.recommend_hardware
+            .get(self.recommend_hw)
+            .and_then(|id| self.recommend_rows_cache.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// The id of the hardware profile Recommend shows.
+    fn recommend_hardware_id(&self) -> &str {
+        self.recommend_hardware
+            .get(self.recommend_hw)
+            .map(String::as_str)
+            .unwrap_or(LOCAL_HARDWARE_ID)
+    }
+
+    /// `local` and the other configured hardware profiles, sorted.
+    fn recommend_hardware_ids(ctx: &crate::AppContext) -> Vec<String> {
+        let mut others: Vec<String> = ctx
+            .config()
+            .hardware
+            .keys()
+            .filter(|id| id.as_str() != LOCAL_HARDWARE_ID)
+            .cloned()
+            .collect();
+        others.sort();
+        std::iter::once(LOCAL_HARDWARE_ID.to_string())
+            .chain(others)
+            .collect()
+    }
+
+    /// Computes the Recommend rows for the profile Recommend shows, unless
+    /// they are cached.
+    fn ensure_recommend_rows(&mut self) {
+        let id = self.recommend_hardware_id().to_string();
+        if !self.recommend_rows_cache.contains_key(&id) {
+            let rows = match Self::recommend_rows_for(&self.ctx, &id) {
+                Ok(rows) => rows,
+                Err(problem) => {
+                    self.recommend_problems.insert(id.clone(), problem);
+                    Vec::new()
+                }
+            };
+            self.recommend_rows_cache.insert(id, rows);
+        }
+    }
+
+    /// The Recommend title: the hardware profile shown, the key to move to
+    /// the next one when there is one, and why the table is empty when the
+    /// profile's figures cannot be looked up.
+    fn recommend_title(&self) -> String {
+        let id = self.recommend_hardware_id();
+        let next = if self.recommend_hardware.len() > 1 {
+            " [h: next profile]"
+        } else {
+            ""
+        };
+        match self.recommend_problems.get(id) {
+            Some(problem) => format!(" Recommend · {id}{next} ⚠ {problem} "),
+            None => format!(" Recommend · {id}{next} "),
+        }
+    }
+
+    /// Recommend rows for hardware profile `id`, the same rows `model
+    /// recommend --hardware <id>` shows: the recommended models, then those
+    /// whose fit is not available, with the reason in FIT and no providers.
+    /// Fails with the reason when the profile's figures cannot be looked up.
+    fn recommend_rows_for(ctx: &crate::AppContext, id: &str) -> Result<Vec<Vec<String>>, String> {
+        let profile = ctx.hardware_profile(id)?;
+        let (mut rows, unavailable) =
+            ModelCommands::recommend_rows_for_hardware(ctx, None, false, id, &profile);
+        rows.extend(unavailable.into_iter().map(|mut row| {
+            row.push(String::new());
+            row
+        }));
+        Ok(rows)
+    }
+
+    /// Shows Recommend for the next hardware profile, wrapping around.
+    fn next_recommend_hardware(&mut self) {
+        if self.recommend_hardware.len() < 2 {
+            return;
+        }
+        self.recommend_hw = (self.recommend_hw + 1) % self.recommend_hardware.len();
+        self.ensure_recommend_rows();
+        self.row = 0;
+        self.sync_table_state();
+    }
+
+    /// The setup pane to open from a Hardware row: the catalog entry on a
+    /// catalog row, and the profile itself on a configured one.
+    fn hardware_setup_action(&self, id: &str) -> AppAction {
+        if !self.configured_only[4] || id == LOCAL_HARDWARE_ID {
+            return AppAction::StartSetup(Section::Hardware, id.to_string(), None);
+        }
+        match self.ctx.config().get_hardware(id) {
+            Some(h) => AppAction::StartSetup(
+                Section::Hardware,
+                h.hardware_type.clone(),
+                Some(id.to_string()),
+            ),
+            None => AppAction::None,
+        }
+    }
+
+    /// Drops what was computed from the previous configuration, after a
+    /// setup run wrote a new one.
+    fn refresh_after_config_change(&mut self) {
+        let current = self.recommend_hardware_id().to_string();
+        self.recommend_rows_cache.clear();
+        self.recommend_problems.clear();
+        // Kept while `local` still differs from it.
+        let local = self.ctx.hardware_profile(LOCAL_HARDWARE_ID);
+        self.unused_local_detection = self
+            .unused_local_detection
+            .take()
+            .filter(|d| local.as_ref().is_ok_and(|p| !p.same_memory(d)));
+        self.recommend_hardware = Self::recommend_hardware_ids(&self.ctx);
+        self.recommend_hw = self
+            .recommend_hardware
+            .iter()
+            .position(|id| *id == current)
+            .unwrap_or(0);
+        self.ensure_recommend_rows();
+    }
+
+    /// Rows of the Hardware section: the configured profiles when
+    /// `configured_only[4]` is set, otherwise the catalog as [id, family,
+    /// name, memory], in the order `hardware catalog` lists it. The id comes
+    /// first because the section keys its rows by the first cell.
+    fn hardware_rows(&self) -> Vec<Vec<String>> {
+        if self.configured_only[4] {
+            HardwareCommands::configured_rows(&self.ctx, self.unused_local_detection.as_ref())
+        } else {
+            HardwareCommands::catalog_rows(None)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut row| {
+                    row.swap(0, 1);
+                    row
+                })
+                .collect()
+        }
+    }
 
     /// Load all session metadata from disk, sorted newest-first by `launched_at`.
     /// Individual file read failures are silently skipped.
@@ -739,6 +900,7 @@ impl App {
             Section::Providers => Some(1),
             Section::Launchers => Some(2),
             Section::Capabilities => Some(3),
+            Section::Hardware => Some(4),
             _ => None,
         }
     }
@@ -753,7 +915,8 @@ impl App {
             Section::Launchers => Some(2),
             Section::Capabilities => Some(3),
             Section::Recommend => Some(4),
-            Section::Sessions | Section::Hardware => None,
+            Section::Hardware => Some(5),
+            Section::Sessions => None,
         }
     }
 
@@ -919,14 +1082,10 @@ impl App {
                 // Also match the pre-computed display columns (size, variant,
                 // type, providers) that are not covered by matches_query().
                 if q.is_empty() {
-                    return self
-                        .recommend_rows_cache
-                        .iter()
-                        .map(|r| r[0].clone())
-                        .collect();
+                    return self.recommend_rows().iter().map(|r| r[0].clone()).collect();
                 }
                 return self
-                    .recommend_rows_cache
+                    .recommend_rows()
                     .iter()
                     .filter(|r| {
                         let id = &r[0];
@@ -962,7 +1121,14 @@ impl App {
                     .map(|s| s.session_id.clone())
                     .collect();
             }
-            Section::Hardware => vec![],
+            Section::Hardware => {
+                return self
+                    .hardware_rows()
+                    .into_iter()
+                    .filter(|r| q.is_empty() || r.iter().any(|c| c.to_lowercase().contains(&q)))
+                    .map(|r| r[0].clone())
+                    .collect();
+            }
         };
         if q.is_empty() {
             return ids;
@@ -1091,7 +1257,7 @@ impl App {
                             crate::capabilities::CAPABILITY_REGISTRY.entries().len()
                         }
                     }
-                    Section::Recommend => self.recommend_rows_cache.len(),
+                    Section::Recommend => self.recommend_rows().len(),
                     Section::Sessions => {
                         if self.hide_inactive {
                             self.sessions
@@ -1102,7 +1268,7 @@ impl App {
                             self.sessions.len()
                         }
                     }
-                    Section::Hardware => 0,
+                    Section::Hardware => self.hardware_rows().len(),
                 };
                 let style = if *s == self.section {
                     Style::default()
@@ -1557,7 +1723,7 @@ impl App {
                 let filtered_ids_set: std::collections::HashSet<String> =
                     self.filtered_ids(query).into_iter().collect();
                 let visible_rows: Vec<&Vec<String>> = self
-                    .recommend_rows_cache
+                    .recommend_rows()
                     .iter()
                     .filter(|r| !searching || filtered_ids_set.contains(&r[0]))
                     .collect();
@@ -1669,9 +1835,11 @@ impl App {
                     ]
                 };
 
-                let table = Table::new(rows, widths.to_vec())
-                    .header(header)
-                    .block(Block::default().borders(Borders::ALL).title(" Recommend "));
+                let table = Table::new(rows, widths.to_vec()).header(header).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(self.recommend_title()),
+                );
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
@@ -1748,26 +1916,67 @@ impl App {
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
             Section::Hardware => {
-                // Hardware is a single static detail pane — no rows to browse
-                let label_style = Style::default().fg(Color::Cyan);
-                let lines: Vec<Line> = HardwareCommands::hardware_fields()
+                // Configured hardware profiles, or the catalog with [c].
+                let configured = self.configured_only[4];
+                let visible: std::collections::HashSet<String> =
+                    self.filtered_ids(query).into_iter().collect();
+                let rows_data: Vec<Vec<String>> = self
+                    .hardware_rows()
+                    .into_iter()
+                    .filter(|r| visible.contains(&r[0]))
+                    .collect();
+                let (title, headers, widths): (&str, Vec<&str>, Vec<Constraint>) = if configured {
+                    (
+                        " Hardware [configured] ",
+                        vec!["ID", "TYPE", "MEMORY", "PROVIDERS", "NOTES"],
+                        vec![
+                            Constraint::Percentage(16),
+                            Constraint::Percentage(18),
+                            Constraint::Percentage(18),
+                            Constraint::Percentage(24),
+                            Constraint::Percentage(24),
+                        ],
+                    )
+                } else {
+                    (
+                        " Hardware [catalog] ",
+                        vec!["ID", "FAMILY", "NAME", "MEMORY"],
+                        vec![
+                            Constraint::Percentage(22),
+                            Constraint::Percentage(20),
+                            Constraint::Percentage(24),
+                            Constraint::Percentage(34),
+                        ],
+                    )
+                };
+                let header = Row::new(headers).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let rows: Vec<Row> = rows_data
                     .iter()
-                    .map(|(k, v)| {
-                        Line::from(vec![
-                            Span::styled(format!("{k}: "), label_style),
-                            Span::raw(v.clone()),
-                        ])
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let style = if i == self.row {
+                            Style::default().bg(Color::DarkGray)
+                        } else if i % 2 == 0 {
+                            Style::default()
+                        } else {
+                            Style::default().bg(Color::Rgb(20, 20, 20))
+                        };
+                        Row::new(
+                            r.iter()
+                                .map(|c| Cell::from(strip_ansi(c)))
+                                .collect::<Vec<_>>(),
+                        )
+                        .style(style)
                     })
                     .collect();
-                let para = Paragraph::new(lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Hardware Profile "),
-                    )
-                    .wrap(Wrap { trim: false })
-                    .scroll((self.detail_scroll as u16, 0));
-                frame.render_widget(para, table_area);
+                let table = Table::new(rows, widths)
+                    .header(header)
+                    .block(Block::default().borders(Borders::ALL).title(title));
+                frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
         }
 
@@ -2277,15 +2486,30 @@ impl App {
                     vec![Line::from(format!("Capability '{id}' not found."))]
                 }
             }
-            Section::Hardware => HardwareCommands::hardware_fields()
-                .iter()
-                .map(|(k, v)| {
-                    Line::from(vec![
-                        Span::styled(format!("{k}: "), bold),
-                        Span::raw(v.clone()),
-                    ])
-                })
-                .collect(),
+            Section::Hardware => {
+                let fields = if self.configured_only[4] {
+                    HardwareCommands::info_fields(
+                        &self.ctx,
+                        id,
+                        self.unused_local_detection.as_ref(),
+                    )
+                    .ok()
+                } else {
+                    HardwareCommands::catalog_fields(id)
+                };
+                match fields {
+                    Some(fields) => fields
+                        .iter()
+                        .map(|(k, v)| {
+                            Line::from(vec![
+                                Span::styled(format!("{k}: "), bold),
+                                Span::raw(strip_ansi(v)),
+                            ])
+                        })
+                        .collect(),
+                    None => vec![Line::from(format!("Hardware profile '{id}' not found."))],
+                }
+            }
             Section::Sessions => unreachable!("Sessions handled above"),
         };
 
@@ -2316,16 +2540,15 @@ impl App {
         match &self.mode {
             AppMode::Browse => {
                 let mut hints = Vec::new();
-                if self.section == Section::Hardware {
-                    hints.push(Hint::Scroll);
-                } else {
-                    hints.push(Hint::Navigate);
-                }
+                hints.push(Hint::Navigate);
                 hints.push(Hint::Section);
                 if self.section == Section::Sessions {
                     hints.push(Hint::Open("Detail"));
-                } else if self.section != Section::Hardware {
+                } else {
                     hints.push(Hint::Open("Detail/Setup"));
+                }
+                if self.section == Section::Recommend && self.recommend_hardware.len() > 1 {
+                    hints.push(Hint::NextHardware);
                 }
                 if Self::active_search_idx(&self.section).is_some() {
                     hints.push(Hint::Search);
@@ -2598,10 +2821,28 @@ impl App {
 
 /// Launch the interactive TUI application. Runs until the user quits.
 pub(crate) async fn run_interactive_tui(
-    ctx: crate::AppContext,
+    mut ctx: crate::AppContext,
     log_level: alog::Level,
     log_filters: &str,
 ) -> anyhow::Result<()> {
+    // Detection runs once, before the first screen, so a difference from the
+    // saved local hardware profile is asked about in the terminal.
+    // A failure here is reported and the TUI still starts, so its Hardware
+    // section stays reachable to fix `local`.
+    let can_prompt = HardwareCommands::can_prompt(&ctx);
+    let unused_local_detection = match prepare_hardware(
+        &mut ctx,
+        crate::utils::hardware::detect_hardware,
+        can_prompt,
+    ) {
+        Ok(unused) => unused,
+        Err(e) => {
+            ctx.ui
+                .warn(&format!("Could not check the local hardware profile: {e}"));
+            None
+        }
+    };
+
     // Silence the global logger for the entire TUI session.  The logger is
     // wired to TerminalOutput which calls println! directly — any log line
     // emitted from a setup task thread would write to stdout while ratatui
@@ -2610,6 +2851,7 @@ pub(crate) async fn run_interactive_tui(
 
     let mut terminal = setup_terminal()?;
     let mut app = App::new(ctx);
+    app.unused_local_detection = unused_local_detection;
 
     loop {
         // When a setup pane is active, poll for new prompts before drawing.
@@ -2619,6 +2861,7 @@ pub(crate) async fn run_interactive_tui(
             if pane.finished {
                 if let Ok(fresh) = crate::config::Config::new() {
                     app.ctx.set_config(fresh);
+                    app.refresh_after_config_change();
                 }
                 app.setup_pane = None;
             }
@@ -2657,6 +2900,7 @@ pub(crate) async fn run_interactive_tui(
                 if pane.finished {
                     if let Ok(fresh) = crate::config::Config::new() {
                         app.ctx.set_config(fresh);
+                        app.refresh_after_config_change();
                     }
                     app.setup_pane = None;
                 }
@@ -2688,6 +2932,18 @@ pub(crate) async fn run_interactive_tui(
     restore_terminal(terminal)?;
     alog::adjust_levels(log_level, AlogFilters::Spec(log_filters.to_string()));
     Ok(())
+}
+
+/// Writes `local` on first use and, in auto mode, checks it against `detect`,
+/// asking about a difference when `can_prompt`. The TUI calls it once at
+/// start-up. Returns the detection the run did not take, as
+/// [`HardwareCommands::compare_local`] does.
+fn prepare_hardware(
+    ctx: &mut crate::AppContext,
+    detect: impl FnOnce() -> crate::utils::hardware::HardwareProfile,
+    can_prompt: bool,
+) -> anyhow::Result<Option<crate::utils::hardware::HardwareProfile>> {
+    HardwareCommands::compare_local(ctx, detect, can_prompt)
 }
 
 /// Spawn a setup task for `id` in `section` on a blocking thread and return
@@ -2739,7 +2995,9 @@ fn spawn_setup(
                 Section::Capabilities => {
                     CapabilityCommands::setup(&mut task_ctx, &id, iid, false).await
                 }
-                Section::Hardware => Ok(()),
+                Section::Hardware => {
+                    hardware_setup_in_pane(&mut task_ctx, &id, instance_id.clone())
+                }
                 Section::Sessions => Ok(()),
             };
             if let Err(e) = result {
@@ -2753,6 +3011,21 @@ fn spawn_setup(
     });
 
     SetupPane::new(title, output, pulls, prompt_rx, answer_tx)
+}
+
+/// `hardware setup` for catalog entry or profile `id` from the setup pane,
+/// which asks its questions itself.
+fn hardware_setup_in_pane(
+    ctx: &mut crate::AppContext,
+    id: &str,
+    instance_id: Option<String>,
+) -> anyhow::Result<()> {
+    let args = crate::commands::hardware::HardwareSetupArgs {
+        target: Some(id.to_string()),
+        id: instance_id,
+        ..Default::default()
+    };
+    HardwareCommands::setup_asking(ctx, args).map(|_| ())
 }
 
 /*-- tests --*/
@@ -2769,6 +3042,40 @@ mod tests {
             Config::default(),
             Arc::new(CaptureUi::default()),
         ))
+    }
+
+    /// An app whose Recommend section has rows: a large saved `local` and
+    /// one Ollama provider on it, built in memory, so no test reads the
+    /// machine it runs on.
+    fn app_recommending() -> App {
+        let mut config = Config::default();
+        config.hardware.insert(
+            LOCAL_HARDWARE_ID.to_string(),
+            crate::config::HardwareConfig::local_from_detection(
+                crate::utils::hardware::HardwareProfile::with_memory(
+                    crate::utils::hardware::Memory::System { ram_gb: 512.0 },
+                ),
+            ),
+        );
+        config.providers.insert(
+            "ollama".to_string(),
+            crate::config::ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+                hardware: Default::default(),
+            },
+        );
+        let mut a = App::new(crate::AppContext::new(
+            config,
+            Arc::new(CaptureUi::default()),
+        ));
+        a.section = Section::Recommend;
+        assert!(
+            !a.recommend_rows().is_empty(),
+            "fixture should recommend models"
+        );
+        a
     }
 
     fn app_with_custom_model() -> App {
@@ -3286,10 +3593,14 @@ mod tests {
     }
 
     #[test]
-    fn hardware_section_row_count_is_zero() {
+    fn hardware_section_with_no_profiles_shows_the_catalog() {
         let mut a = app();
         a.section = Section::Hardware;
-        assert_eq!(a.row_count(), 0);
+        assert!(!a.configured_only[4]);
+        assert_eq!(
+            a.row_count(),
+            crate::utils::hardware_catalog::HARDWARE_CATALOG.len()
+        );
     }
 
     #[test]
@@ -3306,17 +3617,9 @@ mod tests {
 
     #[test]
     fn recommend_search_filters_by_id_substring() {
-        let mut a = app();
-        a.section = Section::Recommend;
-        // If the cache is empty (no hardware profile in test), filtered_ids returns
-        // nothing — that's fine. The important thing is that when rows are present,
-        // only matching ones are returned.
-        if a.recommend_rows_cache.is_empty() {
-            // Nothing to assert — cache is built lazily from hardware profile.
-            return;
-        }
+        let a = app_recommending();
         // Use the id of the first row as a guaranteed match.
-        let first_id = a.recommend_rows_cache[0][0].clone();
+        let first_id = a.recommend_rows()[0][0].clone();
         let query = &first_id[..4.min(first_id.len())];
         let matches = a.filtered_ids(query);
         assert!(
@@ -3326,27 +3629,19 @@ mod tests {
             "every returned id must contain the query substring"
         );
         // Empty query returns all rows.
-        assert_eq!(a.filtered_ids("").len(), a.recommend_rows_cache.len());
-    }
-
-    #[test]
-    fn hardware_fields_has_all_expected_keys() {
-        use crate::commands::HardwareCommands;
-        let fields = HardwareCommands::hardware_fields();
-        let keys: Vec<&str> = fields.iter().map(|(k, _)| *k).collect();
-        assert!(keys.contains(&"CPU Cores"));
-        assert!(keys.contains(&"RAM"));
+        assert_eq!(a.filtered_ids("").len(), a.recommend_rows().len());
     }
 
     // -- Enter triggers StartSetup --------------------------------------------
 
     #[test]
-    fn browse_enter_on_hardware_section_does_not_emit_start_setup() {
-        // Hardware has no rows, so selected_id() returns None and no action is emitted
+    fn browse_enter_on_hardware_section_opens_the_detail() {
+        // Enter from Browse opens the detail pane; setup starts from there.
         let mut a = app();
         a.section = Section::Hardware;
         let action = a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, AppAction::None);
+        assert!(matches!(a.mode, AppMode::Detail(_)));
     }
 
     #[test]
@@ -3993,8 +4288,8 @@ mod tests {
     }
 
     #[test]
-    fn configured_only_idx_hardware_is_none() {
-        assert_eq!(App::configured_only_idx(&Section::Hardware), None);
+    fn configured_only_idx_hardware_is_four() {
+        assert_eq!(App::configured_only_idx(&Section::Hardware), Some(4));
     }
 
     // -- active_query ---------------------------------------------------------
@@ -4026,11 +4321,14 @@ mod tests {
     // -- filtered_ids hardware arm / empty-query early return -----------------
 
     #[test]
-    fn filtered_ids_hardware_section_always_empty() {
+    fn filtered_ids_hardware_section_filters_the_catalog_by_query() {
         let mut a = app();
         a.section = Section::Hardware;
-        assert!(a.filtered_ids("").is_empty());
-        assert!(a.filtered_ids("anything").is_empty());
+        let catalog = crate::utils::hardware_catalog::HARDWARE_CATALOG.len();
+        assert_eq!(a.filtered_ids("").len(), catalog);
+        let apple = a.filtered_ids("apple");
+        assert!(!apple.is_empty() && apple.len() < catalog);
+        assert!(apple.iter().all(|id| id.starts_with("apple-")));
     }
 
     #[test]
@@ -4634,41 +4932,30 @@ mod tests {
 
     #[test]
     fn filtered_ids_recommend_empty_returns_all_cache() {
-        let mut a = app();
-        a.section = Section::Recommend;
+        let a = app_recommending();
         let all = a.filtered_ids("");
-        assert_eq!(all.len(), a.recommend_rows_cache.len());
+        assert_eq!(all.len(), a.recommend_rows().len());
     }
 
     #[test]
     fn filtered_ids_recommend_filters_by_id() {
-        let mut a = app();
-        a.section = Section::Recommend;
-        // Use the first cached row's id as query — must return at least that row
-        if let Some(first_id) = a.recommend_rows_cache.first().map(|r| r[0].clone()) {
-            let ids = a.filtered_ids(&first_id);
-            assert!(ids.contains(&first_id));
-        }
+        let a = app_recommending();
+        // The first cached row's id as query must return at least that row.
+        let first_id = a.recommend_rows()[0][0].clone();
+        let ids = a.filtered_ids(&first_id);
+        assert!(ids.contains(&first_id));
     }
 
     #[test]
     fn filtered_ids_recommend_filters_by_size() {
-        let mut a = app();
-        a.section = Section::Recommend;
+        let a = app_recommending();
         // r[1] is the size string e.g. "3B" — search for a size that exists
-        let size_query = a
-            .recommend_rows_cache
-            .first()
-            .and_then(|r| r.get(1))
-            .cloned()
-            .unwrap_or_default();
-        if !size_query.is_empty() {
-            let ids = a.filtered_ids(&size_query);
-            assert!(
-                !ids.is_empty(),
-                "expected rows matching size '{size_query}'"
-            );
-        }
+        let size_query = a.recommend_rows()[0][1].clone();
+        let ids = a.filtered_ids(&size_query);
+        assert!(
+            !ids.is_empty(),
+            "expected rows matching size '{size_query}'"
+        );
     }
 
     #[test]
@@ -4693,11 +4980,12 @@ mod tests {
 
     #[test]
     fn filtered_ids_recommend_filters_by_variant() {
-        let mut a = app();
-        a.section = Section::Recommend;
-        // r[2] contains "GGUF" for GGUF variants — search for it
-        let ids = a.filtered_ids("gguf");
-        let _ = ids; // assert no panic; actual matches depend on hardware profile
+        let a = app_recommending();
+        // Ollama runs its own format; every row matching it names it.
+        let variant = a.recommend_rows()[0][2].clone();
+        let format = variant.split(' ').next().unwrap().to_string();
+        let ids = a.filtered_ids(&format);
+        assert!(!ids.is_empty(), "expected rows matching variant '{format}'");
     }
 
     #[test]
@@ -4764,8 +5052,8 @@ mod tests {
     }
 
     #[test]
-    fn active_search_idx_hardware_is_none() {
-        assert_eq!(App::active_search_idx(&Section::Hardware), None);
+    fn active_search_idx_hardware_is_five() {
+        assert_eq!(App::active_search_idx(&Section::Hardware), Some(5));
     }
 
     // -- active_search scoped per section -------------------------------------
@@ -4942,7 +5230,17 @@ mod tests {
         let mut a = app();
         a.section = Section::Hardware;
         let hints = a.active_hints();
-        assert_eq!(hints, vec![Hint::Scroll, Hint::Section, Hint::Quit]);
+        assert_eq!(
+            hints,
+            vec![
+                Hint::Navigate,
+                Hint::Section,
+                Hint::Open("Detail/Setup"),
+                Hint::Search,
+                Hint::ToggleCatalog { hidden: false },
+                Hint::Quit
+            ]
+        );
     }
 
     #[test]
@@ -5639,5 +5937,269 @@ mod tests {
             _answer_tx,
         ));
         assert!(a.active_hints().is_empty());
+    }
+
+    // -- hardware profiles in the TUI --------------------------------------------
+
+    fn system_profile(ram_gb: f64) -> crate::utils::hardware::HardwareProfile {
+        crate::utils::hardware::HardwareProfile::with_memory(
+            crate::utils::hardware::Memory::System { ram_gb },
+        )
+    }
+
+    #[test]
+    fn catalog_search_matches_a_family() {
+        let mut a = app();
+        a.section = Section::Hardware;
+        a.configured_only[4] = false;
+
+        let ids = a.filtered_ids("apple silicon");
+
+        assert!(!ids.is_empty());
+        assert!(ids.iter().all(|id| id.starts_with("apple-")), "{ids:?}");
+        assert!(ids.contains(&"apple-m4-max".to_string()));
+    }
+
+    #[test]
+    fn the_setup_pane_asks_for_the_headroom_factor() {
+        let _home = crate::config::TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::new().unwrap(), ui.clone());
+        ui.text_answers
+            .borrow_mut()
+            .extend(["spark".to_string(), "1.2".to_string()]);
+
+        hardware_setup_in_pane(&mut ctx, "dgx-spark", None).unwrap();
+
+        assert!(
+            ui.text_prompts
+                .borrow()
+                .iter()
+                .any(|(prompt, _)| prompt == "Headroom factor")
+        );
+        assert_eq!(
+            ctx.config().get_hardware("spark").unwrap().headroom,
+            Some(1.2)
+        );
+    }
+
+    /// An app whose configuration has a small `local`, the `spark` catalog
+    /// profile and one Ollama provider on `local`, built in memory.
+    fn app_with_two_hardware_profiles() -> App {
+        use crate::config::HardwareConfig;
+        let mut config = Config::default();
+        config.hardware.insert(
+            LOCAL_HARDWARE_ID.to_string(),
+            HardwareConfig::local_from_detection(system_profile(8.0)),
+        );
+        config.hardware.insert(
+            "spark".to_string(),
+            HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+        );
+        config.providers.insert(
+            "ollama".to_string(),
+            crate::config::ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+                hardware: Default::default(),
+            },
+        );
+        App::new(crate::AppContext::new(
+            config,
+            Arc::new(CaptureUi::default()),
+        ))
+    }
+
+    #[test]
+    fn hardware_section_row_counts_for_each_view() {
+        let mut a = app_with_two_hardware_profiles();
+        a.section = Section::Hardware;
+        assert!(a.configured_only[4]);
+        assert_eq!(a.row_count(), 2);
+        assert_eq!(a.filtered_ids(""), vec!["local", "spark"]);
+
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(
+            a.row_count(),
+            crate::utils::hardware_catalog::HARDWARE_CATALOG.len()
+        );
+    }
+
+    #[test]
+    fn h_moves_recommend_to_the_next_hardware_profile() {
+        let mut a = app_with_two_hardware_profiles();
+        a.section = Section::Recommend;
+        let on_local: Vec<String> = a.filtered_ids("");
+        assert_eq!(a.recommend_hardware_id(), "local");
+
+        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+
+        assert_eq!(a.recommend_hardware_id(), "spark");
+        let on_spark: Vec<String> = a.filtered_ids("");
+        assert_ne!(on_local, on_spark);
+        assert!(on_spark.len() > on_local.len());
+        assert!(a.active_hints().contains(&Hint::NextHardware));
+
+        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(a.recommend_hardware_id(), "local");
+        assert_eq!(a.filtered_ids(""), on_local);
+    }
+
+    #[test]
+    fn recommend_matches_model_recommend_for_a_profile_with_no_provider_linked() {
+        let mut a = app_with_two_hardware_profiles();
+        a.section = Section::Recommend;
+        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(a.recommend_hardware_id(), "spark");
+
+        // What `granite-cli model recommend --hardware spark` prints.
+        let spark = a.ctx.hardware_profile("spark").unwrap();
+        ModelCommands::recommend(&a.ctx, None, &[], false, "spark", &spark).unwrap();
+        let ui = (&*a.ctx.ui as &dyn std::any::Any)
+            .downcast_ref::<CaptureUi>()
+            .unwrap();
+        let tables = ui.tables.borrow();
+        let cli: Vec<Vec<String>> = tables
+            .iter()
+            .flat_map(|(_, _, rows)| rows.clone())
+            .collect();
+        let tui = a.recommend_rows().to_vec();
+
+        // Rows of equal size come out in no fixed order, so compare as sets.
+        // The TUI adds an empty PROVIDERS cell to the fit-not-available rows.
+        let sorted = |rows: Vec<Vec<String>>| {
+            let mut rows: Vec<Vec<String>> = rows
+                .into_iter()
+                .map(|mut r| {
+                    if r.last().is_some_and(String::is_empty) {
+                        r.pop();
+                    }
+                    r
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(sorted(tui), sorted(cli));
+        assert!(
+            tables[0]
+                .2
+                .iter()
+                .all(|r| r.last().unwrap() == "none linked")
+        );
+    }
+
+    #[test]
+    fn per_section_arrays_have_a_slot_for_hardware() {
+        let a = app();
+        assert_eq!(a.configured_only.len(), 5);
+        assert_eq!(a.active_search.len(), 6);
+        let sections = [
+            Section::Models,
+            Section::Providers,
+            Section::Launchers,
+            Section::Capabilities,
+            Section::Recommend,
+            Section::Hardware,
+        ];
+        let search: Vec<usize> = sections.iter().filter_map(App::active_search_idx).collect();
+        assert_eq!(search, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn enter_on_a_hardware_detail_opens_setup_for_the_entry_or_profile() {
+        let mut a = app_with_two_hardware_profiles();
+        a.section = Section::Hardware;
+        a.mode = AppMode::Detail("spark".to_string());
+        assert_eq!(
+            a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::StartSetup(
+                Section::Hardware,
+                "dgx-spark".to_string(),
+                Some("spark".to_string())
+            )
+        );
+
+        a.configured_only[4] = false;
+        a.mode = AppMode::Detail("nvidia-a100".to_string());
+        assert_eq!(
+            a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::StartSetup(Section::Hardware, "nvidia-a100".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn a_difference_kept_for_the_session_is_shown_in_the_hardware_section() {
+        let _home = crate::config::TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::new().unwrap(), ui.clone());
+        prepare_hardware(&mut ctx, || system_profile(32.0), true).unwrap();
+        // "Keep the stored figures for this session".
+        ui.select_answers.borrow_mut().push_back(1);
+
+        let unused = prepare_hardware(&mut ctx, || system_profile(64.0), true).unwrap();
+        let mut app = App::new(ctx);
+        app.unused_local_detection = unused;
+        app.configured_only[4] = true;
+
+        let rows = app.hardware_rows();
+        assert_eq!(rows[0][0], "local");
+        assert_eq!(rows[0][4], "auto; detected system 64.0 GB (not used)");
+    }
+
+    #[test]
+    fn start_up_asks_about_a_hardware_difference_and_not_otherwise() {
+        let _home = crate::config::TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::new().unwrap(), ui.clone());
+        prepare_hardware(&mut ctx, || system_profile(32.0), true).unwrap();
+
+        prepare_hardware(&mut ctx, || system_profile(32.0), true).unwrap();
+        assert!(ui.select_prompts.borrow().is_empty());
+
+        prepare_hardware(&mut ctx, || system_profile(64.0), true).unwrap();
+        assert_eq!(ui.select_prompts.borrow().len(), 1);
+        assert_eq!(
+            ui.select_prompts.borrow()[0].0,
+            "What would you like to do?"
+        );
+        assert_eq!(ui.select_prompts.borrow()[0].1.len(), 3);
+    }
+
+    #[test]
+    fn recommend_title_names_the_profile_and_why_it_is_empty() {
+        let mut a = app_with_two_hardware_profiles();
+        assert_eq!(a.recommend_title(), " Recommend · local [h: next profile] ");
+
+        a.ctx.config_mut().hardware.insert(
+            "card".to_string(),
+            crate::config::HardwareConfig::catalog("card", "nvidia-rtx-4090", 48.0),
+        );
+        a.refresh_after_config_change();
+        // local, card, spark: move to card.
+        a.next_recommend_hardware();
+
+        assert_eq!(a.recommend_hardware_id(), "card");
+        assert!(a.recommend_rows().is_empty());
+        assert_eq!(
+            a.recommend_title(),
+            " Recommend · card [h: next profile] ⚠ 'nvidia-rtx-4090' is not offered with 48 GB; \
+             the catalog lists 24 GB "
+        );
+    }
+
+    #[test]
+    fn recommend_shows_why_when_local_is_not_saved() {
+        // No `local` in the configuration: the title names the problem and
+        // nothing reads the machine the test runs on.
+        let a = app();
+        assert_eq!(a.recommend_hardware_id(), LOCAL_HARDWARE_ID);
+        assert!(a.recommend_rows().is_empty());
+        assert_eq!(
+            a.recommend_title(),
+            " Recommend · local ⚠ hardware profile 'local' is not configured "
+        );
     }
 }
