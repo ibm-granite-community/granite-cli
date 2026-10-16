@@ -2278,6 +2278,9 @@ impl SetupCommands {
                 provider_id: provider_id.clone(),
                 provider_type: provider_id.to_string(),
                 config: default_config,
+                hardware: Some(crate::config::hardware::HardwareLink::default_for(
+                    provider_id,
+                )),
             };
 
             if ctx
@@ -2785,6 +2788,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             id.to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: id.to_string(),
                 provider_type: provider_type.to_string(),
                 config,
@@ -3766,6 +3770,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({ "base_url": "http://127.0.0.1:1" }),
@@ -3874,6 +3879,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "lm-studio".to_string(),
             crate::config::ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "lm-studio".to_string(),
                 provider_type: "lm-studio".to_string(),
                 config: PROVIDER_REGISTRY.default_config("lm-studio"),
@@ -4567,6 +4573,7 @@ mod tests {
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
+                hardware: Default::default(),
             },
         );
         capture.multi_select_answers.borrow_mut().push_back(vec![0]);
@@ -4596,6 +4603,7 @@ mod tests {
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
+                hardware: Default::default(),
             },
         );
         capture
@@ -4760,6 +4768,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             provider_id.to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: provider_id.to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({"base_url": custom_url}),

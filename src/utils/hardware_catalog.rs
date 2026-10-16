@@ -169,12 +169,14 @@ mod tests {
 
     #[test]
     fn no_id_is_a_reserved_hardware_type() {
-        // A configured profile's type is a catalog id, `custom` or `local`, so
-        // an entry with one of those ids would be read as the other type.
+        // A configured profile's type is a catalog id, `custom` or `local`, and
+        // a provider's link can be `unspecified`, so an entry with one of
+        // those ids would be read as something else.
         for e in HARDWARE_CATALOG.iter() {
             assert!(
                 e.id != crate::config::hardware::CUSTOM_HARDWARE_TYPE
-                    && e.id != crate::config::hardware::LOCAL_HARDWARE_ID,
+                    && e.id != crate::config::hardware::LOCAL_HARDWARE_ID
+                    && e.id != crate::config::hardware::UNSPECIFIED_HARDWARE,
                 "catalog id '{}' is reserved",
                 e.id
             );

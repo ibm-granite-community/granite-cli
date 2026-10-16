@@ -431,7 +431,15 @@ impl ModelCommands {
         let providers: Option<Vec<&dyn Provider>> = if skip_all {
             None
         } else if providers_arg.is_empty() {
-            Some(instances.iter().map(|(_, p)| &**p).collect())
+            // Variants are chosen from what the providers on this hardware
+            // can run. A profile no provider is linked to yet is judged by
+            // every provider, so it still answers "would this machine do?".
+            let candidates: Vec<&dyn Provider> = if display.is_empty() {
+                instances.iter().map(|(_, p)| &**p).collect()
+            } else {
+                display.iter().map(|(_, p)| &**p).collect()
+            };
+            Some(candidates)
         } else {
             let unknown: Vec<&str> = providers_arg
                 .iter()
@@ -471,8 +479,8 @@ impl ModelCommands {
             ctx.ui.as_ref(),
             hardware,
         );
-        // Every configured provider runs on `local`, so only another profile
-        // can have none linked.
+        // For `local`, the column keeps reading "none" when no provider can
+        // run the variant, as it did before providers were linked.
         let mut table_rows = table_rows;
         if hardware_id != crate::config::hardware::LOCAL_HARDWARE_ID && on_hardware.is_empty() {
             for row in &mut table_rows {
@@ -1725,6 +1733,7 @@ mod tests {
         config_obj.providers.insert(
             id.to_string(),
             crate::config::ProviderConfig {
+                hardware: Default::default(),
                 provider_id: id.to_string(),
                 provider_type: provider_type.to_string(),
                 config,
@@ -1992,6 +2001,7 @@ mod tests {
         config.providers.insert(
             "openai".to_string(),
             crate::config::ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "openai".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({ "base_url": "http://localhost:8080" }),
@@ -2440,6 +2450,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "shared".to_string(),
             crate::config::ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "shared".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({}),
@@ -2630,6 +2641,41 @@ mod tests {
         let (title, _, rows) = &tables[0];
         assert!(title.starts_with("Recommended Models for hardware 'local'"));
         assert!(rows.iter().any(|r| r[5] == "ollama"));
+    }
+
+    #[test]
+    fn variants_are_chosen_from_the_providers_on_the_hardware() {
+        let mut config = config_with_provider("llama-cpp", "llama-cpp", serde_json::json!({}));
+        config.providers.insert(
+            "far-ollama".to_string(),
+            crate::config::ProviderConfig {
+                hardware: Some(crate::config::hardware::HardwareLink::Profile(
+                    "spark".to_string(),
+                )),
+                provider_id: "far-ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        let ctx = ctx_with_config(config);
+
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &[],
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
+
+        let tables = tables!(ctx);
+        let (_, _, rows) = &tables[0];
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|r| r[5] == "llama-cpp"),
+            "every row should be one llama-cpp on this machine can run: {rows:?}"
+        );
     }
 
     #[test]

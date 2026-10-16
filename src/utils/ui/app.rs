@@ -3397,6 +3397,7 @@ mod tests {
         cfg.insert_provider(
             "my-ollama",
             crate::config::ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "my-ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),

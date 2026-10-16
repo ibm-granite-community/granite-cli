@@ -1,0 +1,5 @@
+provider_id: lab
+type: llama-cpp
+config:
+  base_url: http://127.0.0.1:9
+hardware: box
