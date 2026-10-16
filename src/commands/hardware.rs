@@ -11,10 +11,22 @@ impl HardwareCommands {
     /// Shared by the CLI command and the TUI.
     pub(crate) fn hardware_fields() -> Vec<(&'static str, String)> {
         let profile = detect_hardware();
+        let gb = |figure: Option<f64>| {
+            figure
+                .map(|v| format!("{v:.2} GB"))
+                .unwrap_or_else(|| "None".to_string())
+        };
         vec![
-            ("CPU Cores", profile.cpu_cores.to_string()),
-            ("CPU Architecture", profile.cpu_arch.clone()),
-            ("RAM", format!("{:.2} GB", profile.ram_gb)),
+            (
+                "CPU Cores",
+                profile
+                    .machine
+                    .cpu_cores
+                    .map(|cores| cores.to_string())
+                    .unwrap_or_else(|| "None".to_string()),
+            ),
+            ("CPU Architecture", profile.machine.cpu_arch.clone()),
+            ("RAM", gb(profile.memory.ram_gb())),
             (
                 "GPU Vendor",
                 profile
@@ -22,13 +34,7 @@ impl HardwareCommands {
                     .clone()
                     .unwrap_or_else(|| "None".to_string()),
             ),
-            (
-                "VRAM",
-                profile
-                    .vram_gb
-                    .map(|v| format!("{v:.2} GB"))
-                    .unwrap_or_else(|| "None".to_string()),
-            ),
+            ("VRAM", gb(profile.memory.vram_gb())),
         ]
     }
 

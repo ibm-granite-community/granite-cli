@@ -2736,14 +2736,7 @@ mod tests {
     /// while even granite-4.2-30b's smallest variant needs far more than
     /// that for full context and only ever partially fits.
     fn test_hardware_profile() -> HardwareProfile {
-        HardwareProfile {
-            os: "test".to_string(),
-            cpu_cores: 8,
-            cpu_arch: "test".to_string(),
-            gpu_vendor: None,
-            vram_gb: None,
-            ram_gb: 64.0,
-        }
+        HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 64.0 })
     }
 
     async fn run_discovery(ctx: &crate::AppContext) -> DiscoveryResult {
@@ -3887,14 +3880,8 @@ mod tests {
     #[test]
     fn resolve_model_set_ordered_fallback() {
         // Build a hardware profile that can fit granite-4.2-8b but not 4.2-30b
-        let hardware = HardwareProfile {
-            os: "test".to_string(),
-            cpu_cores: 8,
-            cpu_arch: "test".to_string(),
-            gpu_vendor: None,
-            vram_gb: None,
-            ram_gb: 32.0,
-        };
+        let hardware =
+            HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 32.0 });
         let ctx = test_ctx();
         let healthy: Vec<String> = ["ollama".to_string()].into_iter().collect();
 
@@ -3927,14 +3914,8 @@ mod tests {
 
     #[test]
     fn resolve_model_set_variant_precision_filtering() {
-        let hardware = HardwareProfile {
-            os: "test".to_string(),
-            cpu_cores: 8,
-            cpu_arch: "test".to_string(),
-            gpu_vendor: None,
-            vram_gb: None,
-            ram_gb: 64.0,
-        };
+        let hardware =
+            HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 64.0 });
         let ctx = test_ctx();
         let healthy: Vec<String> = ["ollama".to_string()].into_iter().collect();
 
@@ -3972,14 +3953,9 @@ mod tests {
         // A model with partial fit where the effective context is below
         // min_context_length should be rejected.
         // Use a small RAM profile to force partial fit.
-        let hardware = HardwareProfile {
-            os: "test".to_string(),
-            cpu_cores: 8,
-            cpu_arch: "test".to_string(),
-            gpu_vendor: None,
-            vram_gb: None,
-            ram_gb: 4.0, // Very tight RAM
-        };
+        // Very tight RAM.
+        let hardware =
+            HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 4.0 });
         let ctx = test_ctx();
         let healthy: Vec<String> = ["ollama".to_string()].into_iter().collect();
 

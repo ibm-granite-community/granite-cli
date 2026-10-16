@@ -1,0 +1,182 @@
+# Built-in hardware catalog: known devices and the memory sizes they are sold
+# in. A configured hardware profile refers to an entry by `id` and one of its
+# `memory_gb` sizes, and the figures are read from here when fit is estimated.
+#
+# Figures are in GiB, the unit `granite-cli hardware` reports.
+#
+# family: the group `hardware catalog` orders and filters by, and the first
+# question of `hardware setup`. Entries of one family are kept together,
+# and the families appear in the order the catalog lists them.
+#
+# memory_kind:
+#   discrete  a card with its own VRAM; `memory_gb` is the VRAM
+#   unified   one pool shared by CPU and GPU; `memory_gb` is the pool and
+#             `addressable_gb` the part of it the GPU can use
+#   system    no accelerator; `memory_gb` is system RAM
+#
+# Apple `addressable_gb` is the Metal working set
+# (recommendedMaxWorkingSetSize). It has been measured on a 64 GiB Mac only
+# (51.84 GiB, 81%). The other Apple sizes use the same 81% and are not
+# measured.
+
+- id: apple-m4
+  name: Apple M4
+  family: Apple Silicon
+  vendor: Apple
+  memory_kind: unified
+  sizes:
+    - { memory_gb: 16, addressable_gb: 12.96 }
+    - { memory_gb: 24, addressable_gb: 19.44 }
+    - { memory_gb: 32, addressable_gb: 25.92 }
+
+- id: apple-m4-pro
+  name: Apple M4 Pro
+  family: Apple Silicon
+  vendor: Apple
+  memory_kind: unified
+  sizes:
+    - { memory_gb: 24, addressable_gb: 19.44 }
+    - { memory_gb: 48, addressable_gb: 38.88 }
+    - { memory_gb: 64, addressable_gb: 51.84 }
+
+- id: apple-m4-max
+  name: Apple M4 Max
+  family: Apple Silicon
+  vendor: Apple
+  memory_kind: unified
+  sizes:
+    - { memory_gb: 36, addressable_gb: 29.16 }
+    - { memory_gb: 48, addressable_gb: 38.88 }
+    - { memory_gb: 64, addressable_gb: 51.84 }
+    - { memory_gb: 128, addressable_gb: 103.68 }
+
+- id: apple-m2-ultra
+  name: Apple M2 Ultra
+  family: Apple Silicon
+  vendor: Apple
+  memory_kind: unified
+  sizes:
+    - { memory_gb: 64, addressable_gb: 51.84 }
+    - { memory_gb: 128, addressable_gb: 103.68 }
+    - { memory_gb: 192, addressable_gb: 155.52 }
+
+- id: apple-m3-ultra
+  name: Apple M3 Ultra
+  family: Apple Silicon
+  vendor: Apple
+  memory_kind: unified
+  sizes:
+    - { memory_gb: 96, addressable_gb: 77.76 }
+    - { memory_gb: 256, addressable_gb: 207.36 }
+    - { memory_gb: 512, addressable_gb: 414.72 }
+
+- id: nvidia-rtx-3090
+  name: NVIDIA RTX 3090
+  family: NVIDIA GeForce
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 24 }
+
+- id: nvidia-rtx-4060-ti
+  name: NVIDIA RTX 4060 Ti
+  family: NVIDIA GeForce
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 8 }
+    - { memory_gb: 16 }
+
+- id: nvidia-rtx-4080
+  name: NVIDIA RTX 4080
+  family: NVIDIA GeForce
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 16 }
+
+- id: nvidia-rtx-4090
+  name: NVIDIA RTX 4090
+  family: NVIDIA GeForce
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 24 }
+
+- id: nvidia-rtx-5090
+  name: NVIDIA RTX 5090
+  family: NVIDIA GeForce
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 32 }
+
+- id: nvidia-rtx-6000-ada
+  name: NVIDIA RTX 6000 Ada
+  family: NVIDIA Workstation
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 48 }
+
+# The GB10 GPU addresses the whole pool. Detection reports total RAM as seen
+# by the OS, which may be below 128; this has not been checked on a Spark.
+- id: dgx-spark
+  name: NVIDIA DGX Spark
+  family: NVIDIA Workstation
+  vendor: NVIDIA
+  memory_kind: unified
+  sizes:
+    - { memory_gb: 128, addressable_gb: 128 }
+
+- id: nvidia-l40s
+  name: NVIDIA L40S
+  family: NVIDIA Data Center
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 48 }
+
+- id: nvidia-a100
+  name: NVIDIA A100
+  family: NVIDIA Data Center
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 40 }
+    - { memory_gb: 80 }
+
+- id: nvidia-h100-80gb
+  name: NVIDIA H100 80GB
+  family: NVIDIA Data Center
+  vendor: NVIDIA
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 80 }
+
+- id: amd-radeon-rx-7900-xtx
+  name: AMD Radeon RX 7900 XTX
+  family: AMD
+  vendor: AMD
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 24 }
+
+- id: amd-instinct-mi300x
+  name: AMD Instinct MI300X
+  family: AMD
+  vendor: AMD
+  memory_kind: discrete
+  sizes:
+    - { memory_gb: 192 }
+
+- id: cpu-only
+  name: CPU only
+  family: CPU only
+  memory_kind: system
+  sizes:
+    - { memory_gb: 16 }
+    - { memory_gb: 32 }
+    - { memory_gb: 64 }
+    - { memory_gb: 128 }
+    - { memory_gb: 256 }

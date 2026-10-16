@@ -1079,14 +1079,7 @@ mod tests {
     /// instead of depending on whatever hardware (and, on some CI runners,
     /// misdetected GPU) actually runs the test.
     fn generous_hardware_profile() -> HardwareProfile {
-        HardwareProfile {
-            os: "test".to_string(),
-            cpu_cores: 8,
-            cpu_arch: "test".to_string(),
-            gpu_vendor: None,
-            vram_gb: None,
-            ram_gb: 512.0,
-        }
+        HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 512.0 })
     }
 
     macro_rules! tables {

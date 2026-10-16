@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod hardware;
+pub(crate) mod hardware_catalog;
 pub mod shell;
 pub mod subserver;
 pub mod traits;

@@ -49,7 +49,9 @@ Two terms are used throughout:
 - **Remote provider**: a provider the user runs on another machine, such as
   llama.cpp on a Spark.
 - **Hosted provider**: a third-party service such as OpenRouter
-  (`ProviderType::Hosted`), whose hardware the user does not know.
+  (`ProviderType::Hosted`), whose hardware the user does not know. An
+  openai-compatible provider is not treated as hosted: it usually points at
+  a server the user runs, such as vLLM.
 
 ## Use Cases
 
@@ -455,12 +457,15 @@ far-ollama      ollama      http://far:11434        ⚠ local (not set)  legacy 
 The link is checked like the other references in the configuration (spec
 0024). A provider linked to a hardware profile that no longer exists shows a
 warning in lists, and commands that need its fit offer to repair the link.
+Launching an agent does not check the link, since a launch does not read
+fit.
 `hardware remove` lists the providers that use a hardware profile before
 removing it.
 
-The setup wizard offers "create new profile…" wherever it links a provider.
-Today the wizard only finds providers at their default local addresses, so
-this matters once the wizard can add a provider by hand.
+The setup wizard asks which hardware each provider it adds runs on as soon as
+the providers are chosen, before it ranks models for them, and offers "create
+new profile…" there. Today the wizard only finds providers at their default
+local addresses, so this matters once the wizard can add a provider by hand.
 
 ### How setup and recommend estimate fit
 
@@ -478,8 +483,9 @@ against the context that fits on that hardware.
                         openrouter  hosted             not specified (hosted)       fit not available
 ```
 
-A variant with no fit available is listed and is not selected automatically.
-`setup --auto` prints it with a note to choose it by hand. If every provider
+A variant with no fit available is not selected automatically. When a
+recommended capability does not resolve, `setup --auto` names such variants
+with a note to choose one by hand. If every provider
 is linked to the local hardware profile, which is the default, setup estimates
 fit for this machine, as it does today.
 
@@ -737,8 +743,10 @@ or has it in a script.
 ## Sub-Tasks
 
 Each sub-task is one commit that leaves `main` working, with its tests and
-documentation. Sub-tasks 1 to 3 change the data model; the only visible change
-is the notice printed when the local hardware profile is first written.
+documentation. Sub-tasks 1 to 3 change the data model. The only visible
+changes are the hardware directory in the configuration and a warning, when
+the configuration loads, about a hardware profile that cannot be used. The
+local hardware profile is first written by the commands sub-task 4 adds.
 
 ```mermaid
 flowchart LR
@@ -803,7 +811,7 @@ rules.
   `test_hardware_profile_detects`)
 - `src/models/context_fit.rs` (`estimate`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -831,7 +839,7 @@ set.
 - `build.rs` (how `resources/recommended_configs` is embedded)
 - `src/config/recommended_config.rs` (`BUILTIN_RECOMMENDED_CONFIGS`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -865,7 +873,7 @@ configuration write discarding the looked-up figures.
 - `src/main.rs` (`AppContext`)
 - `docs/specs/0026-instance-identity-and-reference-resolution.md`
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -963,16 +971,18 @@ estimated against `local`, `provider list` and `provider info` show it as
 `⚠ local (not set)` with a note naming the command that sets it, and its file
 is saved without a link until the user chooses one. The validation from spec
 0024 checks the link: the linked hardware profile must exist and its figures
-and headroom factor must be usable. Removing a hardware profile lists the
-providers that use it and offers the usual choices.
+and headroom factor must be usable. A launch does not check it. Removing a
+hardware profile lists the providers that use it and offers the usual
+choices.
 
 Tests cover: a link to a missing hardware profile, and to one with a factor
-below 1.0, reported by validation;
-creating and linking a hardware profile from `provider setup`; removing a
-linked hardware profile listing its providers; a provider configured before
-this change read as `local`, marked in `provider list`, and saved without a
-link; "not specified" surviving a save and load; and a
-hosted provider defaulting to "not specified".
+below 1.0, reported by validation; a launcher's check not stopped by a
+provider's broken link; creating and linking a hardware profile from
+`provider setup`; removing a linked hardware profile listing its providers; a
+provider configured before this change read as `local`, marked in `provider
+list`, and saved without a link; "not specified" surviving a save and load;
+and a hosted provider defaulting to "not specified" and an openai-compatible
+one to `local`.
 
 **Relevant Context**
 - `src/config/mod.rs` (`ProviderConfig`)
@@ -994,15 +1004,18 @@ Make setup pick models for each provider by what fits the hardware it runs on.
 Setup estimates each candidate variant against the hardware profile of each
 provider that can run it, and keeps the best fit. `min_context_length` is
 checked against the context that fits on that hardware. Variants with no fit
-available are listed and not selected automatically; `setup --auto` prints
-them with a note. `setup --auto` and the wizard share this logic. The wizard's
-variant list names the hardware profile when it is not `local`, and the wizard
-offers "create new profile…" wherever it links a provider.
+available are not selected automatically; when a recommended capability does
+not resolve, `setup --auto` names them with a note. `setup --auto` and the
+wizard share this logic. The wizard asks which hardware each provider it adds
+runs on before it ranks models, offering "create new profile…", and its
+variant list names the hardware profile when it is not `local`.
 
 Tests cover: a model rejected for a local provider and accepted for a provider
 on larger hardware, with the same recommended configuration; a variant without
-a size and a provider without a hardware profile each listed and not selected;
-and the existing setup tests passing with every provider on `local`.
+a size and a provider without a hardware profile each named and not selected;
+the variant a model is bound to coming from the provider it fits best on; the
+wizard ranking models for the hardware chosen for a new provider; and the
+existing setup tests passing with every provider on `local`.
 
 **Relevant Context**
 - `src/commands/setup.rs` (`resolve_model_set`, `rank_variants_among`,
