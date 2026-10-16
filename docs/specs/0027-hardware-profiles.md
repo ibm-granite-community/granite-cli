@@ -1061,7 +1061,7 @@ existing setup tests passing with every provider on `local`.
 - `src/commands/setup.rs` (`resolve_model_set`, `rank_variants_among`,
   `run_auto_with_hardware`, `select_variants`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
