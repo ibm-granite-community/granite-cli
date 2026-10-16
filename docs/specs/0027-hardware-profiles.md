@@ -1116,4 +1116,4 @@ otherwise.
 - `src/utils/ui/setup_pane.rs`
 - `docs/specs/0021-tui-catalog-list-toggle.md`
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
