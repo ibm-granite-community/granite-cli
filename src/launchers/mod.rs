@@ -18,6 +18,7 @@ pub static LAUNCHER_REGISTRY: LazyLock<base::LauncherFactory> = LazyLock::new(||
     factory.register::<hermes::HermesLauncher>("hermes");
     factory.register::<goose::GooseLauncher>("goose");
     factory.register::<openclaw::OpenClawLauncher>("openclaw");
+    factory.register::<codex::CodexLauncher>("codex");
     factory
 });
 
@@ -110,6 +111,7 @@ impl crate::dependency::Configured<dyn Launcher> for LauncherSource {
 mod base;
 pub mod bob;
 pub mod claude;
+pub mod codex;
 pub mod goose;
 pub mod hermes;
 pub mod openclaw;
@@ -120,6 +122,7 @@ pub(crate) use base::resolve_and_bind;
 pub use base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata};
 pub use bob::{BobLauncher, BobLauncherConfig};
 pub use claude::{ClaudeLauncher, ClaudeLauncherConfig};
+pub use codex::{CodexLauncher, CodexLauncherConfig};
 pub use goose::{GooseLauncher, GooseLauncherConfig};
 pub use hermes::{HermesLauncher, HermesLauncherConfig};
 pub use openclaw::{OpenClawLauncher, OpenClawLauncherConfig};
@@ -160,6 +163,7 @@ mod tests {
         assert!(LAUNCHER_REGISTRY.get("hermes").is_some());
         assert!(LAUNCHER_REGISTRY.get("goose").is_some());
         assert!(LAUNCHER_REGISTRY.get("openclaw").is_some());
+        assert!(LAUNCHER_REGISTRY.get("codex").is_some());
         assert!(LAUNCHER_REGISTRY.get("nonexistent").is_none());
     }
 
@@ -207,6 +211,7 @@ mod tests {
         assert!(catalog.contains_key("hermes"));
         assert!(catalog.contains_key("goose"));
         assert!(catalog.contains_key("openclaw"));
+        assert!(catalog.contains_key("codex"));
     }
 
     #[test]
@@ -220,6 +225,7 @@ mod tests {
         assert!(source.config_schema("hermes").is_some());
         assert!(source.config_schema("goose").is_some());
         assert!(source.config_schema("openclaw").is_some());
+        assert!(source.config_schema("codex").is_some());
         assert!(source.config_schema("nonexistent").is_none());
     }
 }

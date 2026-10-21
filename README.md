@@ -151,15 +151,15 @@ To regenerate it after adding a launcher or capability, run `scripts/update-capa
 
 <!-- capability-table-start -->
 
-| Capability | Type | `claude` | `bob` | `pi` | `opencode` | `hermes` | `goose` | `openclaw` |
-|---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `agent-model` | Agent Model Binding | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `speech-to-text` | Speech To Text | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
-| `vision-mcp` | Vision MCP Server | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| `sub-agent` | Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| `sub-agent-code` | Code Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| `sub-agent-explore` | Explore Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| `sub-agent-plan` | Plan Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
+| Capability | Type | `claude` | `bob` | `pi` | `opencode` | `hermes` | `goose` | `openclaw` | `codex` |
+|---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `agent-model` | Agent Model Binding | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `speech-to-text` | Speech To Text | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
+| `vision-mcp` | Vision MCP Server | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `sub-agent` | Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| `sub-agent-code` | Code Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| `sub-agent-explore` | Explore Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| `sub-agent-plan` | Plan Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
 
 **Capability descriptions:**
 
