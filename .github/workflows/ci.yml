@@ -61,13 +61,113 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo test --locked --target ${{ matrix.target }} --all-targets --all-features
 
-  coverage:
-    name: Coverage
+  e2e:
+    name: End-to-end tests (hermetic)
+    needs: [check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # 1.96.1
+        with:
+          toolchain: 1.99
+          components: llvm-tools-preview
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: e2e-coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      # Builds target/debug/granite-cli with coverage instrumentation, runs
+      # tests/e2e/hermetic/*.sh against it and writes the coverage of those
+      # runs, also when a test fails. The coverage job combines it with the
+      # unit test coverage.
+      # jq is preinstalled on the GitHub-hosted Ubuntu runners.
+      - name: Run hermetic end-to-end tests
+        run: bash tests/e2e/coverage.sh lcov-e2e-hermetic.info
+
+      - name: Upload coverage
+        if: ${{ !cancelled() && hashFiles('lcov-e2e-hermetic.info') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-e2e-hermetic
+          path: lcov-e2e-hermetic.info
+          retention-days: 7
+
+  e2e-local:
+    name: End-to-end tests (local, with Ollama)
     needs: [check]
     runs-on: ubuntu-latest
     env:
-      # Minimum line coverage, in percent: for the whole crate, and for the
-      # lines a pull request adds or changes.
+      OLLAMA_VERSION: "0.40.0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # 1.96.1
+        with:
+          toolchain: 1.99
+          components: llvm-tools-preview
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: e2e-coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      # Start Ollama using Docker Compose. --wait returns once the service's
+      # health check passes, and fails if it does not within the timeout.
+      # Docker and Docker Compose are pre-installed on GitHub-hosted runners.
+      - name: Start Ollama with Docker Compose
+        run: docker compose -f tests/e2e/docker-compose.providers.yml up -d --wait --wait-timeout 120 ollama
+
+      # Runs tests/e2e/local/*.sh only (the e2e job runs hermetic/).
+      # --no-skip fails a test that skips itself because Ollama, jq or
+      # curl is missing, so the job cannot pass without running it.
+      # As in the e2e job, the binary is instrumented and the coverage of
+      # these runs is written for the coverage job.
+      - name: Run local end-to-end tests
+        run: bash tests/e2e/coverage.sh lcov-e2e-local.info --local --no-skip local/
+
+      - name: Upload coverage
+        if: ${{ !cancelled() && hashFiles('lcov-e2e-local.info') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-e2e-local
+          path: lcov-e2e-local.info
+          retention-days: 7
+
+      - name: Show Ollama logs
+        if: failure()
+        run: docker compose -f tests/e2e/docker-compose.providers.yml logs ollama
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f tests/e2e/docker-compose.providers.yml down -v
+
+  coverage:
+    name: Coverage
+    needs: [check, e2e, e2e-local]
+    # Runs when an end-to-end job fails, so that the unit test coverage and
+    # the coverage of the end-to-end jobs that wrote it are still reported.
+    if: ${{ !cancelled() && needs.check.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      # Minimum line coverage, in percent, of the unit and end-to-end tests
+      # combined: for the whole crate, and for the lines a pull request adds
+      # or changes.
       COVERAGE_MIN_TOTAL: "80"
       COVERAGE_MIN_DIFF: "80"
       DIFF_COVER_VERSION: "10.6.0"
@@ -95,34 +195,139 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.9.1
 
+      # genhtml writes the HTML report of the combined coverage.
+      - name: Install lcov
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lcov
+
       - name: Test with coverage
         run: cargo llvm-cov --no-report --locked --all-targets --all-features
 
-      - name: Generate reports
-        run: |
-          cargo llvm-cov report --lcov --output-path lcov.info
-          cargo llvm-cov report --html --output-dir coverage
-          cargo llvm-cov report --json --summary-only --output-path coverage-summary.json
-          lines=$(jq '.data[0].totals.lines.percent' coverage-summary.json)
-          printf '## Coverage\n\nLine coverage: **%.2f%%** (minimum %s%%)\n\n' \
-            "$lines" "$COVERAGE_MIN_TOTAL" >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate unit test reports
+        run: cargo llvm-cov report --lcov --output-path lcov-unit.info
 
+      # The e2e and e2e-local jobs upload the coverage of their runs. A job
+      # that failed before its tests ran uploads none, and the coverage of
+      # the other test suites is still combined and reported.
+      - name: Download end-to-end test coverage
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: coverage-e2e-*
+          merge-multiple: true
+
+      # A line is covered in lcov.info when any of the test suites covers it.
+      # The HTML report shows line coverage only: the merged file has no
+      # function or region data.
+      - name: Combine coverage
+        run: |
+          inputs="lcov-unit.info"
+          for f in lcov-e2e-hermetic.info lcov-e2e-local.info; do
+            if [ -f "$f" ]; then inputs="$inputs $f"; fi
+          done
+          # shellcheck disable=SC2086 # file names without spaces
+          scripts/lcov.sh merge lcov.info $inputs
+          genhtml lcov.info --output-directory coverage/html --quiet \
+            --title "granite-cli: unit and end-to-end tests"
+
+      # Gates on the combined coverage. The coverage of each test suite
+      # alone is computed for the summary only.
       - name: Check coverage of changed lines
         if: github.event_name == 'pull_request'
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
+          for suite in unit e2e-hermetic e2e-local; do
+            if [ -f "lcov-${suite}.info" ]; then
+              pipx run "diff-cover==${DIFF_COVER_VERSION}" "lcov-${suite}.info" \
+                --compare-branch="origin/${BASE_REF}" \
+                --format "json:diff-cover-${suite}.json" > /dev/null
+            fi
+          done
           status=0
           pipx run "diff-cover==${DIFF_COVER_VERSION}" lcov.info \
             --compare-branch="origin/${BASE_REF}" \
             --format markdown:diff-cover.md,json:diff-cover.json \
             --fail-under="$COVERAGE_MIN_DIFF" || status=$?
-          cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
+      # Writes coverage.md, a table of the coverage of each test suite and
+      # of all of them combined, to the job summary. The pull request
+      # comment repeats it.
+      - name: Summarise coverage
+        if: ${{ !cancelled() && hashFiles('lcov.info') != '' }}
+        env:
+          E2E_HERMETIC_RESULT: ${{ needs.e2e.result }}
+          E2E_LOCAL_RESULT: ${{ needs.e2e-local.result }}
+        run: |
+          # Prints a pass or fail mark for a percentage against a minimum,
+          # using the same comparison as the checks.
+          mark() { awk -v v="$1" -v m="$2" 'BEGIN { print (v < m) ? ":x:" : ":white_check_mark:" }'; }
+
+          # Prints the whole-crate line coverage of an LCOV file.
+          crate() {
+            read -r hit total < <(scripts/lcov.sh lines "$1")
+            printf '%.2f%% (%s of %s)' "$(scripts/lcov.sh percent "$1")" "$hit" "$total"
+          }
+
+          # Prints the changed-line coverage from a diff-cover JSON report.
+          changed() {
+            if [ ! -f "$1" ]; then
+              return
+            fi
+            lines=$(jq '.total_num_lines' "$1")
+            missing=$(jq '.total_num_violations' "$1")
+            if [ "$lines" -eq 0 ]; then
+              printf 'none with coverage data'
+            else
+              printf '%.2f%% (%s of %s)' "$(jq '.total_percent_covered' "$1")" \
+                "$((lines - missing))" "$lines"
+            fi
+          }
+
+          # Prints the table row of one test suite.
+          row() {
+            if [ -f "lcov-$2.info" ]; then
+              printf '| %s | %s | %s |\n' "$1" "$(crate "lcov-$2.info")" "$(changed "diff-cover-$2.json")"
+            else
+              printf '| %s | no coverage data (job %s) | |\n' "$1" "$3"
+            fi
+          }
+
+          total=$(scripts/lcov.sh percent lcov.info)
+          {
+            printf '## Coverage\n\n'
+            printf 'Line coverage of each test suite, and of all of them combined. The minimums apply to the combined coverage.\n\n'
+            printf '| Tests | Whole crate | Changed lines |\n|---|---:|---:|\n'
+            row "Unit" unit success
+            row "End-to-end, hermetic" e2e-hermetic "$E2E_HERMETIC_RESULT"
+            row "End-to-end, local (Ollama)" e2e-local "$E2E_LOCAL_RESULT"
+            combined_diff=""
+            if [ -f diff-cover.json ]; then
+              combined_diff="**$(changed diff-cover.json)**"
+              if [ "$(jq '.total_num_lines' diff-cover.json)" -gt 0 ]; then
+                combined_diff="$combined_diff $(mark "$(jq '.total_percent_covered' diff-cover.json)" "$COVERAGE_MIN_DIFF")"
+              fi
+            fi
+            printf '| **Combined** | **%s** %s | %s |\n' \
+              "$(crate lcov.info)" "$(mark "$total" "$COVERAGE_MIN_TOTAL")" "$combined_diff"
+            printf '| Minimum | %s%% | %s%% |\n\n' "$COVERAGE_MIN_TOTAL" "$COVERAGE_MIN_DIFF"
+          } > coverage.md
+          cat coverage.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f diff-cover.md ]; then
+            cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Check total coverage
-        if: ${{ !cancelled() }}
-        run: cargo llvm-cov report --summary-only --fail-under-lines "$COVERAGE_MIN_TOTAL"
+        if: ${{ !cancelled() && hashFiles('lcov.info') != '' }}
+        run: |
+          total=$(scripts/lcov.sh percent lcov.info)
+          printf 'Combined line coverage: %.2f%% (minimum %s%%)\n' "$total" "$COVERAGE_MIN_TOTAL"
+          if awk -v v="$total" -v m="$COVERAGE_MIN_TOTAL" 'BEGIN { exit !(v < m) }'; then
+            echo "::error::Combined line coverage is below the minimum of ${COVERAGE_MIN_TOTAL}%"
+            exit 1
+          fi
 
       - name: Upload coverage reports
         id: upload-reports
@@ -131,7 +336,7 @@ jobs:
         with:
           name: coverage
           path: |
-            lcov.info
+            lcov*.info
             coverage/html
             diff-cover.md
           if-no-files-found: ignore
@@ -141,41 +346,23 @@ jobs:
       # request number as the "coverage-comment" artifact, and
       # coverage-comment.yml posts the comment.
       - name: Write pull request comment
-        if: ${{ github.event_name == 'pull_request' && !cancelled() && hashFiles('coverage-summary.json') != '' }}
+        if: ${{ github.event_name == 'pull_request' && !cancelled() && hashFiles('coverage.md') != '' }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPORT_URL: ${{ steps.upload-reports.outputs.artifact-url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # Prints a pass or fail mark for a percentage against a minimum,
-          # using the same comparison as the checks above.
-          mark() { awk -v v="$1" -v m="$2" 'BEGIN { print (v < m) ? ":x:" : ":white_check_mark:" }'; }
-
-          total=$(jq '.data[0].totals.lines.percent' coverage-summary.json)
           changed=0
+          if [ -f diff-cover.json ]; then
+            changed=$(jq '.total_num_lines' diff-cover.json)
+          fi
           {
-            printf '## Coverage\n\n'
-            printf '| | Line coverage | Minimum | |\n|---|---:|---:|:-:|\n'
-            printf '| Whole crate | %.2f%% | %s%% | %s |\n' \
-              "$total" "$COVERAGE_MIN_TOTAL" "$(mark "$total" "$COVERAGE_MIN_TOTAL")"
-            if [ -f diff-cover.json ]; then
-              changed=$(jq '.total_num_lines' diff-cover.json)
-              missing=$(jq '.total_num_violations' diff-cover.json)
-              if [ "$changed" -eq 0 ]; then
-                printf '| Changed lines | none with coverage data | %s%% | |\n' "$COVERAGE_MIN_DIFF"
-              else
-                diff=$(jq '.total_percent_covered' diff-cover.json)
-                printf '| Changed lines (%s of %s covered) | %.2f%% | %s%% | %s |\n' \
-                  "$((changed - missing))" "$changed" "$diff" "$COVERAGE_MIN_DIFF" \
-                  "$(mark "$diff" "$COVERAGE_MIN_DIFF")"
-              fi
-            fi
-            printf '\n'
+            cat coverage.md
             # A comment body is limited to 65536 characters; the per-file
             # listing goes to the job summary only when it is longer.
             if [ -f diff-cover.md ] && [ "$changed" -gt 0 ]; then
               if [ "$(wc -c < diff-cover.md)" -le 50000 ]; then
-                printf '<details><summary>Changed lines by file</summary>\n\n'
+                printf '<details><summary>Changed lines by file (combined)</summary>\n\n'
                 cat diff-cover.md
                 printf '\n</details>\n\n'
               else
@@ -183,7 +370,7 @@ jobs:
               fi
             fi
             if [ -n "$REPORT_URL" ]; then
-              printf '[Coverage report (HTML and LCOV, zip)](%s) · ' "$REPORT_URL"
+              printf '[Coverage reports (combined HTML, LCOV for each test suite and combined; zip)](%s) · ' "$REPORT_URL"
             fi
             printf '[Workflow run](%s)\n' "$RUN_URL"
           } > comment.md

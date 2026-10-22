@@ -1,0 +1,77 @@
+# Docker Compose configuration for AI model providers used in local e2e tests
+#
+# Usage:
+#   docker compose -f tests/e2e/docker-compose.providers.yml up -d --wait ollama
+#   docker compose -f tests/e2e/docker-compose.providers.yml ps
+#   docker compose -f tests/e2e/docker-compose.providers.yml down
+#
+# Environment variables:
+#   OLLAMA_IMAGE - Ollama image name, without the tag (default: ollama/ollama);
+#                  set it to use a mirror of the image with the same tags
+#   OLLAMA_VERSION - Ollama image tag (default: 0.40.0)
+#   LOCALAI_VERSION - LocalAI image tag (default: latest-aio-cpu)
+#
+# Each service includes a health check that the CI workflow waits for before
+# running tests. Tests use require_url to skip when a provider is not running.
+
+services:
+  # Ollama - Local LLM server
+  # Official image: https://hub.docker.com/r/ollama/ollama
+  # Default port: 11434
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama}:${OLLAMA_VERSION:-0.40.0}
+    ports:
+      - "11434:11434"
+    # The image has no curl; `ollama list` succeeds once the server answers.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    # Optional: persist models between runs (useful for local development)
+    # volumes:
+    #   - ollama-data:/root/.ollama
+
+  # LocalAI - OpenAI-compatible API for local models
+  # Official image: https://hub.docker.com/r/localai/localai
+  # Default port: 8080
+  localai:
+    image: localai/localai:${LOCALAI_VERSION:-latest-aio-cpu}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+    environment:
+      - THREADS=4
+      - CONTEXT_SIZE=512
+
+  # vLLM - High-performance LLM serving (requires GPU)
+  # Official image: https://hub.docker.com/r/vllm/vllm-openai
+  # Default port: 8000
+  # Note: Commented out by default as it requires GPU and is large (8-12 GB)
+  # vllm:
+  #   image: vllm/vllm-openai:${VLLM_VERSION:-latest}
+  #   ports:
+  #     - "8000:8000"
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 1s
+  #     timeout: 2s
+  #     retries: 30
+  #     start_period: 15s
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+
+# Optional: named volumes for data persistence
+# volumes:
+#   ollama-data:

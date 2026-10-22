@@ -1,0 +1,4 @@
+capability_id: sub-agent-explore
+type: sub-agent-explore
+config:
+  model_id: missing-model
