@@ -233,16 +233,19 @@ fn max_context_fitting(
 mod tests {
     use super::*;
     use crate::models::base::{LayerTypeCount, MambaShape};
+    use crate::utils::hardware::Memory;
 
     fn hardware_with_vram(vram_gb: f64) -> HardwareProfile {
-        HardwareProfile {
-            os: "test".to_string(),
-            cpu_cores: 8,
-            cpu_arch: "test".to_string(),
-            gpu_vendor: Some("NVIDIA".to_string()),
-            vram_gb: Some(vram_gb),
-            ram_gb: 32.0,
-        }
+        hardware(Memory::Discrete {
+            vram_gb,
+            ram_gb: Some(32.0),
+        })
+    }
+
+    fn hardware(memory: Memory) -> HardwareProfile {
+        let mut profile = HardwareProfile::with_memory(memory);
+        profile.gpu_vendor = Some("NVIDIA".to_string());
+        profile
     }
 
     fn variant(format: &str, size_gb: f64) -> ModelVariant {
@@ -420,6 +423,53 @@ mod tests {
             &hardware,
         );
         assert!(matches!(fit, ContextFit::Partial(_)));
+    }
+
+    #[test]
+    fn each_memory_kind_estimates_from_the_figure_it_names() {
+        // 22.5 GB of accelerator memory and 30 GB of system RAM both leave
+        // 15 GB usable, which gives a partial fit for this model.
+        let fit = |hardware: &HardwareProfile| {
+            estimate(
+                131_072,
+                &dense_architecture(),
+                "bfloat16",
+                &variant("GGUF", 5.0),
+                hardware,
+            )
+        };
+        let discrete = fit(&hardware(Memory::Discrete {
+            vram_gb: 22.5,
+            ram_gb: Some(128.0),
+        }));
+        let unified = fit(&hardware(Memory::Unified {
+            vram_gb: 22.5,
+            ram_gb: Some(128.0),
+        }));
+        let system = fit(&hardware(Memory::System { ram_gb: 30.0 }));
+
+        assert!(matches!(discrete, ContextFit::Partial(_)));
+        assert_eq!(unified, discrete);
+        assert_eq!(system, discrete);
+    }
+
+    #[test]
+    fn a_set_headroom_factor_changes_the_estimate() {
+        let fit = |hardware: &HardwareProfile| {
+            estimate(
+                131_072,
+                &dense_architecture(),
+                "bfloat16",
+                &variant("GGUF", 5.0),
+                hardware,
+            )
+        };
+        let default = hardware_with_vram(22.5);
+        let mut whole_card = hardware_with_vram(22.5);
+        whole_card.headroom = Some(1.0);
+
+        assert!(matches!(fit(&default), ContextFit::Partial(_)));
+        assert_ne!(fit(&whole_card), fit(&default));
     }
 
     #[test]

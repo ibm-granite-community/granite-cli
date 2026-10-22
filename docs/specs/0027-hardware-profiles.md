@@ -49,7 +49,9 @@ Two terms are used throughout:
 - **Remote provider**: a provider the user runs on another machine, such as
   llama.cpp on a Spark.
 - **Hosted provider**: a third-party service such as OpenRouter
-  (`ProviderType::Hosted`), whose hardware the user does not know.
+  (`ProviderType::Hosted`), whose hardware the user does not know. An
+  openai-compatible provider is not treated as hosted: it usually points at
+  a server the user runs, such as vLLM.
 
 ## Use Cases
 
@@ -293,8 +295,9 @@ runs on. It is reserved and cannot be removed. It stores its own figures, like
 a custom profile, and a mode: `auto` or `manual`.
 
 - **First run.** When no `local` profile exists, granite-cli writes the
-  detected figures and prints a one-line notice. This needs no prompt, so
-  `setup --auto` works on a new machine.
+  detected figures and prints a one-line notice, on stderr with `--output
+  json` or `markdown`. This needs no prompt, so `setup --auto` works on a
+  new machine.
 - **Detection.** In both modes, granite-cli detects the hardware again on
   the commands that use fit (`model recommend`, `setup`), on the `hardware`
   commands, and when the TUI starts. Other commands, such as `launch`, do
@@ -323,14 +326,15 @@ a custom profile, and a mode: `auto` or `manual`.
 - **Non-interactive runs** keep the saved figures and print a warning. A run
   is non-interactive when there is no terminal, under `setup --auto`, and with
   `--output json` or `markdown`; with `--output json` the warning goes to
-  stderr. The warning repeats on each run until the user acts. The
-  crate-wide `--quiet` (`-q`) flag silences it, together with the warnings
-  of every other command (see Open Questions).
+  stderr. The warning repeats on each run until the user acts, and
+  `hardware list` and `hardware info` show the detected figures as not
+  used. The crate-wide `--quiet` (`-q`) flag silences it, together with the
+  warnings of every other command (see Open Questions).
 
   ```
   ⚠ Local hardware differs from profile 'local' (stored unified 36 GB,
     detected unified 48 GB).
-    Using the stored figures. Run `granite-cli hardware setup local` to update.
+    Using the stored figures. Run `granite-cli hardware setup local --auto` to update.
   ```
 
 - **TUI.** Detection runs once at start-up. A difference opens the same three
@@ -454,18 +458,24 @@ far-ollama      ollama      http://far:11434        ⚠ local (not set)  legacy 
 
 The link is checked like the other references in the configuration (spec
 0024). A provider linked to a hardware profile that no longer exists shows a
-warning in lists, and commands that need its fit offer to repair the link.
+warning in `provider list` and `provider info`. `provider info` and the setup
+wizard offer to repair the link with the remediation prompt from spec 0024.
+Launching an agent does not check the link, since a launch does not read
+fit.
 `hardware remove` lists the providers that use a hardware profile before
 removing it.
 
-The setup wizard offers "create new profile…" wherever it links a provider.
-Today the wizard only finds providers at their default local addresses, so
-this matters once the wizard can add a provider by hand.
+The setup wizard asks which hardware each provider it adds runs on as soon as
+the providers are chosen, before it ranks models for them, and offers "create
+new profile…" there. Today the wizard only finds providers at their default
+local addresses, so this matters once the wizard can add a provider by hand.
 
 ### How setup and recommend estimate fit
 
 **Setup** considers each candidate model variant once for every provider that
 can run it, against that provider's hardware profile, and keeps the best fit.
+Each model is bound to the provider on whose hardware its variant fits best;
+when it fits as well on several, a provider on `local` is preferred.
 The `min_context_length` in a recommended configuration (spec 0025) is checked
 against the context that fits on that hardware.
 
@@ -478,8 +488,10 @@ against the context that fits on that hardware.
                         openrouter  hosted             not specified (hosted)       fit not available
 ```
 
-A variant with no fit available is listed and is not selected automatically.
-`setup --auto` prints it with a note to choose it by hand. If every provider
+A variant with no fit available is not selected automatically. When a
+recommended capability does not resolve, `setup --auto` names the capability
+once, lists such variants grouped by model, provider and reason, and notes
+that one can be chosen by hand. If every provider
 is linked to the local hardware profile, which is the default, setup estimates
 fit for this machine, as it does today.
 
@@ -536,7 +548,11 @@ shows the local hardware profile and its mode, as `granite-cli hardware` shows
 this machine today.
 
 `setup` takes a catalog id, `custom` or `local`, and `--headroom` for any of
-them. `setup local` takes `--auto` or `--manual`.
+them. `setup local` takes `--auto` or `--manual`. A profile id starts with a
+letter or digit and uses only letters, digits, `-`, `_` and `.`; `local` and
+`custom` are reserved. A `local` profile that cannot be read stops the
+commands that use its figures; `hardware catalog` and `hardware setup` of
+another profile warn about it and go on.
 
 ### TUI
 
@@ -737,8 +753,10 @@ or has it in a script.
 ## Sub-Tasks
 
 Each sub-task is one commit that leaves `main` working, with its tests and
-documentation. Sub-tasks 1 to 3 change the data model; the only visible change
-is the notice printed when the local hardware profile is first written.
+documentation. Sub-tasks 1 to 3 change the data model. The only visible
+changes are the hardware directory in the configuration and a warning, when
+the configuration loads, about a hardware profile that cannot be used. The
+local hardware profile is first written by the commands sub-task 4 adds.
 
 ```mermaid
 flowchart LR
@@ -803,7 +821,7 @@ rules.
   `test_hardware_profile_detects`)
 - `src/models/context_fit.rs` (`estimate`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -831,7 +849,7 @@ set.
 - `build.rs` (how `resources/recommended_configs` is embedded)
 - `src/config/recommended_config.rs` (`BUILTIN_RECOMMENDED_CONFIGS`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -865,7 +883,7 @@ configuration write discarding the looked-up figures.
 - `src/main.rs` (`AppContext`)
 - `docs/specs/0026-instance-identity-and-reference-resolution.md`
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -887,14 +905,19 @@ device, skips the second question for a family with one entry, and asks for
 the headroom factor last, starting from the default for the memory kind.
 `hardware info` shows the headroom factor in use and whether it is the
 default, and `hardware list` names a set factor in NOTES. Updating `local` to
-the detected figures keeps its factor.
+the detected figures keeps its factor. `setup` refuses a profile id that is
+not a plain name.
 
 The commands that use fit and the `hardware` commands compare detection
 with the saved local figures, and in manual mode with the recorded
 detection. A `local` profile whose recorded detection cannot be read fails
 to load with an error that names `detected`. A difference prompts when the
-run is interactive and warns when it is not. The warning is printed as a
-warning, so `--quiet` silences it once that flag exists.
+run is interactive and warns when it is not, naming `hardware setup local
+--auto`; `hardware list` and `info` then show the detection as not used. The
+warning is printed as a warning, so `--quiet` silences it once that flag
+exists. With `--output json` or `markdown`, the warning and the first-use
+notice go to stderr. `hardware catalog` and `hardware setup` of another
+profile warn about a `local` profile that cannot be read and go on.
 
 Tests cover: each subcommand's output through the test UI; the catalog
 ordered by family; `--family` matching regardless of case, and an unknown
@@ -906,10 +929,12 @@ interactive answer writing it only when it differs from the default; "Update
 subcommand showing `local` and its mode; each of the three prompt choices;
 "for this session" saving nothing and asking again; manual mode skipping the
 recorded detection but not a different one; a malformed `detected` block
-failing to load with an error that names it; the non-interactive warning
-keeping the saved figures, on stderr with `--output json`; and the
-recorded detection and the factor in
-`hardware info local` and the NOTES column.
+failing to load with an error that names it, and only a warning for
+`hardware catalog`; the non-interactive warning keeping the saved figures,
+on stderr with `--output json` together with the first-use notice; the
+recorded detection, a detection kept for the session, and the factor in
+`hardware info local` and the NOTES column; and ids that are not plain names
+refused.
 
 **Relevant Context**
 - `src/commands/hardware.rs`, `src/main.rs` (`Commands::Hardware`)
@@ -931,13 +956,17 @@ Let `model recommend` answer for a hardware profile other than the local one.
 against that hardware profile. The title names it and the PROVIDERS column
 lists the providers linked to it. Models with no fit available are listed with
 the reason. An id with no hardware profile offers to create one when the run
-is interactive, from the catalog entry with that id or as a custom profile,
-and is an error listing the configured ids otherwise.
+is interactive, from the catalog entry with that id or as a custom profile.
+Otherwise it is an error that lists the configured ids, `local` among them,
+and names the `hardware setup` command with the flags a script needs. An id
+that cannot be a profile id is refused without the offer.
 
 Tests cover: one model fitting a large hardware profile and not a small one;
 the default giving today's rows; a hosted variant listed with "fit not
 available"; creating a hardware profile from a catalog id with scripted
-answers; and an unknown id in a non-interactive run.
+answers; an unknown id in a non-interactive run, for a catalog entry with one
+size and with several and for a custom profile; and a reserved or malformed
+id refused.
 
 **Relevant Context**
 - `src/commands/model.rs` (`recommend`, `recommend_rows`)
@@ -963,16 +992,22 @@ estimated against `local`, `provider list` and `provider info` show it as
 `⚠ local (not set)` with a note naming the command that sets it, and its file
 is saved without a link until the user chooses one. The validation from spec
 0024 checks the link: the linked hardware profile must exist and its figures
-and headroom factor must be usable. Removing a hardware profile lists the
-providers that use it and offers the usual choices.
+and headroom factor must be usable. `provider info` reports a broken link
+and offers the repair when the run can ask. A launch does not check it.
+Removing a hardware profile lists the providers that use it and offers the
+usual choices. The link question shows `local`'s figures, and the last line
+of `provider setup` names the hardware.
 
 Tests cover: a link to a missing hardware profile, and to one with a factor
-below 1.0, reported by validation;
-creating and linking a hardware profile from `provider setup`; removing a
-linked hardware profile listing its providers; a provider configured before
-this change read as `local`, marked in `provider list`, and saved without a
-link; "not specified" surviving a save and load; and a
-hosted provider defaulting to "not specified".
+below 1.0, reported by validation; a launcher's check not stopped by a
+provider's broken link; `provider info` reporting a broken link; creating and
+linking a hardware profile from `provider setup`, and `local` written first so
+the question shows its figures; removing a linked hardware profile listing
+its providers; a
+provider configured before this change read as `local`, marked in `provider
+list`, and saved without a link; "not specified" surviving a save and load;
+and a hosted provider defaulting to "not specified" and an openai-compatible
+one to `local`.
 
 **Relevant Context**
 - `src/config/mod.rs` (`ProviderConfig`)
@@ -994,15 +1029,23 @@ Make setup pick models for each provider by what fits the hardware it runs on.
 Setup estimates each candidate variant against the hardware profile of each
 provider that can run it, and keeps the best fit. `min_context_length` is
 checked against the context that fits on that hardware. Variants with no fit
-available are listed and not selected automatically; `setup --auto` prints
-them with a note. `setup --auto` and the wizard share this logic. The wizard's
-variant list names the hardware profile when it is not `local`, and the wizard
-offers "create new profile…" wherever it links a provider.
+available are not selected automatically; when a recommended capability does
+not resolve, `setup --auto` names it once, with them grouped by model and
+provider, and a note. `setup --auto` and the wizard share this logic. The
+wizard asks which hardware each provider it adds runs on before it ranks
+models, offering "create new profile…". Before it ranks models it offers to
+repair each configured provider's broken link, and its variant list names
+the hardware profile when it is not `local`. A model that fits as well on several providers is bound
+to one on `local`.
 
 Tests cover: a model rejected for a local provider and accepted for a provider
 on larger hardware, with the same recommended configuration; a variant without
-a size and a provider without a hardware profile each listed and not selected;
-and the existing setup tests passing with every provider on `local`.
+a size and a provider without a hardware profile each named and not selected;
+the variant a model is bound to coming from the provider it fits best on, and
+from the provider on `local` on a tie; a capability recommended by two
+launchers named once; the wizard's repair of a broken link; the wizard
+ranking models for the hardware chosen for a new provider; and the
+existing setup tests passing with every provider on `local`.
 
 **Relevant Context**
 - `src/commands/setup.rs` (`resolve_model_set`, `rank_variants_among`,
