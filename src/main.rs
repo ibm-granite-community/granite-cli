@@ -90,6 +90,75 @@ struct ProviderWithOutput {
 }
 
 #[derive(clap::Args, Debug)]
+struct HardwareWithOutput {
+    /// Output format
+    #[arg(short, long, global = true, default_value = "terminal", value_parser = output_formats())]
+    output: String,
+
+    /// With no subcommand, show the local hardware profile and its mode
+    #[command(subcommand)]
+    subcommand: Option<HardwareSubcommands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum HardwareSubcommands {
+    /// Show the built-in catalog of devices
+    Catalog {
+        /// Show one family only, such as "Apple Silicon" (case does not matter)
+        #[arg(long)]
+        family: Option<String>,
+    },
+
+    /// List the configured hardware profiles
+    List,
+
+    /// Show one configured hardware profile
+    Info {
+        /// Hardware profile id
+        hardware_id: String,
+    },
+
+    /// Create or change a hardware profile: from a catalog id, from typed
+    /// figures (`custom`), or the local machine (`local`)
+    Setup {
+        /// A catalog id (see `hardware catalog`), `custom` or `local`
+        target: Option<String>,
+
+        /// Id to save the profile under (defaults to the catalog id)
+        #[arg(long)]
+        id: Option<String>,
+
+        /// For a catalog entry, the size in GB; for `custom` or `local
+        /// --manual`, the memory figure the kind names, in GB
+        #[arg(long)]
+        memory: Option<f64>,
+
+        /// Memory kind, for `custom` or `local --manual`
+        #[arg(long, value_enum)]
+        kind: Option<utils::hardware::MemoryKind>,
+
+        /// `local` only: take this machine's detected figures and follow detection
+        #[arg(long, conflicts_with = "manual")]
+        auto: bool,
+
+        /// `local` only: keep the figures given on this machine
+        #[arg(long)]
+        manual: bool,
+
+        /// Factor the estimator divides the memory figure by, in place of the
+        /// default for the memory kind (at least 1.0)
+        #[arg(long)]
+        headroom: Option<f64>,
+    },
+
+    /// Remove a hardware profile (`local` cannot be removed)
+    Remove {
+        /// Hardware profile id
+        hardware_id: String,
+    },
+}
+
+#[derive(clap::Args, Debug)]
 struct LaunchWithOutput {
     /// Output format
     #[arg(short, long, global = true, default_value = "terminal", value_parser = output_formats())]
@@ -177,8 +246,9 @@ enum Commands {
         skip_pull: bool,
     },
 
-    /// Show hardware profile and recommended precision
-    Hardware,
+    /// Hardware profiles: show the local machine, browse the catalog, and
+    /// manage the hardware providers run on
+    Hardware(HardwareWithOutput),
 
     /// Launch a configured launcher with Granite overlay
     Launch(LaunchWithOutput),
@@ -234,6 +304,10 @@ enum ModelSubcommands {
         /// Show all columns, including family and full context length
         #[arg(long)]
         wide: bool,
+
+        /// Hardware profile to estimate fit against (see `hardware list`)
+        #[arg(long, default_value = "local")]
+        hardware: String,
     },
 
     /// Show detailed model information
@@ -655,15 +729,16 @@ async fn main() {
                 .await
                 .map_err(|e| ctx.ui.error(&e.to_string()))
         }
-        Some(Commands::Hardware) => {
-            let ctx = construct_context(
-                "terminal",
+        Some(Commands::Hardware(wrapper)) => {
+            let mut ctx = construct_context(
+                &wrapper.output,
                 &log_level,
                 &log_filters,
                 log_json,
                 log_thread_id,
             );
-            HardwareCommands::show(&ctx).map_err(|e| ctx.ui.error(&e.to_string()))
+            run_hardware_command(&mut ctx, wrapper.subcommand)
+                .map_err(|e| ctx.ui.error(&e.to_string()))
         }
         Some(Commands::Launcher(wrapper)) => {
             let mut ctx = construct_context(
@@ -779,6 +854,63 @@ async fn main() {
     }
 }
 
+/// Compares this machine's hardware with the saved `local` profile, as the
+/// other `hardware` commands do, for `hardware setup` of another profile,
+/// which does not use `local`'s figures. See
+/// [`HardwareCommands::check_local_or_warn`].
+fn check_local_hardware(ctx: &mut AppContext) {
+    let can_prompt = HardwareCommands::can_prompt(ctx);
+    HardwareCommands::check_local_or_warn(ctx, utils::hardware::detect_hardware, can_prompt);
+}
+
+fn run_hardware_command(
+    ctx: &mut AppContext,
+    subcmd: Option<HardwareSubcommands>,
+) -> anyhow::Result<()> {
+    match subcmd {
+        None => HardwareCommands::show(ctx),
+        // The catalog is built in, so listing it leaves `local` alone.
+        Some(HardwareSubcommands::Catalog { family }) => {
+            HardwareCommands::catalog(ctx, family.as_deref())
+        }
+        Some(HardwareSubcommands::List) => HardwareCommands::list(ctx),
+        Some(HardwareSubcommands::Info { hardware_id }) => {
+            HardwareCommands::info(ctx, &hardware_id)
+        }
+        Some(HardwareSubcommands::Setup {
+            target,
+            id,
+            memory,
+            kind,
+            auto,
+            manual,
+            headroom,
+        }) => {
+            // `setup local` detects as part of its own steps.
+            if target.as_deref() != Some(config::hardware::LOCAL_HARDWARE_ID) {
+                check_local_hardware(ctx);
+            }
+            HardwareCommands::setup(
+                ctx,
+                commands::hardware::HardwareSetupArgs {
+                    target,
+                    id,
+                    memory,
+                    kind,
+                    auto,
+                    manual,
+                    headroom,
+                    force_overwrite: false,
+                },
+            )
+            .map(|_| ())
+        }
+        Some(HardwareSubcommands::Remove { hardware_id }) => {
+            HardwareCommands::remove(ctx, &hardware_id)
+        }
+    }
+}
+
 async fn run_model_command(ctx: &mut AppContext, subcmd: ModelSubcommands) -> anyhow::Result<()> {
     match subcmd {
         ModelSubcommands::Catalog { r#type } => ModelCommands::catalog(ctx, r#type),
@@ -788,7 +920,13 @@ async fn run_model_command(ctx: &mut AppContext, subcmd: ModelSubcommands) -> an
             r#type,
             providers,
             wide,
-        } => ModelCommands::recommend(ctx, r#type, &providers, wide),
+            hardware,
+        } => {
+            let can_prompt = HardwareCommands::can_prompt(ctx);
+            let (hardware, profile) =
+                HardwareCommands::profile_for_fit(ctx, &hardware, can_prompt)?;
+            ModelCommands::recommend(ctx, r#type, &providers, wide, &hardware, &profile)
+        }
         ModelSubcommands::Info { model_id } => ModelCommands::info(ctx, &model_id).await,
         ModelSubcommands::Setup {
             model_type,

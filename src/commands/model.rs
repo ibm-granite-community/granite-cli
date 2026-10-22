@@ -7,7 +7,7 @@ use crate::config::validation::RefKind;
 use crate::dependency::{self, Configured, DependsOn, Requirement};
 use crate::models::{ContextFit, MODEL_REGISTRY, ModelMetadata, ModelType, ModelVariant};
 use crate::providers::{PROVIDER_REGISTRY, Provider, ProviderMetadata, ProviderType, PullResult};
-use crate::utils::hardware::{HardwareProfile, detect_hardware};
+use crate::utils::hardware::HardwareProfile;
 use crate::utils::prompt_from_schema;
 use crate::utils::ui::Ui;
 
@@ -102,6 +102,22 @@ fn search_match_reason(id: &str, m: &ModelMetadata, q: &str) -> Option<String> {
 }
 
 pub struct ModelCommands;
+
+/// Whether every provider type that runs variants of `format` is hosted.
+/// Such a variant states no size because the hosted provider does not
+/// publish one.
+fn hosted_format(format: &str) -> bool {
+    let mut runs_it = PROVIDER_REGISTRY
+        .entries()
+        .into_values()
+        .filter(|m| {
+            m.supported_formats
+                .iter()
+                .any(|f| f.to_string().eq_ignore_ascii_case(format))
+        })
+        .peekable();
+    runs_it.peek().is_some() && runs_it.all(|m| m.provider_type == ProviderType::Hosted)
+}
 
 /*-- Model -> Provider dependency --------------------------------------------*/
 
@@ -297,7 +313,7 @@ impl ModelCommands {
                         .map(|(pid, _)| pid.as_str())
                         .collect();
                     if matching.is_empty() {
-                        "None".to_string()
+                        "none".to_string()
                     } else {
                         matching.join(", ")
                     }
@@ -338,6 +354,50 @@ impl ModelCommands {
         rows.into_iter().map(|(_, row)| row).collect()
     }
 
+    /// Rows for the models that have no row in `fit_rows` because the
+    /// variant they could use states no size, so fit cannot be estimated:
+    /// [id, size, variant, type, fit], with the reason in the fit column.
+    /// Such a model is listed and never recommended.
+    fn fit_unavailable_rows(
+        filter_type: Option<&ModelType>,
+        filter_providers: Option<&[&dyn Provider]>,
+        fit_rows: &[Vec<String>],
+    ) -> Vec<Vec<String>> {
+        let mut rows: Vec<Vec<String>> = MODEL_REGISTRY
+            .entries()
+            .iter()
+            .filter(|(_, m)| filter_type.is_none_or(|t| m.model_type == *t))
+            .filter(|(id, _)| !fit_rows.iter().any(|row| row[0] == **id))
+            .filter_map(|(id, m)| {
+                let unsized_variant = m.variants.iter().find(|v| {
+                    v.size_gb.is_none()
+                        && filter_providers.is_none_or(|ps| {
+                            ps.iter().any(|p| p.can_run_model(&v.format, &v.precision))
+                        })
+                })?;
+                let variant = if unsized_variant.precision.is_empty() {
+                    unsized_variant.format.clone()
+                } else {
+                    format!("{} / {}", unsized_variant.format, unsized_variant.precision)
+                };
+                let reason = if hosted_format(&unsized_variant.format) {
+                    "fit not available: hosted provider doesn't specify size"
+                } else {
+                    "fit not available: no size"
+                };
+                Some(vec![
+                    id.to_string(),
+                    m.format_size(),
+                    variant,
+                    m.model_type.to_string(),
+                    reason.to_string(),
+                ])
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
     /// Resolves the `--providers` flag against configured providers.
     ///
     /// - `providers_arg` empty: use all configured+enabled providers.
@@ -350,9 +410,18 @@ impl ModelCommands {
         filter_type: Option<ModelType>,
         providers_arg: &[String],
         wide: bool,
+        hardware_id: &str,
+        hardware: &HardwareProfile,
     ) -> Result<()> {
         let source = ctx.sources().providers();
         let instances = source.instances();
+        // The PROVIDERS column names the providers that run on this hardware.
+        let on_hardware = crate::commands::HardwareCommands::providers_on(ctx, hardware_id);
+        let display: Vec<(String, std::sync::Arc<dyn Provider>)> = instances
+            .iter()
+            .filter(|(id, _)| on_hardware.contains(id))
+            .cloned()
+            .collect();
 
         let skip_all = providers_arg.iter().any(|p| p.eq_ignore_ascii_case("all"));
         if skip_all && providers_arg.len() > 1 {
@@ -397,19 +466,47 @@ impl ModelCommands {
         let table_rows = Self::recommend_rows(
             filter_type.as_ref(),
             providers.as_deref(),
-            &instances,
+            &display,
             wide,
             ctx.ui.as_ref(),
-            &detect_hardware(),
+            hardware,
         );
+        // Every configured provider runs on `local`, so only another profile
+        // can have none linked.
+        let mut table_rows = table_rows;
+        if hardware_id != crate::config::hardware::LOCAL_HARDWARE_ID && on_hardware.is_empty() {
+            for row in &mut table_rows {
+                *row.last_mut().unwrap() = "none linked".to_string();
+            }
+        }
+        let unavailable =
+            Self::fit_unavailable_rows(filter_type.as_ref(), providers.as_deref(), &table_rows);
+        let show_unavailable = || {
+            if !unavailable.is_empty() {
+                ctx.ui.table(
+                    &format!(
+                        "Fit not available ({} {})",
+                        unavailable.len(),
+                        if unavailable.len() == 1 {
+                            "model"
+                        } else {
+                            "models"
+                        }
+                    ),
+                    &["ID", "SIZE", "VARIANT", "TYPE", "FIT"],
+                    &unavailable,
+                );
+            }
+        };
         if table_rows.is_empty() {
             let msg = if matches!(&providers, Some(list) if list.is_empty()) {
                 "No models fit: no providers are configured. Use --providers all to ignore \
                  this check, or run `granite-cli provider setup` to add one."
             } else {
-                "No models fit the current hardware profile and configured providers."
+                "No models fit this hardware profile and the configured providers."
             };
             ctx.ui.info(msg);
+            show_unavailable();
             return Ok(());
         }
         let headers: &[&str] = if wide {
@@ -428,12 +525,13 @@ impl ModelCommands {
         };
         ctx.ui.table(
             &format!(
-                "Recommended Models for this hardware ({} models)",
+                "Recommended Models for hardware '{hardware_id}' ({} models)",
                 table_rows.len()
             ),
             headers,
             &table_rows,
         );
+        show_unavailable();
 
         Ok(())
     }
@@ -1091,14 +1189,7 @@ mod tests {
     /// instead of depending on whatever hardware (and, on some CI runners,
     /// misdetected GPU) actually runs the test.
     fn generous_hardware_profile() -> HardwareProfile {
-        HardwareProfile {
-            os: "test".to_string(),
-            cpu_cores: 8,
-            cpu_arch: "test".to_string(),
-            gpu_vendor: None,
-            vram_gb: None,
-            ram_gb: 512.0,
-        }
+        HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 512.0 })
     }
 
     macro_rules! tables {
@@ -1650,7 +1741,15 @@ mod tests {
     #[test]
     fn recommend_returns_table_or_info() {
         let ctx = empty_ctx();
-        ModelCommands::recommend(&ctx, None, &all_providers(), false).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &all_providers(),
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         let has_table = !tables!(ctx).is_empty();
         let has_info = !infos!(ctx).is_empty();
         assert!(has_table || has_info, "expected a table or an info message");
@@ -1659,7 +1758,15 @@ mod tests {
     #[test]
     fn recommend_all_rows_have_six_columns() {
         let ctx = empty_ctx();
-        ModelCommands::recommend(&ctx, None, &all_providers(), false).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &all_providers(),
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         for (_, _, rows) in tables!(ctx).iter() {
             for row in rows {
                 assert_eq!(row.len(), 6, "each row must have 6 columns");
@@ -1670,7 +1777,15 @@ mod tests {
     #[test]
     fn recommend_wide_rows_have_eight_columns() {
         let ctx = empty_ctx();
-        ModelCommands::recommend(&ctx, None, &all_providers(), true).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &all_providers(),
+            true,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         for (_, _, rows) in tables!(ctx).iter() {
             for row in rows {
                 assert_eq!(row.len(), 8, "each wide row must have 8 columns");
@@ -1681,7 +1796,15 @@ mod tests {
     #[test]
     fn recommend_fit_column_is_full_or_partial() {
         let ctx = empty_ctx();
-        ModelCommands::recommend(&ctx, None, &all_providers(), false).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &all_providers(),
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         for (_, _, rows) in tables!(ctx).iter() {
             for row in rows {
                 assert!(
@@ -1696,7 +1819,15 @@ mod tests {
     #[test]
     fn recommend_type_filter_limits_results() {
         let ctx = empty_ctx();
-        ModelCommands::recommend(&ctx, Some(ModelType::Text), &all_providers(), false).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            Some(ModelType::Text),
+            &all_providers(),
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         for (_, _, rows) in tables!(ctx).iter() {
             for row in rows {
                 assert_eq!(row[3], "Text", "filtered rows must all be Text type");
@@ -1707,7 +1838,15 @@ mod tests {
     #[test]
     fn recommend_rows_sorted_descending_by_variant_size() {
         let ctx = empty_ctx();
-        ModelCommands::recommend(&ctx, None, &all_providers(), false).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &all_providers(),
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         for (_, _, rows) in tables!(ctx).iter() {
             // Extract the GB value from the VARIANT column "format / precision (N.N GB)"
             let sizes: Vec<f64> = rows
@@ -1731,7 +1870,15 @@ mod tests {
     #[test]
     fn recommend_default_with_no_configured_providers_shows_no_providers_info() {
         let ctx = empty_ctx();
-        ModelCommands::recommend(&ctx, None, &[], false).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &[],
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         assert!(tables!(ctx).is_empty());
         let infos = infos!(ctx);
         assert!(
@@ -1794,7 +1941,15 @@ mod tests {
     #[test]
     fn recommend_default_with_gguf_only_provider_excludes_non_gguf_models() {
         let with_all = ctx_with_config(Config::default());
-        ModelCommands::recommend(&with_all, None, &all_providers(), false).unwrap();
+        ModelCommands::recommend(
+            &with_all,
+            None,
+            &all_providers(),
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         let all_count: usize = tables!(with_all)
             .iter()
             .map(|(_, _, rows)| rows.len())
@@ -1805,7 +1960,15 @@ mod tests {
             "llama-cpp",
             serde_json::json!({}),
         ));
-        ModelCommands::recommend(&gguf_only, None, &[], false).unwrap();
+        ModelCommands::recommend(
+            &gguf_only,
+            None,
+            &[],
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         let gguf_rows: Vec<Vec<String>> = tables!(gguf_only)
             .iter()
             .flat_map(|(_, _, rows)| rows.clone())
@@ -1837,7 +2000,15 @@ mod tests {
         );
         let ctx = ctx_with_config(config);
 
-        ModelCommands::recommend(&ctx, None, &["llama-cpp".to_string()], false).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &["llama-cpp".to_string()],
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         let narrowed_rows: Vec<Vec<String>> = tables!(ctx)
             .iter()
             .flat_map(|(_, _, rows)| rows.clone())
@@ -1854,7 +2025,14 @@ mod tests {
     #[test]
     fn recommend_unknown_provider_id_errors() {
         let ctx = empty_ctx();
-        let result = ModelCommands::recommend(&ctx, None, &["does-not-exist".to_string()], false);
+        let result = ModelCommands::recommend(
+            &ctx,
+            None,
+            &["does-not-exist".to_string()],
+            false,
+            "local",
+            &generous_hardware_profile(),
+        );
         assert!(result.is_err());
     }
 
@@ -1866,6 +2044,8 @@ mod tests {
             None,
             &["all".to_string(), "llama-cpp".to_string()],
             false,
+            "local",
+            &generous_hardware_profile(),
         );
         assert!(result.is_err());
     }
@@ -1877,7 +2057,15 @@ mod tests {
             "llama-cpp",
             serde_json::json!({}),
         ));
-        ModelCommands::recommend(&ctx, None, &[], false).unwrap();
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &[],
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
         for (_, _, rows) in tables!(ctx).iter() {
             for row in rows {
                 assert_eq!(
@@ -1902,8 +2090,8 @@ mod tests {
         );
         for row in &rows {
             assert_eq!(
-                row[5], "None",
-                "with no display providers, PROVIDERS column must be None, got {}",
+                row[5], "none",
+                "with no display providers, PROVIDERS column must be none, got {}",
                 row[5]
             );
         }
@@ -2309,5 +2497,160 @@ mod tests {
             .iter()
             .map(|(prompt, _, _)| prompt.clone())
             .collect()
+    }
+
+    // -- recommend for a chosen hardware profile ------------------------------
+
+    fn catalog_hardware(catalog_id: &str, memory_gb: f64) -> HardwareProfile {
+        crate::config::HardwareConfig::catalog("test", catalog_id, memory_gb)
+            .profile()
+            .unwrap()
+    }
+
+    fn row_ids(rows: &[Vec<String>]) -> Vec<String> {
+        rows.iter().map(|r| r[0].clone()).collect()
+    }
+
+    #[test]
+    fn a_model_fits_a_large_hardware_profile_and_not_a_small_one() {
+        let ui = CaptureUi::default();
+        let rows = |hardware: &HardwareProfile| {
+            row_ids(&ModelCommands::recommend_rows(
+                None,
+                None,
+                &[],
+                false,
+                &ui,
+                hardware,
+            ))
+        };
+
+        let spark = rows(&catalog_hardware("dgx-spark", 128.0));
+        let small_card = rows(&catalog_hardware("nvidia-rtx-4060-ti", 8.0));
+
+        assert!(spark.contains(&"granite-4.2-30b".to_string()));
+        assert!(!small_card.contains(&"granite-4.2-30b".to_string()));
+    }
+
+    #[test]
+    fn the_default_gives_the_rows_recommend_gave_before() {
+        let ctx = empty_ctx();
+        let hardware = generous_hardware_profile();
+
+        ModelCommands::recommend(&ctx, None, &all_providers(), false, "local", &hardware).unwrap();
+
+        // Rows of equal size come out of the registry in no fixed order.
+        let mut before = ModelCommands::recommend_rows(None, None, &[], false, &*ctx.ui, &hardware);
+        before.sort();
+        let tables = tables!(ctx);
+        let (title, _, rows) = tables
+            .iter()
+            .find(|(title, _, _)| title.starts_with("Recommended Models"))
+            .unwrap();
+        let mut rows = rows.clone();
+        rows.sort();
+        assert_eq!(rows, before);
+        assert_eq!(
+            title,
+            &format!(
+                "Recommended Models for hardware 'local' ({} models)",
+                before.len()
+            )
+        );
+    }
+
+    #[test]
+    fn a_hosted_variant_is_listed_with_fit_not_available() {
+        // Too small for any local variant of granite-4.0-h-micro; its
+        // OpenRouter variant states no size, so fit cannot be estimated.
+        let tiny =
+            HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 0.5 });
+        let ctx = empty_ctx();
+
+        ModelCommands::recommend(&ctx, None, &all_providers(), false, "local", &tiny).unwrap();
+
+        let tables = tables!(ctx);
+        let (title, headers, rows) = tables
+            .iter()
+            .find(|(title, _, _)| title.starts_with("Fit not available"))
+            .expect("a fit-not-available table");
+        assert_eq!(title, &format!("Fit not available ({} models)", rows.len()));
+        assert_eq!(headers, &["ID", "SIZE", "VARIANT", "TYPE", "FIT"]);
+        let micro = rows.iter().find(|r| r[0] == "granite-4.0-h-micro").unwrap();
+        assert_eq!(micro[2], "OpenRouter");
+        assert_eq!(
+            micro[4],
+            "fit not available: hosted provider doesn't specify size"
+        );
+        // Printed after the main table.
+        assert!(tables.last().unwrap().0.starts_with("Fit not available"));
+    }
+
+    #[test]
+    fn hosted_format_is_true_only_when_every_provider_type_for_it_is_hosted() {
+        assert!(hosted_format("OpenRouter"));
+        // openai-compatible is hosted, but ollama and llama-cpp run GGUF here.
+        assert!(!hosted_format("GGUF"));
+        assert!(!hosted_format("Ollama"));
+        assert!(!hosted_format("no-such-format"));
+    }
+
+    #[test]
+    fn a_model_with_a_fitting_row_is_not_also_listed_as_unavailable() {
+        let ui = CaptureUi::default();
+        let hardware = generous_hardware_profile();
+        let fit = ModelCommands::recommend_rows(None, None, &[], false, &ui, &hardware);
+
+        let unavailable = ModelCommands::fit_unavailable_rows(None, None, &fit);
+
+        assert!(!row_ids(&unavailable).contains(&"granite-4.0-h-micro".to_string()));
+    }
+
+    fn ctx_with_ollama() -> crate::AppContext {
+        crate::AppContext::new(
+            config_with_provider("ollama", "ollama", serde_json::json!({})),
+            Arc::new(CaptureUi::default()),
+        )
+    }
+
+    #[test]
+    fn providers_column_names_the_providers_on_local() {
+        let ctx = ctx_with_ollama();
+
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &[],
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
+
+        let tables = tables!(ctx);
+        let (title, _, rows) = &tables[0];
+        assert!(title.starts_with("Recommended Models for hardware 'local'"));
+        assert!(rows.iter().any(|r| r[5] == "ollama"));
+    }
+
+    #[test]
+    fn providers_column_says_none_linked_for_another_profile() {
+        let ctx = ctx_with_ollama();
+
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &[],
+            false,
+            "spark",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
+
+        let tables = tables!(ctx);
+        let (title, _, rows) = &tables[0];
+        assert!(title.starts_with("Recommended Models for hardware 'spark'"));
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|r| r[5] == "none linked"));
     }
 }

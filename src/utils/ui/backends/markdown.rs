@@ -63,6 +63,12 @@ impl Ui for MarkdownOutput {
     fn warn(&self, msg: &str) {
         println!("> [!warning]\n> {msg}");
     }
+    fn warn_stderr(&self, msg: &str) {
+        eprintln!("Warning: {msg}");
+    }
+    fn info_stderr(&self, msg: &str) {
+        eprintln!("{msg}");
+    }
     fn error(&self, msg: &str) {
         eprintln!("> [!critical]\n> {msg}");
     }

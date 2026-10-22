@@ -6,6 +6,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=resources/models.yaml");
     println!("cargo:rerun-if-changed=resources/recommended_configs");
+    println!("cargo:rerun-if-changed=resources/hardware.yaml");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/tags");
 
@@ -28,6 +29,20 @@ fn main() {
     let code = generate_models_code(&models);
 
     fs::write(&dest_path, code).expect("Failed to write generated code");
+
+    // The hardware catalog is embedded with include_str! and parsed at run
+    // time; parsing it here turns a malformed file into a build error.
+    let hardware_yaml =
+        fs::read_to_string("resources/hardware.yaml").expect("Failed to read hardware.yaml");
+    let hardware: Vec<YamlHardwareEntry> =
+        serde_yaml::from_str(&hardware_yaml).expect("Failed to parse hardware.yaml");
+    for entry in &hardware {
+        assert!(
+            !entry.family.trim().is_empty(),
+            "hardware.yaml: entry '{}' names no family",
+            entry.id
+        );
+    }
 
     // Generate version module to OUT_DIR (same pattern as generated_models.rs)
     let version_info = get_version_info();
@@ -449,6 +464,35 @@ struct YamlMambaShape {
     d_state: u64,
     d_inner: u64,
     n_groups: u64,
+}
+
+/// Mirrors `CatalogEntry` in `src/utils/hardware_catalog.rs`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct YamlHardwareEntry {
+    id: String,
+    name: String,
+    family: String,
+    vendor: Option<String>,
+    memory_kind: YamlMemoryKind,
+    sizes: Vec<YamlHardwareSize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum YamlMemoryKind {
+    Discrete,
+    Unified,
+    System,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct YamlHardwareSize {
+    memory_gb: f64,
+    addressable_gb: Option<f64>,
 }
 
 /*-- version info --*/

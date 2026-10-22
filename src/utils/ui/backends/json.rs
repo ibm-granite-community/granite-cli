@@ -13,8 +13,12 @@ use crate::utils::ui::base::{self, HasUiMetadata, Ui, UiMetadata};
 /// directly to stdout.
 pub struct JsonOutput {
     writer: Mutex<Box<dyn Write + Send>>,
+    /// Where `warn_stderr` writes: stderr, or a capture buffer in tests.
+    err_writer: Mutex<Box<dyn Write + Send>>,
     /// Shared capture buffer — `Some` only when constructed via `with_capture`.
     buf: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Shared capture buffer for `err_writer`, as `buf` is for `writer`.
+    err_buf: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl JsonOutput {
@@ -22,33 +26,48 @@ impl JsonOutput {
     /// `captured()`. Used in tests only.
     pub fn with_capture() -> Self {
         let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let writer: Box<dyn Write + Send> = Box::new(SharedWriter(Arc::clone(&buf)));
+        let err_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         Self {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Box::new(SharedWriter(Arc::clone(&buf)))),
+            err_writer: Mutex::new(Box::new(SharedWriter(Arc::clone(&err_buf)))),
             buf: Some(buf),
+            err_buf: Some(err_buf),
         }
     }
 
     /// Return all emitted JSON objects in emission order.
     /// Panics if called on a non-capturing instance.
     pub fn captured(&self) -> Vec<serde_json::Value> {
-        let buf = self
-            .buf
-            .as_ref()
-            .expect("captured() called on stdout JsonOutput")
-            .lock()
-            .unwrap();
-        String::from_utf8_lossy(&buf)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| serde_json::from_str(l).expect("JsonOutput emitted invalid JSON"))
-            .collect()
+        parse_lines(self.buf.as_ref())
+    }
+
+    /// The JSON objects written to stderr, in emission order.
+    /// Panics if called on a non-capturing instance.
+    pub fn captured_stderr(&self) -> Vec<serde_json::Value> {
+        parse_lines(self.err_buf.as_ref())
     }
 
     fn emit(&self, value: serde_json::Value) {
         let mut w = self.writer.lock().unwrap();
         let _ = writeln!(w, "{value}");
     }
+
+    fn emit_stderr(&self, value: serde_json::Value) {
+        let mut w = self.err_writer.lock().unwrap();
+        let _ = writeln!(w, "{value}");
+    }
+}
+
+fn parse_lines(buf: Option<&Arc<Mutex<Vec<u8>>>>) -> Vec<serde_json::Value> {
+    let buf = buf
+        .expect("captured output read from a JsonOutput that writes to the terminal")
+        .lock()
+        .unwrap();
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("JsonOutput emitted invalid JSON"))
+        .collect()
 }
 
 /// A `Write` impl backed by a shared `Arc<Mutex<Vec<u8>>>` so the buffer
@@ -71,7 +90,9 @@ impl ConfigConstructable for JsonOutput {
     fn new(_instance_id: &str, _cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         Ok(Self {
             writer: Mutex::new(Box::new(std::io::stdout())),
+            err_writer: Mutex::new(Box::new(std::io::stderr())),
             buf: None,
+            err_buf: None,
         })
     }
 }
@@ -118,6 +139,14 @@ impl Ui for JsonOutput {
 
     fn warn(&self, msg: &str) {
         self.emit(serde_json::json!({ "type": "warn", "message": msg }));
+    }
+
+    fn warn_stderr(&self, msg: &str) {
+        self.emit_stderr(serde_json::json!({ "type": "warn", "message": msg }));
+    }
+
+    fn info_stderr(&self, msg: &str) {
+        self.emit_stderr(serde_json::json!({ "type": "info", "message": msg }));
     }
 
     fn error(&self, msg: &str) {
@@ -201,6 +230,17 @@ mod tests {
         // Machine-readable output has nobody to prompt, so commands fall
         // back to leaving a broken reference alone rather than asking.
         assert!(!make().is_interactive());
+    }
+
+    #[test]
+    fn warn_stderr_stays_out_of_the_json_output() {
+        let out = make();
+        out.warn_stderr("hardware differs");
+        assert!(out.captured().is_empty());
+        assert_eq!(
+            out.captured_stderr(),
+            vec![serde_json::json!({ "type": "warn", "message": "hardware differs" })]
+        );
     }
 
     #[test]

@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use_channel!("CONF");
 
+pub(crate) mod hardware;
 pub(crate) mod recommended_config;
 pub(crate) mod validation;
+
+pub(crate) use hardware::HardwareConfig;
 
 pub(crate) const PATH_DELIM: &str = "---";
 
@@ -43,6 +46,18 @@ impl ConfigId for LauncherConfig {
     }
 }
 
+impl ConfigId for HardwareConfig {
+    fn config_id(&self) -> &str {
+        &self.hardware_id
+    }
+}
+
+impl ConfigPathTranslator for HardwareConfig {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        None
+    }
+}
+
 impl ConfigId for recommended_config::RecommendedConfiguration {
     fn config_id(&self) -> &str {
         &self.launcher
@@ -62,6 +77,7 @@ pub struct Config {
     pub capabilities: HashMap<String, CapabilityConfig>,
     pub launchers: HashMap<String, LauncherConfig>,
     pub recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
+    pub(crate) hardware: HashMap<String, HardwareConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -377,6 +393,10 @@ impl Config {
         Ok(Self::config_dir()?.join("recommended_configs"))
     }
 
+    fn hardware_dir() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("hardware"))
+    }
+
     pub(crate) fn sessions_dir() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("sessions"))
     }
@@ -404,6 +424,7 @@ impl Config {
         fs::create_dir_all(Self::capabilities_dir()?)?;
         fs::create_dir_all(Self::launchers_dir()?)?;
         fs::create_dir_all(Self::recommended_configs_dir()?)?;
+        fs::create_dir_all(Self::hardware_dir()?)?;
         fs::create_dir_all(Self::sessions_dir()?)?;
         Ok(())
     }
@@ -500,6 +521,8 @@ impl Config {
         config.capabilities = Self::load_dir(capabilities_dir, |s| s.to_string())?;
         config.launchers = Self::load_dir(launchers_dir, |s| s.to_string())?;
         config.recommended_configs = Self::load_recommended_configs(recommended_configs_dir)?;
+        config.hardware = Self::load_dir(&Self::hardware_dir()?, |s| s.to_string())?;
+        config.report_hardware_problems();
 
         Ok(config)
     }
@@ -607,6 +630,13 @@ impl Config {
             let path = Self::launchers_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
             alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
             Self::save_yaml_to_file(&path, &launcher)?;
+        }
+
+        // Save individual hardware profile files
+        for (id, hardware) in &self.hardware {
+            let path = Self::hardware_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
+            alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
+            Self::save_yaml_to_file(&path, hardware)?;
         }
 
         Ok(())
@@ -741,6 +771,57 @@ impl Config {
             self.save()
         } else {
             Ok(())
+        }
+    }
+
+    // -- Hardware --
+
+    pub(crate) fn get_hardware(&self, id: &str) -> Option<&HardwareConfig> {
+        self.hardware.get(id)
+    }
+
+    pub(crate) fn insert_hardware(&mut self, id: &str, config: HardwareConfig) -> Result<()> {
+        self.hardware.insert(id.to_string(), config);
+        self.save()
+    }
+
+    /// Removes a hardware profile. `local` describes the machine granite-cli
+    /// runs on and cannot be removed.
+    pub(crate) fn remove_hardware(&mut self, id: &str) -> Result<()> {
+        if id == hardware::LOCAL_HARDWARE_ID {
+            anyhow::bail!("hardware profile '{id}' describes this machine and cannot be removed");
+        }
+        self.hardware.remove(id);
+        let path = Self::hardware_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        self.save()
+    }
+
+    /// Every hardware profile whose figures cannot be looked up, such as one
+    /// that uses a size a newer catalog no longer offers, with the reason,
+    /// sorted by id.
+    fn hardware_problems(&self) -> Vec<(String, String)> {
+        let mut problems: Vec<(String, String)> = self
+            .hardware
+            .iter()
+            .filter_map(|(id, hardware)| hardware.profile().err().map(|e| (id.clone(), e)))
+            .collect();
+        problems.sort();
+        problems
+    }
+
+    /// Warns about each of `hardware_problems` on load. The profiles stay
+    /// loaded, so the user can still see and fix them.
+    fn report_hardware_problems(&self) {
+        for (id, problem) in self.hardware_problems() {
+            alog_channel!(
+                MessageLevel::Warning,
+                "Hardware profile '{}': {}",
+                id,
+                problem
+            );
         }
     }
 
@@ -1001,5 +1082,108 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    // -- hardware profiles ------------------------------------------------------
+
+    fn hardware_dir() -> PathBuf {
+        Path::new(&std::env::var("GRANITE_CLI_HOME").unwrap()).join("hardware")
+    }
+
+    #[test]
+    fn hardware_profiles_are_saved_and_loaded() {
+        let _home = TestConfigHome::new();
+
+        let mut config = Config::new().unwrap();
+        let spark = HardwareConfig::catalog("spark", "dgx-spark", 128.0);
+        config.insert_hardware("spark", spark.clone()).unwrap();
+
+        assert!(hardware_dir().join("spark.yaml").exists());
+        let reloaded = Config::new().unwrap();
+        assert_eq!(reloaded.get_hardware("spark"), Some(&spark));
+    }
+
+    #[test]
+    fn a_size_the_catalog_no_longer_offers_is_reported_on_load() {
+        let _home = TestConfigHome::new();
+        fs::write(
+            hardware_dir().join("card.yaml"),
+            "hardware_id: card\ntype: nvidia-rtx-4090\nmemory: 48.0\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+
+        // Still loaded, so the user can see and fix it.
+        assert!(config.get_hardware("card").is_some());
+        assert_eq!(
+            config.hardware_problems(),
+            vec![(
+                "card".to_string(),
+                "'nvidia-rtx-4090' is not offered with 48 GB; the catalog lists 24 GB".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_headroom_factor_below_one_is_reported_on_load() {
+        let _home = TestConfigHome::new();
+        fs::write(
+            hardware_dir().join("card.yaml"),
+            "hardware_id: card\ntype: nvidia-rtx-4090\nmemory: 24.0\nheadroom: 0.9\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+
+        assert!(config.get_hardware("card").is_some());
+        assert_eq!(
+            config.hardware_problems(),
+            vec![(
+                "card".to_string(),
+                "headroom must be at least 1.0, got 0.9".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn local_hardware_profile_cannot_be_removed() {
+        let _home = TestConfigHome::new();
+        let mut config = Config::new().unwrap();
+        let local =
+            HardwareConfig::local_from_detection(crate::utils::HardwareProfile::with_memory(
+                crate::utils::hardware::Memory::System { ram_gb: 64.0 },
+            ));
+        config
+            .insert_hardware(hardware::LOCAL_HARDWARE_ID, local)
+            .unwrap();
+
+        let err = config
+            .remove_hardware(hardware::LOCAL_HARDWARE_ID)
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "hardware profile 'local' describes this machine and cannot be removed"
+        );
+        assert!(config.get_hardware(hardware::LOCAL_HARDWARE_ID).is_some());
+        assert!(hardware_dir().join("local.yaml").exists());
+    }
+
+    #[test]
+    fn other_hardware_profiles_can_be_removed() {
+        let _home = TestConfigHome::new();
+        let mut config = Config::new().unwrap();
+        config
+            .insert_hardware(
+                "spark",
+                HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+            )
+            .unwrap();
+
+        config.remove_hardware("spark").unwrap();
+
+        assert!(config.get_hardware("spark").is_none());
+        assert!(!hardware_dir().join("spark.yaml").exists());
     }
 }
