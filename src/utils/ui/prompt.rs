@@ -149,13 +149,11 @@ fn prompt_array(
         return Ok(Value::Array(vec![]));
     };
 
-    // A `Vec<PureUnitEnum>` -- every choice is a plain literal, none carry
-    // their own fields -- gets a single one-shot Multi-Select instead of the
-    // per-item "Add?" loop below.
-    if let Some(choices) = enum_choices(root, items_schema)
-        && choices.iter().all(|c| matches!(c, EnumChoice::Literal(_)))
-    {
-        return prompt_enum_array(ui, &choices, default, indent, label);
+    // A `Vec<Enum>` gets a single one-shot checklist (Multi-Select) instead
+    // of the per-item "Add?" loop below, so existing selections can be
+    // pre-checked and unchecked again.
+    if let Some(choices) = enum_choices(root, items_schema) {
+        return prompt_enum_array(ui, root, &choices, default, indent, label);
     }
 
     let default_items: Vec<Value> = default.as_array().cloned().unwrap_or_default();
@@ -170,15 +168,14 @@ fn prompt_array(
             break;
         }
         let item_default = next_default.unwrap_or_else(|| zero_value_for(items_schema));
-        let item = if let Some(choices) = enum_choices(root, items_schema) {
-            // Mixed enum (some choices carry their own fields, e.g. an
-            // escape-hatch variant) -- one Select per item, recursing into
-            // sub-fields for whichever choice is picked.
-            prompt_enum_scalar(ui, root, &choices, &item_default, &child_indent, label)?
-        } else {
-            prompt_value(ui, root, items_schema, &item_default, &child_indent, label)?
-        };
-        items.push(item);
+        items.push(prompt_value(
+            ui,
+            root,
+            items_schema,
+            &item_default,
+            &child_indent,
+            label,
+        )?);
     }
 
     Ok(Value::Array(items))
@@ -290,32 +287,59 @@ fn prompt_enum_scalar(
     }
 }
 
-/// One-shot Multi-Select over an array whose items are all `Literal`
-/// choices (a `Vec<PureUnitEnum>` field), replacing the generic per-item
-/// "Add?" loop with a single checklist prompt.
+/// One-shot Multi-Select over an array of enum items (a `Vec<Enum>` field),
+/// replacing the generic per-item "Add?" loop with a single checklist
+/// prompt. Choices present in `default` start checked. A checked `Literal`
+/// is emitted as-is; a checked `Tagged` choice (which carries its own
+/// fields) is prompted for those fields -- prefilled from the matching
+/// existing entries -- and may be repeated via "Add another?".
 fn prompt_enum_array(
     ui: &dyn Ui,
+    root: &Value,
     choices: &[EnumChoice],
     default: &Value,
     indent: &str,
     label: &str,
 ) -> anyhow::Result<Value> {
     let labels: Vec<String> = choices.iter().map(|c| c.label().to_string()).collect();
-    let default_items: Vec<&str> = default
-        .as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let defaults: Vec<bool> = labels
+    let default_items: Vec<Value> = default.as_array().cloned().unwrap_or_default();
+    let defaults: Vec<bool> = choices
         .iter()
-        .map(|l| default_items.contains(&l.as_str()))
+        .map(|c| match c {
+            EnumChoice::Literal(l) => default_items.iter().any(|v| v.as_str() == Some(l)),
+            EnumChoice::Tagged { key, .. } => {
+                default_items.iter().any(|v| v.get(key.as_str()).is_some())
+            }
+        })
         .collect();
     let chosen = ui.multi_select(&format!("{indent}{label}"), &labels, &defaults)?;
-    Ok(Value::Array(
-        chosen
-            .into_iter()
-            .map(|i| Value::String(labels[i].clone()))
-            .collect(),
-    ))
+
+    let child_indent = format!("{indent}  ");
+    let mut result = Vec::new();
+    for i in chosen {
+        match &choices[i] {
+            EnumChoice::Literal(s) => result.push(Value::String(s.clone())),
+            EnumChoice::Tagged { key, schema } => {
+                let mut existing = default_items
+                    .iter()
+                    .filter_map(|v| v.get(key.as_str()))
+                    .cloned();
+                let mut sub_default = existing.next().unwrap_or(Value::Null);
+                loop {
+                    let value = prompt_value(ui, root, schema, &sub_default, &child_indent, key)?;
+                    result.push(json!({ key: value }));
+                    let next = existing.next();
+                    let again =
+                        ui.confirm(&format!("{child_indent}Add another {key}?"), next.is_some())?;
+                    if !again {
+                        break;
+                    }
+                    sub_default = next.unwrap_or(Value::Null);
+                }
+            }
+        }
+    }
+    Ok(Value::Array(result))
 }
 
 /// Finds which choice `default` corresponds to, so the Select can pre-select
@@ -948,13 +972,12 @@ mod tests {
         }
 
         let ui = CaptureUi::default();
-        ui.confirm_answers.borrow_mut().push_back(true); // Add tools item? yes
-        ui.select_answers.borrow_mut().push_back(2); // choices[2] == "Mcp"
+        ui.multi_select_answers.borrow_mut().push_back(vec![2]); // choices[2] == "Mcp"
         ui.text_answers.borrow_mut().push_back("vision".to_string()); // server
         ui.text_answers
             .borrow_mut()
             .push_back("vlm_compare_images".to_string()); // tool
-        ui.confirm_answers.borrow_mut().push_back(false); // Add tools item? no more
+        ui.confirm_answers.borrow_mut().push_back(false); // Add another Mcp? no
 
         let schema = schemars::schema_for!(TestConfig);
         let result = prompt_from_schema(&ui, &schema, &json!({})).unwrap();
@@ -1026,13 +1049,11 @@ mod tests {
         ui.text_answers
             .borrow_mut()
             .push_back("You are a meticulous code reviewer.".to_string());
-        ui.confirm_answers.borrow_mut().push_back(true); // Add tools? yes
         // Flattened choice order: FileRead, FileWrite, FileEdit, WebFetch,
         // WebSearch (the shared enum group, in that order), then each
         // doc-commented unit variant's own const alternative -- Search,
         // FileSearch, Shell -- then Mcp, Other. Index 5 == "Search".
-        ui.select_answers.borrow_mut().push_back(5);
-        ui.confirm_answers.borrow_mut().push_back(false); // Add tools? no more
+        ui.multi_select_answers.borrow_mut().push_back(vec![5]);
 
         let schema = schemars::schema_for!(SubAgentCapabilityConfig);
         let result = prompt_from_schema(&ui, &schema, &json!({})).unwrap();
@@ -1048,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_from_schema_drives_mixed_enum_array_through_select_of_a_plain_literal() {
+    fn prompt_from_schema_multi_selects_a_plain_literal_from_a_mixed_enum() {
         use crate::utils::ui::base::tests::CaptureUi;
 
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -1065,14 +1086,47 @@ mod tests {
         }
 
         let ui = CaptureUi::default();
-        ui.confirm_answers.borrow_mut().push_back(true); // Add tools item? yes
-        ui.select_answers.borrow_mut().push_back(0); // choices[0] == "FileRead"
-        ui.confirm_answers.borrow_mut().push_back(false); // Add tools item? no more
+        ui.multi_select_answers.borrow_mut().push_back(vec![0]); // choices[0] == "FileRead"
 
         let schema = schemars::schema_for!(TestConfig);
         let result = prompt_from_schema(&ui, &schema, &json!({})).unwrap();
 
         assert_eq!(result, json!({"tools": ["FileRead"]}));
+    }
+
+    #[test]
+    fn prompt_from_schema_prechecks_existing_mixed_enum_selection_and_allows_unchecking() {
+        use crate::utils::ui::base::tests::CaptureUi;
+
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+        #[allow(dead_code)]
+        enum TestTool {
+            FileRead,
+            FileWrite,
+            Mcp { server: String },
+        }
+
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+        struct TestConfig {
+            tools: Vec<TestTool>,
+        }
+
+        let ui = CaptureUi::default();
+        // Uncheck FileRead, keep the Mcp entry (index 2) checked.
+        ui.multi_select_answers.borrow_mut().push_back(vec![2]);
+        ui.text_answers.borrow_mut().push_back("vision".to_string());
+
+        let defaults = json!({"tools": ["FileRead", {"Mcp": {"server": "old"}}]});
+        let schema = schemars::schema_for!(TestConfig);
+        let result = prompt_from_schema(&ui, &schema, &defaults).unwrap();
+
+        assert_eq!(result, json!({"tools": [{"Mcp": {"server": "vision"}}]}));
+        let prompts = ui.multi_select_prompts.borrow();
+        assert_eq!(prompts[0].2, vec![true, false, true]);
+        // One existing Mcp entry => "Add another?" defaults to false.
+        assert!(!ui.confirm_prompts.borrow()[0].1);
+        // The existing Mcp entry prefilled the text prompt.
+        assert_eq!(ui.text_prompts.borrow()[0].1, "old");
     }
 
     #[test]
