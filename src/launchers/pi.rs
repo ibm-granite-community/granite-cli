@@ -15,6 +15,7 @@ use crate::launchers::base::{
 };
 use crate::providers::ApiType;
 use crate::registry::{ConfigConstructable, ConstructError};
+use crate::utils::install::{InstallInfo, InstallMethod, MethodKind, Os};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -176,6 +177,7 @@ impl HasPiLauncherMetadata for PiLauncher {
             supported_capabilities: HashSet::from([BindingType::AgentModel]),
             mcp_transports: HashSet::new(),
             tags: vec!["pi".to_string(), "coding-agent".to_string()],
+            install: install_info(),
         }
     }
 }
@@ -700,6 +702,31 @@ fn same_dir(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// Install instructions for Pi.
+///
+/// Source, checked 2026-10-17: https://pi.dev and its install.sh, which asks
+/// "Start pi now?" from the terminal and installs into `~/.local/bin` or
+/// npm's global prefix.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("pi")
+        .page("https://pi.dev")
+        .method(InstallMethod::new(
+            Os::ANY,
+            MethodKind::Npm,
+            "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
+        ))
+        .method(
+            InstallMethod::new(
+                Os::UNIX,
+                MethodKind::Script,
+                "curl -fsSL https://pi.dev/install.sh | sh",
+            )
+            .attended()
+            .bin_dir("~/.local/bin"),
+        )
 }
 
 /*-- tests --*/

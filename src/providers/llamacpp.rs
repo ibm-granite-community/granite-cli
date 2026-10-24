@@ -5,6 +5,7 @@ use crate::providers::base::{
     ProviderError, ProviderMetadata, ProviderType,
 };
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
+use crate::utils::install::{InstallInfo, InstallMethod, MethodKind, Os};
 use crate::utils::ui::Ui;
 use crate::utils::ui::base::PullHandle;
 use async_trait::async_trait;
@@ -493,8 +494,30 @@ impl HasProviderMetadata for LlamaCppProvider {
                 "gguf".to_string(),
                 "high-performance".to_string(),
             ],
+            install: install_info(),
         }
     }
+}
+
+/// Install instructions for llama.cpp.
+///
+/// Source, checked 2026-10-17:
+/// https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("llama-server")
+        .page("https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md")
+        .run_command("llama-server")
+        .method(InstallMethod::new(
+            Os::UNIX,
+            MethodKind::Brew,
+            "brew install llama.cpp",
+        ))
+        .method(InstallMethod::new(
+            &[Os::Windows],
+            MethodKind::Winget,
+            "winget install llama.cpp",
+        ))
 }
 
 /*-- tests -------------------------------------------------------------------*/

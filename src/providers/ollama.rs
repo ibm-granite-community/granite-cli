@@ -5,6 +5,7 @@ use crate::providers::base::{
     ProviderError, ProviderMetadata, ProviderType, http_health_check,
 };
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
+use crate::utils::install::{InstallInfo, InstallMethod, MethodKind, Os};
 use crate::utils::ui::Ui;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -382,8 +383,54 @@ impl HasProviderMetadata for OllamaProvider {
                 "gguf".to_string(),
                 "multi-api".to_string(),
             ],
+            install: install_info(),
         }
     }
+}
+
+/// Install instructions for Ollama.
+///
+/// Sources, checked 2026-10-17: https://ollama.com/download (Linux script,
+/// Windows PowerShell script), the Homebrew formula `ollama`. The Linux and
+/// macOS script calls `sudo`. The Windows script runs the installer with
+/// `/VERYSILENT` and asks nothing.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("ollama")
+        .page("https://ollama.com/download")
+        .run_command("ollama serve")
+        .start_note(
+            &[Os::Mac],
+            "Homebrew can run it as a service: brew services start ollama",
+        )
+        .start_note(
+            &[Os::Linux],
+            "The install script sets up a systemd service: sudo systemctl start ollama",
+        )
+        .start_note(
+            &[Os::Windows],
+            "The Ollama app starts the server when it runs.",
+        )
+        .method(InstallMethod::new(
+            &[Os::Mac],
+            MethodKind::Brew,
+            "brew install ollama",
+        ))
+        .method(
+            // install.sh exits on anything but Linux.
+            InstallMethod::new(
+                &[Os::Linux],
+                MethodKind::Script,
+                "curl -fsSL https://ollama.com/install.sh | sh",
+            )
+            .attended()
+            .bin_dir("/usr/local/bin"),
+        )
+        .method(InstallMethod::new(
+            &[Os::Windows],
+            MethodKind::Script,
+            "irm https://ollama.com/install.ps1 | iex",
+        ))
 }
 
 /*-- tests -------------------------------------------------------------------*/

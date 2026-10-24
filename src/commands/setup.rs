@@ -11,6 +11,7 @@ use crate::commands::capability::CapabilityCommands;
 use crate::commands::launcher::LauncherCommands;
 use crate::commands::model::ModelCommands;
 use crate::commands::provider::ProviderCommands;
+use crate::commands::shared::install::InstallOutcome;
 use crate::config::recommended_config;
 use crate::dependency::{Configured, Requirement};
 use crate::launchers::LAUNCHER_REGISTRY;
@@ -19,6 +20,7 @@ use crate::models::{
 };
 use crate::providers::{HealthStatus, PROVIDER_REGISTRY, Provider};
 use crate::utils::hardware::{HardwareProfile, detect_hardware};
+use crate::utils::install::InstallInfo;
 
 use_channel!("SETUP");
 
@@ -68,6 +70,122 @@ pub struct DiscoveryResult {
 }
 
 /*-- private --*/
+
+/// After discovery runs again, mark each launcher in `paths` as found at its
+/// path. Discovery looks only on PATH, and these were installed elsewhere.
+fn mark_installed_off_path(
+    discovery: &mut DiscoveryResult,
+    paths: &HashMap<String, std::path::PathBuf>,
+) {
+    for rec in &mut discovery.recommendations {
+        if let Recommendation::Launcher {
+            launcher_type,
+            binary_path,
+            ..
+        } = rec
+            && binary_path.is_none()
+            && let Some(path) = paths.get(launcher_type)
+        {
+            *binary_path = Some(path.display().to_string());
+        }
+    }
+}
+
+/// Set `command_path` on each launcher in `selected` that was installed off
+/// PATH in this run, so it resolves at launch.
+fn set_install_paths(
+    ctx: &mut crate::AppContext,
+    selected: &HashSet<String>,
+    paths: &HashMap<String, std::path::PathBuf>,
+) {
+    let mut paths: Vec<_> = paths.iter().collect();
+    paths.sort();
+    for (id, path) in paths {
+        if !selected.contains(id) {
+            continue;
+        }
+        let Some(mut launcher) = ctx.config().get_launcher(id).cloned() else {
+            continue;
+        };
+        // A command_path the user entered in this run is theirs to keep.
+        if launcher.config["command_path"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty())
+        {
+            continue;
+        }
+        launcher.config["command_path"] = serde_json::Value::String(path.display().to_string());
+        if let Err(e) = ctx.config_mut().insert_launcher(id, launcher) {
+            ctx.ui
+                .warn(&format!("Failed to save command_path for '{id}': {e}"));
+        } else {
+            ctx.ui.info(&format!(
+                "  command_path set to {} for '{id}'.",
+                path.display()
+            ));
+        }
+    }
+}
+
+/// What the wizard's install step did.
+#[derive(Default)]
+struct InstallStep {
+    /// Launcher types installed in this run.
+    launchers: HashSet<String>,
+    /// Launcher types installed in this run into a directory that is not on
+    /// PATH, with where the binary is.
+    launcher_paths: HashMap<String, std::path::PathBuf>,
+    /// Provider types installed in this run.
+    providers: HashSet<String>,
+    /// Whether discovery should run again.
+    rediscover: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallKind {
+    Launcher,
+    Provider,
+}
+
+impl InstallKind {
+    /// The types of this kind that granite-cli can offer to install, sorted
+    /// by id, as (id, name, install info): every launcher type, and the
+    /// local provider types.
+    fn types(self) -> Vec<(String, String, InstallInfo)> {
+        let mut types: Vec<(String, String, InstallInfo)> = match self {
+            InstallKind::Launcher => LAUNCHER_REGISTRY
+                .entries()
+                .into_iter()
+                .map(|(id, md)| (id.to_string(), md.name, md.install))
+                .collect(),
+            InstallKind::Provider => PROVIDER_REGISTRY
+                .entries()
+                .into_iter()
+                .filter(|(_, md)| md.provider_type == crate::providers::ProviderType::Local)
+                .map(|(id, md)| (id.to_string(), md.name, md.install))
+                .collect(),
+        };
+        types.sort_by(|a, b| a.0.cmp(&b.0));
+        types
+    }
+}
+
+/// [`InstallKind::types`] without the names.
+fn id_and_info(kind: InstallKind) -> Vec<(String, InstallInfo)> {
+    kind.types()
+        .into_iter()
+        .map(|(id, _, info)| (id, info))
+        .collect()
+}
+
+/// A type the user ticked in the install step, with the method to run.
+struct InstallChoice {
+    id: String,
+    name: String,
+    info: InstallInfo,
+    method: crate::utils::install::InstallMethod,
+    kind: InstallKind,
+}
 
 /// Discovers all available providers, models, launchers, and capabilities,
 /// returning structured recommendations and a list of already-configured items.
@@ -1174,9 +1292,15 @@ impl SetupCommands {
     /// Entry point for `granite-cli setup`.
     /// `pull`: `Some(true)` => pull without prompting, `Some(false)` => skip
     /// pull, `None` => prompt in interactive mode / no pull in auto mode.
-    pub async fn run(ctx: &mut crate::AppContext, auto: bool, pull: Option<bool>) -> Result<()> {
+    /// `install` names the types `--auto` installs before discovery.
+    pub async fn run(
+        ctx: &mut crate::AppContext,
+        auto: bool,
+        pull: Option<bool>,
+        install: &[String],
+    ) -> Result<()> {
         if auto {
-            Self::run_auto(ctx, pull).await
+            Self::run_auto(ctx, pull, install).await
         } else {
             Self::run_wizard(ctx, pull).await
         }
@@ -1193,7 +1317,16 @@ impl SetupCommands {
         // capabilities against the same hardware profile discovery used,
         // rather than re-detecting (and potentially disagreeing).
         let hardware = detect_hardware();
-        let discovery = Discover::run_with_hardware(ctx, &hardware).await;
+        let mut discovery = Discover::run_with_hardware(ctx, &hardware).await;
+
+        // Offer installs right after discovery, then discover again so the
+        // phases below see what was installed (spec 0028, decision 6).
+        let installed = Self::install_step(ctx, &discovery).await?;
+        if installed.rediscover {
+            ui.info("\nDiscovering available components again...\n");
+            discovery = Discover::run_with_hardware(ctx, &hardware).await;
+            mark_installed_off_path(&mut discovery, &installed.launcher_paths);
+        }
 
         if discovery.recommendations.is_empty()
             && discovery.configured_provider_ids.is_empty()
@@ -1208,7 +1341,8 @@ impl SetupCommands {
         }
 
         // Phase 1: Launchers selection (show all detected launchers)
-        let selected_launchers = Self::select_launchers(ctx, &discovery).await?;
+        let selected_launchers =
+            Self::select_launchers(ctx, &discovery, &installed.launchers).await?;
 
         // Phase 2: Capabilities selection (filtered by what the selected
         // launchers can actually bind, pre-selected only where a
@@ -1221,7 +1355,8 @@ impl SetupCommands {
             Self::select_models(ctx, &discovery, &selected_caps, &selected_launchers).await?;
 
         // Phase 4: Providers selection (only healthy, filtered by model compatibility)
-        let selected_providers = Self::select_providers(ctx, &discovery, &selected_models).await?;
+        let selected_providers =
+            Self::select_providers(ctx, &discovery, &selected_models, &installed.providers).await?;
 
         // Phase 4.5: Variant selection (limited to formats the selected
         // providers can actually run, with a VRAM estimate at full context)
@@ -1275,6 +1410,7 @@ impl SetupCommands {
             &recommended_capability_types_by_launcher,
         )
         .await?;
+        set_install_paths(ctx, &selected_launchers, &installed.launcher_paths);
 
         // Phase 6: Pull (optional)
         match pull {
@@ -1290,14 +1426,19 @@ impl SetupCommands {
             &selected_launchers,
             &selected_providers,
             &selected_models,
+            true,
         );
 
         Ok(())
     }
 
     /// Run auto mode — detect, configure everything with defaults.
-    async fn run_auto(ctx: &mut crate::AppContext, pull: Option<bool>) -> Result<()> {
-        Self::run_auto_with_hardware(ctx, &detect_hardware(), pull).await
+    async fn run_auto(
+        ctx: &mut crate::AppContext,
+        pull: Option<bool>,
+        install: &[String],
+    ) -> Result<()> {
+        Self::run_auto_with_hardware(ctx, &detect_hardware(), pull, install).await
     }
 
     /// Hardware-aware variant of `run_auto` for testability.
@@ -1305,15 +1446,44 @@ impl SetupCommands {
         ctx: &mut crate::AppContext,
         hardware: &crate::utils::hardware::HardwareProfile,
         pull: Option<bool>,
+        install: &[String],
+    ) -> Result<()> {
+        ctx.ui.info("=== granite-cli Auto Setup ===\n");
+        let (installed_all, launcher_paths) = Self::auto_install(ctx, install).await?;
+        ctx.ui
+            .info("Auto-detecting and configuring all available components...\n");
+        let discovery = Discover::run_with_hardware(ctx, hardware).await;
+        Self::auto_configure(
+            ctx,
+            hardware,
+            pull,
+            discovery,
+            installed_all,
+            &launcher_paths,
+        )
+        .await
+    }
+
+    /// Everything `setup --auto` does after discovery, given what discovery
+    /// found and whether every type named with `--install` was installed.
+    /// Exits with an error at the end when one was not.
+    async fn auto_configure(
+        ctx: &mut crate::AppContext,
+        hardware: &crate::utils::hardware::HardwareProfile,
+        pull: Option<bool>,
+        mut discovery: DiscoveryResult,
+        installed_all: bool,
+        launcher_paths: &HashMap<String, std::path::PathBuf>,
     ) -> Result<()> {
         let ui = &*ctx.ui;
-        ui.info("=== granite-cli Auto Setup ===\n");
-        ui.info("Auto-detecting and configuring all available components...\n");
-
-        let discovery = Discover::run_with_hardware(ctx, hardware).await;
+        mark_installed_off_path(&mut discovery, launcher_paths);
+        Self::warn_missing(ctx, &discovery);
 
         if discovery.recommendations.is_empty() {
             ui.info("No components available to configure.");
+            if !installed_all {
+                anyhow::bail!("Not every type named with --install was installed.");
+            }
             return Ok(());
         }
 
@@ -1354,6 +1524,7 @@ impl SetupCommands {
             &selection.recommended_capability_types_by_launcher,
         )
         .await?;
+        set_install_paths(ctx, &selected_launchers, launcher_paths);
 
         // Only pull if explicitly requested via --pull; never prompt in auto mode.
         if pull == Some(true) {
@@ -1365,8 +1536,12 @@ impl SetupCommands {
             &selected_launchers,
             &selection.providers,
             &selection.models,
+            false,
         );
 
+        if !installed_all {
+            anyhow::bail!("Not every type named with --install was installed.");
+        }
         Ok(())
     }
 
@@ -1668,9 +1843,269 @@ impl SetupCommands {
     const CONFIGURE_DIFFERENT_PROVIDER_LABEL: &'static str = "→ Configure a different provider…";
     const CONFIGURE_DIFFERENT_MODELS_LABEL: &'static str = "→ Configure a different models…";
 
+    /// The wizard's install step (spec 0028, sub-task 7). For launchers, then
+    /// providers, when `discovery` found none of that kind and none is
+    /// configured, list the types with a method that can run here and let the
+    /// user tick the ones to install. Nothing is ticked, so Enter installs
+    /// nothing. The chosen commands are repeated and confirmed once, then run
+    /// in order; a failure is reported and the rest go on. Each provider
+    /// installed, or found on PATH and not answering, gets its start instructions,
+    /// and the user is asked once whether to check again.
+    ///
+    /// granite-cli starts no server. The caller runs discovery again when
+    /// `rediscover` is set.
+    async fn install_step(
+        ctx: &crate::AppContext,
+        discovery: &DiscoveryResult,
+    ) -> Result<InstallStep> {
+        let ui = &*ctx.ui;
+        let mut step = InstallStep::default();
+        if !ui.is_interactive() || !ui.can_lend_terminal() {
+            return Ok(step);
+        }
+
+        let mut chosen: Vec<InstallChoice> = Vec::new();
+        let mut not_running: Vec<String> = Vec::new();
+
+        let launcher_found = discovery.recommendations.iter().any(|r| {
+            matches!(
+                r,
+                Recommendation::Launcher {
+                    binary_path: Some(_),
+                    ..
+                }
+            )
+        });
+        if !launcher_found && discovery.configured_launcher_ids.is_empty() {
+            ui.info("No agent tools were found on this machine.");
+            let candidates = InstallKind::Launcher
+                .types()
+                .into_iter()
+                .map(|(id, name, info)| (id, name, info, InstallKind::Launcher))
+                .collect();
+            chosen.extend(Self::pick_installs(
+                ctx,
+                candidates,
+                "Select agent tools to install",
+                &mut not_running,
+            )?);
+        }
+
+        let provider_found = discovery.recommendations.iter().any(|r| {
+            matches!(
+                r,
+                Recommendation::Provider {
+                    health_healthy: true,
+                    ..
+                }
+            )
+        });
+        if !provider_found && discovery.configured_provider_ids.is_empty() {
+            ui.info("No model server is answering on this machine.");
+            let candidates = InstallKind::Provider
+                .types()
+                .into_iter()
+                .map(|(id, name, info)| (id, name, info, InstallKind::Provider))
+                .collect();
+            chosen.extend(Self::pick_installs(
+                ctx,
+                candidates,
+                "Select model servers to install",
+                &mut not_running,
+            )?);
+            ui.info("  Hosted providers can be added in the Providers step.");
+        }
+
+        if !chosen.is_empty() {
+            ui.info("These commands will run:");
+            for c in &chosen {
+                ui.info(&format!("  {}", c.method.command));
+            }
+            if ui.confirm("Run them now?", true)? {
+                for c in &chosen {
+                    let outcome = crate::commands::shared::install::install_with(
+                        ctx, &c.name, &c.info, &c.method,
+                    )
+                    .await?;
+                    if let InstallOutcome::Installed { path, off_path } = outcome {
+                        step.rediscover = true;
+                        match c.kind {
+                            InstallKind::Launcher => {
+                                step.launchers.insert(c.id.clone());
+                                if let (Some(path), true) = (path, off_path) {
+                                    step.launcher_paths.insert(c.id.clone(), path);
+                                }
+                            }
+                            InstallKind::Provider => {
+                                step.providers.insert(c.id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        use crate::commands::shared::install::{
+            ServerProgram, WOULD_YOU_LIKE_TO, show_not_answering,
+        };
+        let env = ctx.install_env();
+        let mut installed: Vec<String> = Vec::new();
+        let mut just_installed: Vec<&String> = step.providers.iter().collect();
+        just_installed.sort();
+        for id in just_installed {
+            // An install can start the server, as Ollama's Linux script does
+            // with its service.
+            let config = PROVIDER_REGISTRY
+                .default_config(id)
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !matches!(env.check_provider(id, &config).await, Ok(s) if s.healthy) {
+                installed.push(id.clone());
+            }
+        }
+        if !installed.is_empty() || !not_running.is_empty() {
+            let waiting = installed
+                .iter()
+                .map(|id| (id, true))
+                .chain(not_running.iter().map(|id| (id, false)));
+            for (id, was_installed) in waiting {
+                let Some(md) = PROVIDER_REGISTRY.get(id) else {
+                    continue;
+                };
+                let found = md.install.program.as_deref().and_then(|p| env.find(p));
+                let program = match (&found, was_installed) {
+                    (_, true) => ServerProgram::Installed,
+                    (Some(path), false) => ServerProgram::FoundAt(path),
+                    (None, false) => ServerProgram::Unknown,
+                };
+                show_not_answering(
+                    ui,
+                    &*env,
+                    &md.name,
+                    program,
+                    &md.default_endpoint,
+                    &md.install,
+                );
+            }
+            // Like `provider setup`, check again until every provider
+            // answers or the user continues without the rest.
+            let items = vec![
+                "Check again".to_string(),
+                "Continue without them".to_string(),
+            ];
+            let mut waiting: Vec<String> = installed.into_iter().chain(not_running).collect();
+            while ui.select(WOULD_YOU_LIKE_TO, &items, 1).ok() == Some(0) {
+                step.rediscover = true;
+                let mut still = Vec::new();
+                for id in waiting {
+                    let Some(md) = PROVIDER_REGISTRY.get(&id) else {
+                        continue;
+                    };
+                    let config = PROVIDER_REGISTRY
+                        .default_config(&id)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    if !matches!(env.check_provider(&id, &config).await, Ok(s) if s.healthy) {
+                        ui.warn(&format!(
+                            "{} is still not answering at {}.",
+                            md.name, md.default_endpoint
+                        ));
+                        still.push(id);
+                    }
+                }
+                if still.is_empty() {
+                    break;
+                }
+                waiting = still;
+            }
+        }
+
+        Ok(step)
+    }
+
+    /// List the types in `candidates` that cannot be installed here, then
+    /// show those that can as a multi-select with nothing ticked, and return
+    /// the ticked ones. The list comes first so that it can inform the
+    /// choice. A provider whose program is already on PATH
+    /// is not offered: its id is pushed to `not_running` instead.
+    fn pick_installs(
+        ctx: &crate::AppContext,
+        candidates: Vec<(String, String, InstallInfo, InstallKind)>,
+        prompt: &str,
+        not_running: &mut Vec<String>,
+    ) -> Result<Vec<InstallChoice>> {
+        let ui = &*ctx.ui;
+        let env = ctx.install_env();
+        let candidates_kind = candidates.first().map(|c| c.3);
+        let mut offered: Vec<InstallChoice> = Vec::new();
+        let mut running_hint: Vec<String> = Vec::new();
+        let mut unavailable: Vec<String> = Vec::new();
+
+        for (id, name, info, kind) in candidates {
+            if kind == InstallKind::Provider
+                && let Some(program) = &info.program
+                && env.find(program).is_some()
+            {
+                running_hint.push(match &info.run_command {
+                    Some(run) => format!("{id} (start it with `{run}`)"),
+                    None => id.clone(),
+                });
+                not_running.push(id);
+                continue;
+            }
+            match crate::commands::shared::install::first_method(ctx, &info) {
+                Ok(method) => offered.push(InstallChoice {
+                    id,
+                    name,
+                    info,
+                    method,
+                    kind,
+                }),
+                Err(Some(reason)) => unavailable.push(format!("{id} ({reason})")),
+                Err(None) => unavailable.push(id),
+            }
+        }
+
+        if !running_hint.is_empty() {
+            ui.info(&format!(
+                "  Found on PATH, not answering: {}.",
+                running_hint.join(", ")
+            ));
+        }
+        if !unavailable.is_empty() {
+            ui.info(&format!(
+                "  Not installable here: {}.",
+                unavailable.join(", ")
+            ));
+            let noun = if candidates_kind == Some(InstallKind::Provider) {
+                "provider"
+            } else {
+                "launcher"
+            };
+            ui.info(&format!(
+                "  Run `granite-cli {noun} info <type>` for instructions."
+            ));
+        }
+        let mut picked = Vec::new();
+        if !offered.is_empty() {
+            let items: Vec<String> = offered
+                .iter()
+                .map(|c| format!("{}  {}  {}", c.id, c.name, c.method.command))
+                .collect();
+            let selected = ui.multi_select(prompt, &items, &vec![false; items.len()])?;
+            for (i, choice) in offered.into_iter().enumerate() {
+                if selected.contains(&i) {
+                    picked.push(choice);
+                }
+            }
+        }
+        Ok(picked)
+    }
+
+    /// `ticked` names launcher types installed in this run, which start
+    /// ticked.
     async fn select_launchers(
         ctx: &mut crate::AppContext,
         discovery: &DiscoveryResult,
+        ticked: &HashSet<String>,
     ) -> Result<HashSet<String>> {
         let ui = ctx.ui.clone(); // owned Arc<dyn Ui>: doesn't borrow `ctx`, so it stays usable across the later `&mut ctx` calls into LauncherCommands::setup
 
@@ -1700,7 +2135,10 @@ impl SetupCommands {
                 .iter()
                 .map(|(id, name, path)| format!("{id} — {name} ({path})"))
                 .collect();
-            let mut defaults = vec![false; items.len()];
+            let mut defaults: Vec<bool> = filtered
+                .iter()
+                .map(|(id, ..)| ticked.contains(id))
+                .collect();
             for id in &manual {
                 items.push(format!("{id} — manually configured"));
                 defaults.push(true); // pre-checked: the user just configured it
@@ -1753,7 +2191,14 @@ impl SetupCommands {
 
             let before: HashMap<String, crate::config::LauncherConfig> =
                 ctx.config().launchers.clone();
-            LauncherCommands::setup(ctx, &chosen_type, None, false).await?;
+            // A launcher that could not be set up, for example because its
+            // tool is not installed, leaves the rest of the wizard intact.
+            // Every error is reported this way, including a TUI pane closed
+            // with Esc; the next prompt then fails and ends the wizard.
+            if let Err(e) = LauncherCommands::setup(ctx, &chosen_type, None, false).await {
+                ui.error(&format!("Launcher setup failed: {e}"));
+                continue;
+            }
             if let Some(new_id) = changed_launcher_id(&before, ctx)
                 && !manual.contains(&new_id)
                 && !filtered.iter().any(|(id, ..)| id == &new_id)
@@ -1764,10 +2209,13 @@ impl SetupCommands {
         }
     }
 
+    /// `ticked` names provider types installed in this run, which start
+    /// ticked when they are healthy.
     async fn select_providers(
         ctx: &mut crate::AppContext,
         discovery: &DiscoveryResult,
         selected_models: &HashSet<String>,
+        ticked: &HashSet<String>,
     ) -> Result<HashSet<String>> {
         let ui = ctx.ui.clone(); // owned Arc<dyn Ui>: doesn't borrow `ctx`, so it stays usable across the later `&mut ctx` calls into ProviderCommands::setup
 
@@ -1818,7 +2266,10 @@ impl SetupCommands {
                     format!("{id} — {name} ({status})")
                 })
                 .collect();
-            let mut defaults = vec![false; items.len()];
+            let mut defaults: Vec<bool> = filtered
+                .iter()
+                .map(|(id, ..)| ticked.contains(id))
+                .collect();
             for id in &configured {
                 items.push(format!("{id} — configured"));
                 defaults.push(true);
@@ -2679,23 +3130,267 @@ impl SetupCommands {
 
     /*-- Summary phase -------------------------------------------------------*/
 
+    /// Install each type named with `--install` that is not already
+    /// installed, before discovery, with its first applicable method. A
+    /// provider installed
+    /// this way is not started: its run command is shown. Returns whether
+    /// every named type was installed, and the launchers installed into a
+    /// directory that is not on PATH, with where their binary is. An unknown
+    /// type, one with no method that runs here, and a failed install are
+    /// reported and setup goes on.
+    async fn auto_install(
+        ctx: &crate::AppContext,
+        names: &[String],
+    ) -> Result<(bool, HashMap<String, std::path::PathBuf>)> {
+        let ui = &*ctx.ui;
+        let mut all = true;
+        let mut launcher_paths = HashMap::new();
+        for name in names {
+            let (display, info, is_provider) = if let Some(md) = LAUNCHER_REGISTRY.get(name) {
+                (md.name, md.install, false)
+            } else if let Some(md) = PROVIDER_REGISTRY.get(name) {
+                (md.name, md.install, true)
+            } else {
+                ui.error(&format!(
+                    "Cannot install '{name}': it is not a launcher or provider type."
+                ));
+                all = false;
+                continue;
+            };
+            if let Some(found) = Self::already_installed(ctx, name, &info, is_provider) {
+                ui.info(&ui.ok(&format!("✓ {display} is already installed: {found}.")));
+                continue;
+            }
+            ui.info(&format!("Installing {name}:"));
+            let outcome =
+                crate::commands::shared::install::install_unattended(ctx, &display, &info).await?;
+            let InstallOutcome::Installed { path, off_path } = outcome else {
+                all = false;
+                continue;
+            };
+            if !is_provider
+                && off_path
+                && let Some(path) = path
+            {
+                launcher_paths.insert(name.clone(), path);
+            }
+            if is_provider && let Some(run) = &info.run_command {
+                ui.info(&format!(
+                    "  granite-cli does not start {display}. Start it with `{run}`, \
+                     then run setup again."
+                ));
+            }
+        }
+        if !names.is_empty() {
+            ui.info("");
+        }
+        Ok((all, launcher_paths))
+    }
+
+    /// Where a type named with `--install` already is, if it is: configured
+    /// as an instance, or with its program on PATH. Installing it again would
+    /// download it again, and could fail on a registry that is down although
+    /// the tool is there.
+    fn already_installed(
+        ctx: &crate::AppContext,
+        type_id: &str,
+        info: &InstallInfo,
+        is_provider: bool,
+    ) -> Option<String> {
+        let config = ctx.config();
+        let configured = if is_provider {
+            config
+                .providers
+                .iter()
+                .find(|(_, p)| p.provider_type == type_id)
+                .map(|(id, _)| id.clone())
+        } else {
+            config
+                .launchers
+                .iter()
+                .find(|(_, l)| l.launcher_type == type_id)
+                .map(|(id, _)| id.clone())
+        };
+        if let Some(id) = configured {
+            return Some(format!("configured as '{id}'"));
+        }
+        let program = info.program.as_ref()?;
+        let path = ctx.install_env().find(program)?;
+        Some(path.display().to_string())
+    }
+
+    /// Warn, for launchers and then for local providers, when discovery found
+    /// none of that kind and none is configured, naming the command `--auto
+    /// --install` would run for each type that can be installed here.
+    fn warn_missing(ctx: &crate::AppContext, discovery: &DiscoveryResult) {
+        let launcher_found = discovery.recommendations.iter().any(|r| {
+            matches!(
+                r,
+                Recommendation::Launcher {
+                    binary_path: Some(_),
+                    ..
+                }
+            )
+        });
+        if !launcher_found && discovery.configured_launcher_ids.is_empty() {
+            Self::warn_kind(
+                ctx,
+                "No launcher found.",
+                id_and_info(InstallKind::Launcher),
+            );
+        }
+
+        let provider_found = discovery.recommendations.iter().any(|r| {
+            matches!(
+                r,
+                Recommendation::Provider {
+                    health_healthy: true,
+                    ..
+                }
+            )
+        });
+        if !provider_found && discovery.configured_provider_ids.is_empty() {
+            Self::warn_kind(
+                ctx,
+                "No model server answering.",
+                id_and_info(InstallKind::Provider),
+            );
+        }
+    }
+
+    /// One `warn_missing` warning: `headline`, then each type in `types`
+    /// that can be installed here without input, with its command.
+    fn warn_kind(ctx: &crate::AppContext, headline: &str, types: Vec<(String, InstallInfo)>) {
+        let ui = &*ctx.ui;
+        let env = ctx.install_env();
+        // A provider whose program is on PATH but that did not answer gets
+        // its run command; installing it again would not make it answer.
+        let (on_path, types): (Vec<_>, Vec<_>) = types.into_iter().partition(|(_, info)| {
+            info.run_command.is_some()
+                && info
+                    .program
+                    .as_deref()
+                    .is_some_and(|p| env.find(p).is_some())
+        });
+        for (id, info) in &on_path {
+            if let (Some(run), Some(program)) = (&info.run_command, &info.program) {
+                ui.warn(&format!(
+                    "'{program}' was found on PATH, but {id} is not answering. \
+                     Start it with `{run}`, then run setup again."
+                ));
+            }
+        }
+        if !on_path.is_empty()
+            && types
+                .iter()
+                .all(|(_, i)| crate::commands::shared::install::first_method(ctx, i).is_err())
+        {
+            return;
+        }
+        let installable: Vec<(String, String)> = types
+            .iter()
+            .filter_map(|(id, info)| {
+                crate::commands::shared::install::first_method(ctx, info)
+                    .ok()
+                    .map(|m| (id.clone(), m.command))
+            })
+            .collect();
+        // The block goes to one stream, so that `2>/dev/null` or `| tee`
+        // does not separate the headline from its commands.
+        let Some((first, _)) = installable.first() else {
+            let mut missing: Vec<String> = types
+                .iter()
+                .filter_map(|(_, info)| {
+                    crate::commands::shared::install::first_method(ctx, info)
+                        .err()
+                        .flatten()
+                })
+                .map(|reason| reason.to_string())
+                .collect();
+            missing.sort();
+            missing.dedup();
+            let why = if missing.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", missing.join(", "))
+            };
+            ui.info(&ui.warn_mark(&format!(
+                "⚠ {headline} Nothing can be installed here{why}; \
+                 run `granite-cli setup` for instructions."
+            )));
+            return;
+        };
+        ui.info(&ui.warn_mark(&format!("⚠ {headline} To install one:")));
+        let width = installable
+            .iter()
+            .map(|(id, _)| id.len())
+            .max()
+            .unwrap_or(0);
+        for (id, command) in &installable {
+            ui.info(&format!("    {id:<width$}  {command}"));
+        }
+        ui.info(&format!(
+            "  or let setup install it: granite-cli setup --auto --install {first}"
+        ));
+    }
+
+    /// The first type of `kind`, by id, that is not on PATH and has an
+    /// install method that can run here; for providers, among
+    /// local types only. Used for the summary's hint when a kind ends empty.
+    fn installable_type(ctx: &crate::AppContext, kind: InstallKind) -> Option<String> {
+        let types = id_and_info(kind);
+        let env = ctx.install_env();
+        types
+            .into_iter()
+            .filter(|(_, info)| {
+                info.program
+                    .as_deref()
+                    .is_none_or(|p| env.find(p).is_none())
+            })
+            .find(|(_, info)| crate::commands::shared::install::first_method(ctx, info).is_ok())
+            .map(|(id, _)| id)
+    }
+
+    /// The summary's line for a kind that ended empty: a setup command for a
+    /// type that can be installed here, or where to read how to install one.
+    fn install_hint(ctx: &crate::AppContext, kind: InstallKind) -> String {
+        let noun = match kind {
+            InstallKind::Launcher => "launcher",
+            InstallKind::Provider => "provider",
+        };
+        match Self::installable_type(ctx, kind) {
+            Some(id) => format!("  Install one with `granite-cli {noun} setup {id}`."),
+            None => format!("  Run `granite-cli {noun} info <type>` to see how to install one."),
+        }
+    }
+
     fn print_summary(
         ctx: &crate::AppContext,
         selected_caps: &HashSet<String>,
         selected_launchers: &HashSet<String>,
         selected_providers: &HashSet<String>,
         selected_models: &HashSet<String>,
+        install_hints: bool,
     ) {
         let ui = &*ctx.ui;
 
         ui.info("\n=== Setup Complete ===");
         ui.info(&format!("Providers: {}", summary_list(selected_providers)));
+        if install_hints && selected_providers.is_empty() {
+            ui.info(&Self::install_hint(ctx, InstallKind::Provider));
+        }
         ui.info(&format!("Models: {}", summary_list(selected_models)));
         ui.info(&format!("Launchers: {}", summary_list(selected_launchers)));
+        if install_hints && selected_launchers.is_empty() {
+            ui.info(&Self::install_hint(ctx, InstallKind::Launcher));
+        }
         ui.info(&format!("Capabilities: {}", summary_list(selected_caps)));
 
         ui.info("\nRun `granite-cli launcher list` to see configured launchers.");
-        if let Some(first_launcher) = selected_launchers.iter().min() {
+        // A launch needs a provider; with none, the install hint above is
+        // the next step.
+        let has_provider = !selected_providers.is_empty() || !ctx.config().providers.is_empty();
+        if has_provider && let Some(first_launcher) = selected_launchers.iter().min() {
             ui.info(&format!(
                 "Run `granite-cli launch {first_launcher}` to launch with Granite overlay.",
             ));
@@ -2784,6 +3479,733 @@ mod tests {
             },
         );
         ctx
+    }
+
+    fn empty_discovery() -> DiscoveryResult {
+        DiscoveryResult {
+            recommendations: vec![],
+            all_model_candidates: vec![],
+            configured_provider_ids: vec![],
+            configured_model_ids: vec![],
+            configured_launcher_ids: vec![],
+            configured_capability_ids: vec![],
+        }
+    }
+
+    fn capture_ui(ctx: &crate::AppContext) -> &CaptureUi {
+        (&*ctx.ui as &dyn std::any::Any)
+            .downcast_ref::<CaptureUi>()
+            .expect("test contexts are built with a CaptureUi")
+    }
+
+    // -- install_step ------------------------------------------------------------
+
+    fn ctx_on(
+        env: crate::utils::test_support::FakeInstallEnv,
+    ) -> (
+        crate::AppContext,
+        Arc<crate::utils::test_support::FakeInstallEnv>,
+    ) {
+        let env = Arc::new(env);
+        let mut ctx = test_ctx();
+        ctx.set_install_env(env.clone());
+        (ctx, env)
+    }
+
+    fn launcher_found(id: &str) -> Recommendation {
+        Recommendation::Launcher {
+            launcher_type: id.to_string(),
+            launcher_name: id.to_string(),
+            binary_path: Some(format!("/usr/bin/{id}")),
+        }
+    }
+
+    fn provider_healthy(id: &'static str) -> Recommendation {
+        Recommendation::Provider {
+            provider_type: id,
+            provider_name: id.to_string(),
+            health_healthy: true,
+            health_error: None,
+        }
+    }
+
+    fn discovery_with(recommendations: Vec<Recommendation>) -> DiscoveryResult {
+        DiscoveryResult {
+            recommendations,
+            ..empty_discovery()
+        }
+    }
+
+    fn multi_prompts(ctx: &crate::AppContext) -> Vec<String> {
+        capture_ui(ctx)
+            .multi_select_prompts
+            .borrow()
+            .iter()
+            .map(|p| p.0.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn install_step_is_skipped_when_a_launcher_and_a_provider_are_detected() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, env) = ctx_on(FakeInstallEnv::new(Os::Linux).with_programs(&["npm"]));
+        let discovery =
+            discovery_with(vec![launcher_found("opencode"), provider_healthy("ollama")]);
+
+        let step = SetupCommands::install_step(&ctx, &discovery).await.unwrap();
+
+        assert!(!step.rediscover);
+        assert!(multi_prompts(&ctx).is_empty());
+        assert!(capture_ui(&ctx).infos.borrow().is_empty());
+        assert!(env.runs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_step_offers_launchers_alone_when_only_a_provider_is_detected() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, _) = ctx_on(FakeInstallEnv::new(Os::Linux).with_programs(&["npm"]));
+        let discovery = discovery_with(vec![provider_healthy("ollama")]);
+
+        SetupCommands::install_step(&ctx, &discovery).await.unwrap();
+
+        assert_eq!(multi_prompts(&ctx), vec!["Select agent tools to install"]);
+        let infos = capture_ui(&ctx).infos.borrow().join("\n");
+        assert!(infos.contains("No agent tools were found on this machine."));
+        assert!(!infos.contains("No model server"));
+    }
+
+    #[tokio::test]
+    async fn install_step_runs_nothing_when_nothing_is_ticked() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, env) =
+            ctx_on(FakeInstallEnv::new(Os::Mac).with_programs(&["npm", "brew", "curl"]));
+
+        let step = SetupCommands::install_step(&ctx, &empty_discovery())
+            .await
+            .unwrap();
+
+        let ui = capture_ui(&ctx);
+        assert_eq!(ui.multi_select_prompts.borrow().len(), 2);
+        assert!(
+            ui.multi_select_prompts
+                .borrow()
+                .iter()
+                .all(|(_, _, defaults)| defaults.iter().all(|d| !d))
+        );
+        assert!(ui.confirm_prompts.borrow().is_empty());
+        assert!(env.runs().is_empty());
+        assert!(!step.rediscover);
+    }
+
+    #[tokio::test]
+    async fn install_step_checks_again_until_the_provider_answers() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, env) = ctx_on(
+            FakeInstallEnv::new(Os::Mac)
+                .with_programs(&["brew", "llama-server"])
+                .with_health(&[false, true]),
+        );
+        let discovery = discovery_with(vec![launcher_found("opencode")]);
+        capture_ui(&ctx).select_answers.borrow_mut().extend([0, 0]);
+
+        let step = SetupCommands::install_step(&ctx, &discovery).await.unwrap();
+
+        assert!(step.rediscover);
+        assert_eq!(env.health_checks(), vec!["llama-cpp", "llama-cpp"]);
+        let ui = capture_ui(&ctx);
+        assert_eq!(ui.select_prompts.borrow().len(), 2);
+        assert!(
+            ui.warns
+                .borrow()
+                .iter()
+                .any(|w| w.contains("is still not answering"))
+        );
+    }
+
+    #[tokio::test]
+    async fn install_step_lists_a_provider_on_path_as_not_answering() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, env) =
+            ctx_on(FakeInstallEnv::new(Os::Mac).with_programs(&["brew", "llama-server"]));
+        let discovery = discovery_with(vec![launcher_found("opencode")]);
+
+        SetupCommands::install_step(&ctx, &discovery).await.unwrap();
+
+        let ui = capture_ui(&ctx);
+        let (prompt, items, _) = ui.multi_select_prompts.borrow()[0].clone();
+        assert_eq!(prompt, "Select model servers to install");
+        assert!(
+            items
+                .iter()
+                .any(|i| i.starts_with("ollama  Ollama  brew install ollama"))
+        );
+        assert!(!items.iter().any(|i| i.starts_with("llama-cpp")));
+        let infos = ui.infos.borrow().join("\n");
+        assert!(
+            infos.contains(
+                "Found on PATH, not answering: llama-cpp (start it with `llama-server`)."
+            )
+        );
+        assert!(
+            ui.warns
+                .borrow()
+                .iter()
+                .any(|w| w.starts_with("llama.cpp was found at ")
+                    && w.contains(" but is not answering at "))
+        );
+        assert!(infos.contains("      llama-server"));
+        assert_eq!(ui.select_prompts.borrow()[0].0, "Would you like to");
+        assert!(env.runs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_step_goes_on_after_a_failure_and_ticks_what_installed() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::{FakeInstallEnv, FakeRun};
+        let (mut ctx, env) = ctx_on(
+            FakeInstallEnv::new(Os::Linux)
+                .with_programs(&["npm"])
+                .with_run(
+                    "npm install -g opencode-ai",
+                    FakeRun::ok().installs("opencode", "/usr/bin/opencode"),
+                )
+                .with_run(
+                    "npm install -g openclaw@latest --allow-scripts=openclaw",
+                    FakeRun::failed(),
+                ),
+        );
+        let ui = capture_ui(&ctx);
+        // On Linux with npm only, the offer is claude, openclaw, opencode, pi.
+        ui.multi_select_answers.borrow_mut().push_back(vec![1, 2]);
+
+        let step = SetupCommands::install_step(&ctx, &empty_discovery())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            env.runs(),
+            vec![
+                "npm install -g openclaw@latest --allow-scripts=openclaw",
+                "npm install -g opencode-ai",
+            ]
+        );
+        assert_eq!(step.launchers, HashSet::from(["opencode".to_string()]));
+        assert!(step.rediscover);
+        let ui = capture_ui(&ctx);
+        assert_eq!(ui.confirm_prompts.borrow()[0].0, "Run them now?");
+        assert!(
+            ui.errors
+                .borrow()
+                .iter()
+                .any(|e| e.starts_with("Install failed"))
+        );
+
+        // The next phase starts with the installed launcher ticked.
+        let discovery = discovery_with(vec![launcher_found("opencode")]);
+        SetupCommands::select_launchers(&mut ctx, &discovery, &step.launchers)
+            .await
+            .unwrap();
+        let (_, items, defaults) = capture_ui(&ctx)
+            .multi_select_prompts
+            .borrow()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(items[0].starts_with("opencode"));
+        assert!(defaults[0]);
+    }
+
+    #[tokio::test]
+    async fn install_step_shows_how_to_start_a_provider_it_installed() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::{FakeInstallEnv, FakeRun};
+        let (ctx, _) = ctx_on(
+            FakeInstallEnv::new(Os::Mac)
+                .with_programs(&["brew"])
+                .with_run(
+                    "brew install ollama",
+                    FakeRun::ok().installs("ollama", "/opt/homebrew/bin/ollama"),
+                ),
+        );
+        // On a Mac with Homebrew the offer is llama-cpp, ollama.
+        capture_ui(&ctx)
+            .multi_select_answers
+            .borrow_mut()
+            .push_back(vec![1]);
+
+        let step =
+            SetupCommands::install_step(&ctx, &discovery_with(vec![launcher_found("opencode")]))
+                .await
+                .unwrap();
+
+        assert_eq!(step.providers, HashSet::from(["ollama".to_string()]));
+        let ui = capture_ui(&ctx);
+        assert!(ui.infos.borrow().iter().any(|i| i == "      ollama serve"));
+        assert!(
+            ui.warns
+                .borrow()
+                .iter()
+                .any(|w| w == "Ollama is installed but not answering at http://localhost:11434.")
+        );
+        assert_eq!(ui.select_prompts.borrow()[0].0, "Would you like to");
+    }
+
+    #[tokio::test]
+    async fn a_launcher_installed_off_path_is_ticked_and_gets_its_command_path() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::{FakeInstallEnv, FakeRun};
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, _) = ctx_on(
+            FakeInstallEnv::new(Os::Linux)
+                .with_programs(&["curl", "bash"])
+                .with_run(
+                    "curl -fsSL https://claude.ai/install.sh | bash",
+                    FakeRun::ok().installs_in(
+                        "~/.local/bin",
+                        "claude",
+                        "/home/me/.local/bin/claude",
+                    ),
+                ),
+        );
+        // On Linux with curl only, claude's script is the first offer.
+        capture_ui(&ctx)
+            .multi_select_answers
+            .borrow_mut()
+            .push_back(vec![0]);
+
+        let step =
+            SetupCommands::install_step(&ctx, &discovery_with(vec![provider_healthy("ollama")]))
+                .await
+                .unwrap();
+        assert_eq!(
+            step.launcher_paths.get("claude"),
+            Some(&std::path::PathBuf::from("/home/me/.local/bin/claude"))
+        );
+
+        // Discovery again finds nothing on PATH; the install's path fills it in.
+        let mut discovery = discovery_with(vec![Recommendation::Launcher {
+            launcher_type: "claude".to_string(),
+            launcher_name: "Claude CLI".to_string(),
+            binary_path: None,
+        }]);
+        mark_installed_off_path(&mut discovery, &step.launcher_paths);
+        SetupCommands::select_launchers(&mut ctx, &discovery, &step.launchers)
+            .await
+            .unwrap();
+        let (_, items, defaults) = capture_ui(&ctx)
+            .multi_select_prompts
+            .borrow()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(items[0].contains("/home/me/.local/bin/claude"));
+        assert!(defaults[0]);
+
+        // Once configured, the launcher gets the path as command_path.
+        ctx.config_mut()
+            .insert_launcher(
+                "claude",
+                crate::config::LauncherConfig {
+                    launcher_id: "claude".to_string(),
+                    launcher_type: "claude".to_string(),
+                    enabled_capabilities: vec![],
+                    config: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        set_install_paths(
+            &mut ctx,
+            &HashSet::from(["claude".to_string()]),
+            &step.launcher_paths,
+        );
+        assert_eq!(
+            ctx.config().get_launcher("claude").unwrap().config["command_path"],
+            "/home/me/.local/bin/claude"
+        );
+
+        // A command_path the user set is kept.
+        let mut launcher = ctx.config().get_launcher("claude").unwrap().clone();
+        launcher.config["command_path"] = serde_json::json!("/opt/claude/bin/claude");
+        ctx.config_mut()
+            .insert_launcher("claude", launcher)
+            .unwrap();
+        set_install_paths(
+            &mut ctx,
+            &HashSet::from(["claude".to_string()]),
+            &step.launcher_paths,
+        );
+        assert_eq!(
+            ctx.config().get_launcher("claude").unwrap().config["command_path"],
+            "/opt/claude/bin/claude"
+        );
+    }
+
+    #[test]
+    fn summary_suggests_a_launch_only_with_a_provider() {
+        let (ctx, _) = ctx_on(crate::utils::test_support::FakeInstallEnv::default());
+        let launchers = HashSet::from(["opencode".to_string()]);
+        SetupCommands::print_summary(
+            &ctx,
+            &HashSet::new(),
+            &launchers,
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        );
+        assert!(
+            !capture_ui(&ctx)
+                .infos
+                .borrow()
+                .iter()
+                .any(|i| i.contains("granite-cli launch "))
+        );
+    }
+
+    #[test]
+    fn auto_summary_has_no_install_hints() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, _) = ctx_on(FakeInstallEnv::new(Os::Mac).with_programs(&["brew"]));
+        SetupCommands::print_summary(
+            &ctx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        );
+        assert!(
+            !capture_ui(&ctx)
+                .infos
+                .borrow()
+                .iter()
+                .any(|i| i.contains("Install one"))
+        );
+    }
+
+    #[test]
+    fn summary_points_at_info_when_nothing_can_be_installed() {
+        let (ctx, _) = ctx_on(crate::utils::test_support::FakeInstallEnv::default());
+        SetupCommands::print_summary(
+            &ctx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+        );
+        let infos = capture_ui(&ctx).infos.borrow().clone();
+        assert!(infos.contains(
+            &"  Run `granite-cli provider info <type>` to see how to install one.".to_string()
+        ));
+        assert!(infos.contains(
+            &"  Run `granite-cli launcher info <type>` to see how to install one.".to_string()
+        ));
+    }
+
+    #[test]
+    fn summary_does_not_suggest_installing_a_provider_already_on_path() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, _) =
+            ctx_on(FakeInstallEnv::new(Os::Mac).with_programs(&["brew", "llama-server"]));
+
+        SetupCommands::print_summary(
+            &ctx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+        );
+
+        let infos = capture_ui(&ctx).infos.borrow().clone();
+        assert!(
+            infos.contains(&"  Install one with `granite-cli provider setup ollama`.".to_string())
+        );
+    }
+
+    #[test]
+    fn summary_names_an_install_for_each_empty_kind() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, _) = ctx_on(FakeInstallEnv::new(Os::Mac).with_programs(&["brew"]));
+
+        SetupCommands::print_summary(
+            &ctx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+        );
+
+        let infos = capture_ui(&ctx).infos.borrow().clone();
+        assert!(
+            infos.contains(
+                &"  Install one with `granite-cli provider setup llama-cpp`.".to_string()
+            )
+        );
+        assert!(
+            infos.contains(&"  Install one with `granite-cli launcher setup claude`.".to_string())
+        );
+    }
+
+    // -- setup --auto: warnings and --install ------------------------------------
+
+    #[test]
+    fn auto_names_the_missing_tools_when_nothing_can_be_installed() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, _) = ctx_on(FakeInstallEnv::new(Os::Linux));
+
+        SetupCommands::warn_missing(&ctx, &empty_discovery());
+
+        let infos = capture_ui(&ctx).infos.borrow().join("\n");
+        assert!(infos.contains(
+            "⚠ No launcher found. Nothing can be installed here (curl not found, npm not found)"
+        ));
+    }
+
+    #[test]
+    fn auto_warns_with_the_commands_for_each_empty_kind_and_runs_nothing() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, env) = ctx_on(FakeInstallEnv::new(Os::Mac).with_programs(&["brew", "npm"]));
+
+        SetupCommands::warn_missing(&ctx, &empty_discovery());
+
+        let ui = capture_ui(&ctx);
+        // Headline and commands go to the same stream.
+        assert!(ui.warns.borrow().is_empty());
+        assert_eq!(
+            *ui.warn_marks.borrow(),
+            vec![
+                "⚠ No launcher found. To install one:",
+                "⚠ No model server answering. To install one:"
+            ]
+        );
+        let infos = ui.infos.borrow().join("\n");
+        assert!(infos.contains("⚠ No launcher found. To install one:\n"));
+        assert!(infos.contains("    opencode  npm install -g opencode-ai"));
+        assert!(infos.contains("    ollama     brew install ollama"));
+        assert!(
+            infos.contains("  or let setup install it: granite-cli setup --auto --install claude")
+        );
+        assert!(
+            infos.contains(
+                "  or let setup install it: granite-cli setup --auto --install llama-cpp"
+            )
+        );
+        assert!(env.runs().is_empty());
+    }
+
+    #[test]
+    fn auto_does_not_warn_about_a_kind_that_is_detected() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, _) = ctx_on(FakeInstallEnv::new(Os::Mac).with_programs(&["brew"]));
+
+        SetupCommands::warn_missing(
+            &ctx,
+            &discovery_with(vec![launcher_found("opencode"), provider_healthy("ollama")]),
+        );
+
+        assert!(capture_ui(&ctx).warns.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_install_runs_exactly_the_named_types() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::{FakeInstallEnv, FakeRun};
+        let (ctx, env) = ctx_on(
+            FakeInstallEnv::new(Os::Mac)
+                .with_programs(&["brew", "npm", "curl"])
+                .with_run(
+                    "npm install -g opencode-ai",
+                    FakeRun::ok().installs("opencode", "/usr/local/bin/opencode"),
+                )
+                .with_run(
+                    "brew install ollama",
+                    FakeRun::ok().installs("ollama", "/opt/homebrew/bin/ollama"),
+                ),
+        );
+
+        let (ok, _) =
+            SetupCommands::auto_install(&ctx, &["ollama".to_string(), "opencode".to_string()])
+                .await
+                .unwrap();
+
+        assert!(ok);
+        assert_eq!(
+            env.runs(),
+            vec![
+                "brew install ollama".to_string(),
+                "npm install -g opencode-ai".to_string(),
+            ]
+        );
+        assert!(env.health_checks().is_empty());
+        let infos = capture_ui(&ctx).infos.borrow().join("\n");
+        assert!(infos.contains(
+            "granite-cli does not start Ollama. Start it with `ollama serve`, then run setup again."
+        ));
+        assert!(capture_ui(&ctx).select_prompts.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_install_skips_a_type_whose_program_is_on_path() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, env) = ctx_on(FakeInstallEnv::new(Os::Linux).with_programs(&["npm", "opencode"]));
+
+        let (ok, _) = SetupCommands::auto_install(&ctx, &["opencode".to_string()])
+            .await
+            .unwrap();
+
+        assert!(ok);
+        assert!(env.runs().is_empty());
+        let ui = capture_ui(&ctx);
+        assert!(
+            ui.infos
+                .borrow()
+                .iter()
+                .any(|i| i.contains("is already installed: /usr/bin/opencode"))
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_install_reports_an_unknown_type_and_a_failed_install() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, env) = ctx_on(FakeInstallEnv::new(Os::Linux).with_programs(&["curl", "bash"]));
+
+        // hermes has only a script that may ask for input. --install runs it;
+        // the fake environment fails it, as a question without a terminal
+        // would.
+        let (ok, _) =
+            SetupCommands::auto_install(&ctx, &["no-such-type".to_string(), "hermes".to_string()])
+                .await
+                .unwrap();
+
+        assert!(!ok);
+        assert_eq!(env.runs().len(), 1);
+        let ui = capture_ui(&ctx);
+        assert!(ui.errors.borrow()[0].contains("'no-such-type'"));
+        assert!(
+            ui.errors
+                .borrow()
+                .iter()
+                .any(|e| e.contains("Install failed"))
+        );
+        assert!(
+            ui.infos
+                .borrow()
+                .iter()
+                .any(|i| i == "To install Hermes CLI yourself:")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_setup_exits_non_zero_when_a_named_install_did_not_happen() {
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, _) = ctx_on(crate::utils::test_support::FakeInstallEnv::default());
+
+        let result = SetupCommands::auto_configure(
+            &mut ctx,
+            &test_hardware_profile(),
+            None,
+            no_discovery(),
+            false,
+            &HashMap::new(),
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Not every type named with --install was installed."
+        );
+    }
+
+    #[test]
+    fn auto_says_how_to_start_a_provider_that_is_installed() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let (ctx, _) = ctx_on(FakeInstallEnv::new(Os::Mac).with_programs(&["brew", "ollama"]));
+
+        SetupCommands::warn_missing(&ctx, &discovery_with(vec![launcher_found("opencode")]));
+
+        let ui = capture_ui(&ctx);
+        assert!(ui.warns.borrow().contains(
+            &"'ollama' was found on PATH, but ollama is not answering. Start it with `ollama serve`, then run setup again."
+                .to_string()
+        ));
+        let infos = ui.infos.borrow().join("\n");
+        assert!(!infos.contains("brew install ollama"));
+        assert!(infos.contains("brew install llama.cpp"));
+    }
+
+    #[tokio::test]
+    async fn auto_install_keeps_the_path_of_a_launcher_installed_off_path() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::{FakeInstallEnv, FakeRun};
+        let (ctx, _) = ctx_on(
+            FakeInstallEnv::new(Os::Linux)
+                .with_programs(&["curl", "bash"])
+                .with_run(
+                    "curl -fsSL https://claude.ai/install.sh | bash",
+                    FakeRun::ok().installs_in(
+                        "~/.local/bin",
+                        "claude",
+                        "/home/me/.local/bin/claude",
+                    ),
+                ),
+        );
+
+        let (ok, paths) = SetupCommands::auto_install(&ctx, &["claude".to_string()])
+            .await
+            .unwrap();
+
+        assert!(ok);
+        assert_eq!(
+            paths.get("claude"),
+            Some(&std::path::PathBuf::from("/home/me/.local/bin/claude"))
+        );
+    }
+
+    // -- select_launchers --------------------------------------------------------
+
+    /// A launcher whose tool cannot be installed fails `launcher setup`; the
+    /// wizard reports it and shows the launcher list again.
+    #[tokio::test]
+    async fn select_launchers_shows_the_list_again_after_a_failed_launcher_setup() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = test_ctx();
+        let ui = capture_ui(&ctx);
+        // The list has only "Configure a different launcher…" at index 0.
+        ui.multi_select_answers.borrow_mut().push_back(vec![0]);
+        // The default FakeInstallEnv finds nothing, so setup of any type fails.
+        ui.select_answers.borrow_mut().push_back(0);
+
+        let selected =
+            SetupCommands::select_launchers(&mut ctx, &empty_discovery(), &HashSet::new())
+                .await
+                .unwrap();
+
+        assert!(selected.is_empty());
+        let ui = capture_ui(&ctx);
+        assert_eq!(ui.multi_select_prompts.borrow().len(), 2);
+        assert!(
+            ui.errors
+                .borrow()
+                .iter()
+                .any(|e| e.starts_with("Launcher setup failed:"))
+        );
+        assert!(ctx.config().launchers.is_empty());
     }
 
     // -- discover_providers ----------------------------------------------------
@@ -3761,7 +5183,7 @@ mod tests {
     #[tokio::test]
     async fn run_wizard_with_empty_config_shows_info() {
         let mut ctx = test_ctx();
-        let _ = SetupCommands::run(&mut ctx, false, Some(false)).await;
+        let _ = SetupCommands::run(&mut ctx, false, Some(false), &[]).await;
         // Wizard should complete without error even with no recommendations
         // (it will show info messages)
     }
@@ -3770,7 +5192,7 @@ mod tests {
     async fn run_auto_with_no_recommendations_shows_info() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = test_ctx();
-        let result = SetupCommands::run(&mut ctx, true, None).await;
+        let result = SetupCommands::run(&mut ctx, true, None, &[]).await;
         assert!(result.is_ok());
     }
 
@@ -3799,7 +5221,7 @@ mod tests {
             configured_capability_ids: vec![],
         };
 
-        SetupCommands::select_launchers(&mut ctx, &discovery)
+        SetupCommands::select_launchers(&mut ctx, &discovery, &HashSet::new())
             .await
             .unwrap();
 
@@ -4486,7 +5908,7 @@ mod tests {
         // No canned multi_select answers — when the queue is empty,
         // CaptureUi returns vec![] (empty selection), so the loop returns
         // immediately without entering the escape-hatch branch.
-        SetupCommands::select_providers(&mut ctx, &discovery, &HashSet::new())
+        SetupCommands::select_providers(&mut ctx, &discovery, &HashSet::new(), &HashSet::new())
             .await
             .unwrap();
 
@@ -4534,9 +5956,14 @@ mod tests {
         );
         capture.multi_select_answers.borrow_mut().push_back(vec![0]);
 
-        let selected = SetupCommands::select_providers(&mut ctx, &no_discovery(), &HashSet::new())
-            .await
-            .unwrap();
+        let selected = SetupCommands::select_providers(
+            &mut ctx,
+            &no_discovery(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(selected, HashSet::from(["ollama".to_string()]));
         let prompts = capture.multi_select_prompts.borrow();
@@ -4567,9 +5994,10 @@ mod tests {
             .extend([vec![], vec![0]]);
         let models = HashSet::from(["granite-4.2-8b".to_string()]);
 
-        let selected = SetupCommands::select_providers(&mut ctx, &no_discovery(), &models)
-            .await
-            .unwrap();
+        let selected =
+            SetupCommands::select_providers(&mut ctx, &no_discovery(), &models, &HashSet::new())
+                .await
+                .unwrap();
 
         assert_eq!(selected, HashSet::from(["ollama".to_string()]));
         assert_eq!(capture.multi_select_prompts.borrow().len(), 2);
@@ -4652,6 +6080,7 @@ mod tests {
             &set(&["pi", "claude", "opencode", "bob"]),
             &set(&["openrouter", "ollama"]),
             &HashSet::new(),
+            false,
         );
 
         let infos = capture.infos.borrow().clone();

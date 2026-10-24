@@ -13,6 +13,7 @@ use crate::providers::base::{
     ProviderError, ProviderMetadata, ProviderType,
 };
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
+use crate::utils::install::InstallInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenRouterProviderConfig {
@@ -172,8 +173,16 @@ impl HasProviderMetadata for OpenRouterProvider {
             supported_formats: vec![ModelFormat::OpenRouter],
             authentication: vec![AuthType::BearerToken],
             tags: vec!["openrouter".to_string(), "hosted".to_string()],
+            install: install_info(),
         }
     }
+}
+
+/// Install instructions for OpenRouter, a hosted service.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .page("https://openrouter.ai/keys")
+        .note("OpenRouter is a hosted service. Create an API key on its keys page.")
 }
 
 #[cfg(test)]

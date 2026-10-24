@@ -928,7 +928,7 @@ processes, so no unit test runs it.
 - `src/context.rs` (`AppContext`, where commands reach the UI)
 - AGENTS.md: no unit test may depend on installed binaries or the network
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -963,7 +963,7 @@ environment that has Homebrew and one that does not.
 - `src/commands/provider.rs:116` (`info`)
 - `docs/data-model.md`
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1000,7 +1000,7 @@ nothing.
 - `src/commands/launcher.rs:75` (`info`)
 - `docs/data-model.md`
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1041,7 +1041,7 @@ applicable method going straight to manual instructions.
 - `src/commands/shared/remediation.rs` (how a prompt is skipped when the UI
   is not interactive)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1074,7 +1074,7 @@ failed launcher setup.
 - `src/commands/setup.rs` (`select_launchers`, the
   `LauncherCommands::setup` call whose error ends the wizard)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1110,7 +1110,7 @@ a remote endpoint leading to neither; a hosted type showing its note; and
   `:395` (`check_provider_health`)
 - `src/commands/setup.rs` (`select_providers`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1152,7 +1152,7 @@ phase; and the summary hints for empty kinds.
 - `src/commands/setup.rs` tests `run_wizard_with_empty_config_shows_info` and
   `run_auto_with_no_recommendations_shows_info`, which run real discovery
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1188,5 +1188,5 @@ without `--auto` rejected by the argument parser.
   discovery never meets)
 - `README.md` (setup flags), `install.sh` (`run_granite_setup`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 

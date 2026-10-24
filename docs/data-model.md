@@ -19,7 +19,8 @@ one YAML file per instance                      registries and their metadata
 │   launcher_id          │                      ┌──────────────────────────────┐
 │   launcher_type      ──┼── type ─────────────▶│ LAUNCHER_REGISTRY            │
 │   enabled_capabilities │                      │   supported_capabilities     │
-│   config               │                      └──────────────────────────────┘
+│   config               │                      │   install                    │
+│                        │                      └──────────────────────────────┘
 └───────────┬────────────┘                                      ┊
             │ id, per entry                                     ┊ binding types
             ▼                                                   ┊
@@ -48,6 +49,7 @@ one YAML file per instance                      registries and their metadata
 │   provider_type      ──┼── type ─────────────▶│ PROVIDER_REGISTRY            │
 │   config               │                      │   supported_formats          │
 └────────────────────────┘                      │   supported_api_types        │
+                                                │   install                    │
                                                 └──────────────────────────────┘
 ```
 
@@ -73,3 +75,10 @@ needs the capability's type reference to resolve first.
 
 In YAML, `provider_type`, `capability_type` and `launcher_type` are written as
 `type`. `model_type` keeps its name.
+
+Each provider type's and launcher type's metadata also holds `install`, an
+`InstallInfo` (`src/utils/install.rs`): the program that shows the type is
+installed, its install methods, the vendor page, a note, and, for a local
+provider, the command that runs its server and how it is usually kept
+running. Nothing in the configuration refers to it; `provider info`,
+`launcher info` and the setup commands read it from the registry.

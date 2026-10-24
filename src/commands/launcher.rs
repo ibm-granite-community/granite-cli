@@ -4,6 +4,7 @@ use anyhow::Result;
 
 // Local
 use crate::capabilities::CAPABILITY_REGISTRY;
+use crate::commands::shared::install::InstallOutcome;
 use crate::config::validation::RefKind;
 use crate::dependency::Configured;
 use crate::launchers::LAUNCHER_REGISTRY;
@@ -102,6 +103,12 @@ impl LauncherCommands {
                 }
 
                 ctx.ui.detail("Type Metadata", &type_fields);
+
+                // Only for a catalog type: a configured instance may point at
+                // its program through settings the PATH lookup does not read.
+                if configured.is_none() {
+                    crate::commands::shared::install::show_install_detail(ctx, &md.install);
+                }
 
                 if let Some(cfg) = configured {
                     let mut instance_fields: Vec<(&str, String)> = Vec::new();
@@ -264,24 +271,67 @@ impl LauncherCommands {
             .unwrap_or_else(|| serde_json::json!({}));
         alog_channel!(MessageLevel::Debug3, "Defaults: {:#?}", defaults);
 
-        let config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
+        let mut config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
 
-        // Validate the binary now so the user gets immediate feedback.
-        // validate_command respects command_path when set; falls back to PATH.
-        let launcher = LAUNCHER_REGISTRY
+        // The settings must build a launcher before anything is installed.
+        LAUNCHER_REGISTRY
             .construct(launcher_type, &instance_id, &config)
             .map_err(|e| anyhow::anyhow!("Failed to construct launcher: {e}"))?;
 
-        match launcher.validate_command() {
+        // Resolve the binary now so the user gets immediate feedback, the way
+        // `Launcher::validate_command` does at launch: command_path when set,
+        // otherwise a PATH lookup of the default command.
+        let command_path = config
+            .get("command_path")
+            .and_then(|v| v.as_str())
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        match resolve_binary(
+            &*ctx.install_env(),
+            command_path.as_deref(),
+            &launcher_def.default_command,
+        ) {
             Ok(path) => {
                 ctx.ui.info(&format!("  Binary found: {}", path.display()));
             }
-            Err(e) => {
-                // command_path was explicitly set but invalid, or binary not on PATH.
+            Err(BinaryMissing::ExplicitPath(path)) => {
                 anyhow::bail!(
-                    "Binary validation failed: {e}\n\
+                    "Binary validation failed: explicit path '{path}' does not exist\n\
                      Set command_path to the full path of the binary and re-run setup."
                 );
+            }
+            // An install puts the type's default command on PATH, so it
+            // cannot make a different bare command_path resolve.
+            Err(BinaryMissing::NotOnPath(name)) if name != launcher_def.default_command => {
+                anyhow::bail!(
+                    "Binary validation failed: command '{name}' not found on PATH\n\
+                     Set command_path to the full path of the binary and re-run setup."
+                );
+            }
+            Err(BinaryMissing::NotOnPath(name)) => {
+                ctx.ui.warn(&format!("'{name}' not found on PATH."));
+                let outcome = crate::commands::shared::install::offer_install(
+                    ctx,
+                    &launcher_def.name,
+                    &launcher_def.install,
+                )
+                .await?;
+                match outcome {
+                    InstallOutcome::Installed {
+                        path: Some(path),
+                        off_path: true,
+                    } => {
+                        let path = path.display().to_string();
+                        ctx.ui.info(&format!("  command_path set to {path}."));
+                        config["command_path"] = serde_json::Value::String(path);
+                    }
+                    InstallOutcome::Installed { .. } => {}
+                    _ => anyhow::bail!(
+                        "Launcher setup stopped: '{name}' was not found. \
+                         Install it, or set command_path to the full path of the binary, \
+                         and re-run setup."
+                    ),
+                }
             }
         }
 
@@ -389,6 +439,41 @@ impl LauncherCommands {
 }
 
 /*-- private --*/
+
+/// Why a launcher's binary did not resolve.
+#[derive(Debug, PartialEq, Eq)]
+enum BinaryMissing {
+    /// `command_path` is a path, and nothing is there.
+    ExplicitPath(String),
+    /// The named command is not on PATH.
+    NotOnPath(String),
+}
+
+/// Resolve a launcher's binary through `env` with the rules of
+/// `resolve_shell_command`: an existing `command_path` is used as it is, one
+/// that looks like a path and does not exist is an error, and a bare name,
+/// or `default_command` when `command_path` is unset, is looked up on PATH.
+fn resolve_binary(
+    env: &dyn crate::utils::install::InstallEnv,
+    command_path: Option<&str>,
+    default_command: &str,
+) -> Result<std::path::PathBuf, BinaryMissing> {
+    let Some(explicit) = command_path else {
+        return env
+            .find(default_command)
+            .ok_or_else(|| BinaryMissing::NotOnPath(default_command.to_string()));
+    };
+    let path = std::path::Path::new(explicit);
+    if path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let looks_like_path = explicit.contains('/') || (cfg!(windows) && explicit.contains('\\'));
+    if looks_like_path {
+        return Err(BinaryMissing::ExplicitPath(explicit.to_string()));
+    }
+    env.find(explicit)
+        .ok_or_else(|| BinaryMissing::NotOnPath(explicit.to_string()))
+}
 
 /// Presents the user with a multi-select of capability instances (and a
 /// "Configure a new capability…" option) filtered to those compatible with
@@ -724,7 +809,8 @@ mod tests {
         assert!(result.is_ok());
 
         let details = details!(ctx);
-        assert_eq!(details.len(), 1);
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[1].0, "Install");
 
         let (id, fields) = &details[0];
         assert_eq!(id, "Type Metadata");
@@ -765,6 +851,124 @@ mod tests {
                 .iter()
                 .any(|(k, v)| *k == "Enabled Capabilities" && v == "chat, plan")
         );
+    }
+
+    fn install_detail(ctx: &crate::AppContext) -> Vec<(String, String)> {
+        details!(ctx)
+            .iter()
+            .find(|(title, _)| title == "Install")
+            .map(|(_, fields)| fields.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn info_shows_install_detail_on_linux_with_npm() {
+        use crate::utils::install::Os;
+        let mut ctx = test_ctx();
+        ctx.set_install_env(Arc::new(
+            crate::utils::test_support::FakeInstallEnv::new(Os::Linux).with_programs(&["npm"]),
+        ));
+        LauncherCommands::info(&ctx, "opencode").unwrap();
+
+        assert_eq!(
+            install_detail(&ctx),
+            vec![
+                (
+                    "Program".to_string(),
+                    "opencode (not found on PATH)".to_string()
+                ),
+                (
+                    "Install 1".to_string(),
+                    "npm install -g opencode-ai  [✓ runs on this machine]".to_string()
+                ),
+                (
+                    "Install 2".to_string(),
+                    "curl -fsSL https://opencode.ai/install | bash  [curl not found]".to_string()
+                ),
+                (
+                    "Install 3".to_string(),
+                    "brew install anomalyco/tap/opencode  [Homebrew not found]".to_string()
+                ),
+                ("Page".to_string(), "https://opencode.ai/docs/".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn info_shows_install_detail_on_a_machine_with_nothing() {
+        use crate::utils::install::Os;
+        let mut ctx = test_ctx();
+        ctx.set_install_env(Arc::new(crate::utils::test_support::FakeInstallEnv::new(
+            Os::Linux,
+        )));
+        LauncherCommands::info(&ctx, "bob").unwrap();
+
+        let fields = install_detail(&ctx);
+        assert!(fields.contains(&(
+            "Install".to_string(),
+            "curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --pm npm  [curl not found]"
+                .to_string()
+        )));
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| k == "Note" && v.contains("Node.js"))
+        );
+        assert!(
+            fields
+                .iter()
+                .all(|(_, v)| !v.contains("runs on this machine"))
+        );
+    }
+
+    #[test]
+    fn every_launcher_type_declares_a_page_or_a_note() {
+        for (id, md) in LAUNCHER_REGISTRY.entries() {
+            assert!(
+                md.install.page.is_some() || md.install.note.is_some(),
+                "{id} declares neither a page nor a note"
+            );
+        }
+    }
+
+    #[test]
+    fn every_launcher_program_is_its_default_command() {
+        for (id, md) in LAUNCHER_REGISTRY.entries() {
+            assert_eq!(
+                md.install.program.as_deref(),
+                Some(md.default_command.as_str()),
+                "{id}"
+            );
+        }
+    }
+
+    /// A vendor script that installs through npm puts the binary in npm's
+    /// global prefix, which is on PATH when npm is, so it needs no directory.
+    #[test]
+    fn every_script_method_declares_a_directory() {
+        use crate::utils::install::MethodKind;
+        for (id, md) in LAUNCHER_REGISTRY.entries() {
+            for m in &md.install.methods {
+                if m.kind == MethodKind::Script && !m.needs.iter().any(|n| n == "npm") {
+                    assert!(
+                        !m.bin_dirs.is_empty(),
+                        "{id}: {} declares no directory",
+                        m.command
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_method_that_pipes_to_bash_needs_bash() {
+        for (id, md) in LAUNCHER_REGISTRY.entries() {
+            for m in &md.install.methods {
+                if m.command.contains("bash") {
+                    assert!(m.needs.iter().any(|n| n == "bash"), "{id}: {}", m.command);
+                }
+            }
+        }
     }
 
     #[test]
@@ -813,6 +1017,174 @@ mod tests {
             infos.iter().any(|m| m.contains("claude-old")),
             "expected clash warning to mention the existing instance"
         );
+    }
+
+    // -- setup offers the install ------------------------------------------------
+
+    fn setup_ctx(env: crate::utils::test_support::FakeInstallEnv) -> crate::AppContext {
+        let mut ctx = test_ctx();
+        ctx.set_install_env(Arc::new(env));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn setup_installs_a_missing_tool_onto_path_and_saves_the_launcher() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::{FakeInstallEnv, FakeRun};
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = setup_ctx(
+            FakeInstallEnv::new(Os::Linux)
+                .with_programs(&["npm"])
+                .with_run(
+                    "npm install -g opencode-ai",
+                    FakeRun::ok().installs("opencode", "/usr/local/bin/opencode"),
+                ),
+        );
+        capture(&ctx).select_answers.borrow_mut().push_back(0);
+
+        LauncherCommands::setup(&mut ctx, "opencode", Some("opencode"), false)
+            .await
+            .unwrap();
+
+        let saved = ctx
+            .config()
+            .get_launcher("opencode")
+            .expect("launcher saved");
+        assert!(
+            saved
+                .config
+                .get("command_path")
+                .and_then(|v| v.as_str())
+                .is_none_or(str::is_empty)
+        );
+        assert!(
+            capture(&ctx)
+                .warns
+                .borrow()
+                .iter()
+                .any(|w| w == "'opencode' not found on PATH.")
+        );
+        assert_eq!(
+            capture(&ctx).select_prompts.borrow()[0].0,
+            "Install OpenCode CLI now?"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_saves_command_path_for_a_tool_installed_off_path() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::{FakeInstallEnv, FakeRun};
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = setup_ctx(
+            FakeInstallEnv::new(Os::Linux)
+                .with_programs(&["curl", "bash"])
+                .with_run(
+                    "curl -fsSL https://opencode.ai/install | bash",
+                    FakeRun::ok().installs_in(
+                        "~/.opencode/bin",
+                        "opencode",
+                        "/home/me/.opencode/bin/opencode",
+                    ),
+                ),
+        );
+        capture(&ctx).select_answers.borrow_mut().push_back(0);
+
+        LauncherCommands::setup(&mut ctx, "opencode", Some("opencode"), false)
+            .await
+            .unwrap();
+
+        let saved = ctx
+            .config()
+            .get_launcher("opencode")
+            .expect("launcher saved");
+        assert_eq!(
+            saved.config.get("command_path").and_then(|v| v.as_str()),
+            Some("/home/me/.opencode/bin/opencode")
+        );
+        assert!(
+            capture(&ctx)
+                .infos
+                .borrow()
+                .iter()
+                .any(|i| i.contains("command_path set to /home/me/.opencode/bin/opencode"))
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_saves_nothing_when_the_install_is_declined() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = setup_ctx(FakeInstallEnv::new(Os::Linux).with_programs(&["npm"]));
+        capture(&ctx).select_answers.borrow_mut().push_back(1); // Don't install
+
+        let result = LauncherCommands::setup(&mut ctx, "opencode", Some("opencode"), false).await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("'opencode' was not found")
+        );
+        assert!(ctx.config().get_launcher("opencode").is_none());
+        assert!(
+            capture(&ctx)
+                .infos
+                .borrow()
+                .iter()
+                .any(|i| i == "To install OpenCode CLI yourself:")
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_does_not_offer_an_install_for_a_missing_explicit_path() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = setup_ctx(FakeInstallEnv::new(Os::Linux).with_programs(&["npm"]));
+        let ui = capture(&ctx);
+        // Answer every text prompt with the path; only command_path is free text.
+        for _ in 0..10 {
+            ui.text_answers
+                .borrow_mut()
+                .push_back("/no/such/dir/opencode".to_string());
+        }
+
+        let result = LauncherCommands::setup(&mut ctx, "opencode", Some("opencode"), false).await;
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            capture(&ctx).text_prompts.borrow()[0]
+                .0
+                .contains("command_path"),
+            "the path must have answered the command_path prompt"
+        );
+        assert!(
+            err.contains("explicit path '/no/such/dir/opencode' does not exist"),
+            "{err}"
+        );
+        assert!(capture(&ctx).select_prompts.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn setup_does_not_offer_an_install_for_a_different_bare_command() {
+        use crate::utils::install::Os;
+        use crate::utils::test_support::FakeInstallEnv;
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = setup_ctx(FakeInstallEnv::new(Os::Linux).with_programs(&["npm"]));
+        capture(&ctx)
+            .text_answers
+            .borrow_mut()
+            .push_back("opencode-dev".to_string());
+
+        let result = LauncherCommands::setup(&mut ctx, "opencode", Some("opencode"), false).await;
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("command 'opencode-dev' not found on PATH"),
+            "{err}"
+        );
+        assert!(capture(&ctx).select_prompts.borrow().is_empty());
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ use crate::launchers::base::{
 };
 use crate::launchers::shared::mcp_cli::{STDIO_AND_HTTP, mcp_binding_request, transport_set};
 use crate::registry::{ConfigConstructable, ConstructError};
+use crate::utils::install::InstallInfo;
 use crate::utils::resolve_shell_command;
 use crate::utils::subserver::SubServer;
 use crate::utils::ui::Ui;
@@ -371,11 +372,21 @@ impl HasBobIdeLauncherMetadata for BobIdeLauncher {
             supported_capabilities: HashSet::from([BindingType::Mcp, BindingType::SubAgent]),
             mcp_transports: transport_set(STDIO_AND_HTTP),
             tags: vec!["bob".to_string(), "ibm".to_string(), "ide".to_string()],
+            install: install_info(),
         }
     }
 }
 
 /*-- private --*/
+
+/// Bob IDE is a desktop application with no install command, so setup shows
+/// the vendor page and offers nothing to run.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("bobide")
+        .page("https://bob.ibm.com")
+        .note("Bob IDE is a desktop application. Install it from the Bob website.")
+}
 
 /// Run `bobide --status` and return its stdout as a string.
 /// Returns `None` on spawn failure or if the process exits non-zero.

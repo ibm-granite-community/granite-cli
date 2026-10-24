@@ -23,6 +23,7 @@ use crate::capabilities::{
 use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
 use crate::launchers::shared::mcp_cli::{STDIO_AND_HTTP, mcp_binding_request, transport_set};
 use crate::registry::{ConfigConstructable, ConstructError};
+use crate::utils::install::{InstallInfo, InstallMethod, MethodKind, Os};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
 
@@ -279,6 +280,7 @@ impl HasGooseLauncherMetadata for GooseLauncher {
             supported_capabilities: HashSet::from([BindingType::AgentModel, BindingType::Mcp]),
             mcp_transports: transport_set(STDIO_AND_HTTP),
             tags: vec!["goose".to_string(), "agent".to_string()],
+            install: install_info(),
         }
     }
 }
@@ -368,6 +370,32 @@ fn insert_extension_flags(args: &[String], flags: Vec<String>, ui: &dyn Ui) -> V
             out
         }
     }
+}
+
+/// Install instructions for the goose CLI.
+///
+/// Source, checked 2026-10-17:
+/// https://goose-docs.ai/docs/getting-started/installation. The script runs
+/// `goose configure` from the terminal unless `CONFIGURE=false` is set, and
+/// installs into `~/.local/bin`.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("goose")
+        .page("https://goose-docs.ai/docs/getting-started/installation")
+        .method(InstallMethod::new(
+            &[Os::Mac],
+            MethodKind::Brew,
+            "brew install block-goose-cli",
+        ))
+        .method(
+            InstallMethod::new(
+                Os::UNIX,
+                MethodKind::Script,
+                "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash",
+            )
+            .needs("bash")
+            .bin_dir("~/.local/bin"),
+        )
 }
 
 /*-- tests --*/

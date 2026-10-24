@@ -4,6 +4,7 @@ use crate::providers::base::{
     ProviderError, ProviderMetadata, ProviderType,
 };
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
+use crate::utils::install::InstallInfo;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -290,8 +291,16 @@ impl HasProviderMetadata for OpenAIProvider {
                 "compatible".to_string(),
                 "local".to_string(),
             ],
+            install: install_info(),
         }
     }
+}
+
+/// Install instructions for an OpenAI-compatible server, which granite-cli
+/// does not install.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .note("Point base_url at any running server with an OpenAI-compatible API.")
 }
 
 /*-- tests -------------------------------------------------------------------*/

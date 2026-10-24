@@ -237,6 +237,9 @@ pub struct ProviderMetadata {
     pub supported_formats: Vec<ModelFormat>,
     pub authentication: Vec<AuthType>,
     pub tags: Vec<String>,
+
+    /// How to install this type's server, and how it is started.
+    pub install: crate::utils::install::InstallInfo,
 }
 
 impl std::fmt::Display for ProviderMetadata {
@@ -493,6 +496,7 @@ mod tests {
             supported_formats: vec![],
             authentication: vec![],
             tags: vec!["local".to_string(), "gguf".to_string()],
+            install: Default::default(),
         };
         let fields = meta.search_fields();
         assert!(fields.contains(&"Ollama"));

@@ -143,6 +143,12 @@ mod tests {
     }
 
     #[test]
+    fn markdown_output_cannot_lend_the_terminal() {
+        let out = MarkdownOutput::new("markdown", &serde_json::json!({})).unwrap();
+        assert!(!out.can_lend_terminal());
+    }
+
+    #[test]
     fn markdown_table_contains_pipe_chars() {
         let out = CaptureUi::default();
         out.table(

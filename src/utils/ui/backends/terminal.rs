@@ -44,6 +44,12 @@ impl ConfigConstructable for TerminalOutput {
 }
 
 impl Ui for TerminalOutput {
+    /// A child process can share the terminal when both stdout and
+    /// standard input are one.
+    fn can_lend_terminal(&self) -> bool {
+        self.is_tty && std::io::IsTerminal::is_terminal(&std::io::stdin())
+    }
+
     fn table(&self, title: &str, headers: &[&str], rows: &[Vec<String>]) {
         if !self.is_tty {
             return PlainOutput.table(title, headers, rows);

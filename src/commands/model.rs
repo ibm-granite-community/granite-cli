@@ -1389,6 +1389,7 @@ mod tests {
             supported_formats: formats,
             authentication: vec![],
             tags: vec![],
+            install: Default::default(),
         }
     }
 

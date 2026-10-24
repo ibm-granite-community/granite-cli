@@ -30,6 +30,7 @@ use crate::launchers::shared::mcp_cli::{STDIO_HTTP_AND_SSE, mcp_binding_request,
 use crate::providers::ApiType;
 use crate::proxy::ProxyHandle;
 use crate::registry::{ConfigConstructable, ConstructError};
+use crate::utils::install::{InstallInfo, InstallMethod, MethodKind, Os};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
 
@@ -345,6 +346,7 @@ impl HasOpenCodeLauncherMetadata for OpenCodeLauncher {
             ]),
             mcp_transports: transport_set(STDIO_HTTP_AND_SSE),
             tags: vec!["opencode".to_string(), "coding-agent".to_string()],
+            install: install_info(),
         }
     }
 }
@@ -1062,6 +1064,35 @@ fn write_opencode_config(path: &Path, config: &serde_json::Value) -> anyhow::Res
     let mut content = serde_json::to_string_pretty(config)?;
     content.push('\n');
     std::fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
+}
+
+/// Install instructions for OpenCode.
+///
+/// Source, checked 2026-10-17: https://opencode.ai/docs/. The install
+/// script puts `opencode` in `~/.opencode/bin`.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("opencode")
+        .page("https://opencode.ai/docs/")
+        .method(InstallMethod::new(
+            Os::ANY,
+            MethodKind::Npm,
+            "npm install -g opencode-ai",
+        ))
+        .method(
+            InstallMethod::new(
+                Os::UNIX,
+                MethodKind::Script,
+                "curl -fsSL https://opencode.ai/install | bash",
+            )
+            .needs("bash")
+            .bin_dir("~/.opencode/bin"),
+        )
+        .method(InstallMethod::new(
+            Os::UNIX,
+            MethodKind::Brew,
+            "brew install anomalyco/tap/opencode",
+        ))
 }
 
 /*-- tests --*/

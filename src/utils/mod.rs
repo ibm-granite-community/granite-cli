@@ -1,5 +1,8 @@
 pub mod capabilities;
 pub mod hardware;
+// Unit tests use the fake install environment, never the real one.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod install;
 pub mod shell;
 pub mod subserver;
 pub mod traits;

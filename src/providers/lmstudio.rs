@@ -5,6 +5,7 @@ use crate::providers::base::{
     ProviderError, ProviderMetadata, ProviderType, http_health_check,
 };
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
+use crate::utils::install::InstallInfo;
 use crate::utils::ui::Ui;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -345,12 +346,29 @@ impl HasProviderMetadata for LMStudioProvider {
             provider_type: ProviderType::Local,
             default_endpoint: "http://localhost:1234".to_string(),
             supported_api_types: vec![ApiType::OpenAI, ApiType::Anthropic],
+            install: install_info(),
             default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: formats,
             authentication: vec![AuthType::None, AuthType::BearerToken],
             tags,
         }
     }
+}
+
+/// Install instructions for LM Studio, a desktop app with no install
+/// command. `lms` comes with the app once it has run.
+///
+/// Sources, checked 2026-10-17: https://lmstudio.ai/download,
+/// https://lmstudio.ai/docs/cli
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("lms")
+        .page("https://lmstudio.ai/download")
+        .note(
+            "LM Studio is a desktop app. Open it once to install the `lms` command, \
+             then start the server from its Developer tab or with the run command.",
+        )
+        .run_command("lms server start")
 }
 
 /*-- tests -------------------------------------------------------------------*/

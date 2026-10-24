@@ -19,6 +19,7 @@ use crate::launchers::shared::mcp_cli::{
     STDIO_AND_HTTP, mcp_binding_request, register_mcp_server, remove_mcp_server, transport_set,
 };
 use crate::registry::{ConfigConstructable, ConstructError};
+use crate::utils::install::{InstallInfo, InstallMethod, MethodKind, Os};
 use crate::utils::resolve_shell_command;
 use crate::utils::subserver::SubServer;
 use crate::utils::ui::Ui;
@@ -336,6 +337,7 @@ impl HasBobLauncherMetadata for BobLauncher {
             supported_capabilities: HashSet::from([BindingType::Mcp, BindingType::SubAgent]),
             mcp_transports: transport_set(STDIO_AND_HTTP),
             tags: vec!["bob".to_string(), "ibm".to_string()],
+            install: install_info(),
         }
     }
 }
@@ -364,6 +366,31 @@ fn ensure_workspace_config_dir(ctx: &LaunchContext) -> anyhow::Result<()> {
             dir.display()
         )
     })
+}
+
+/// Install instructions for Bob Shell.
+///
+/// Source, checked 2026-10-17:
+/// https://bob.ibm.com/docs/shell/getting-started/install-and-setup and its
+/// bobshell.sh, which asks which package manager to use unless `--pm` is
+/// given, and installs the `bob` package globally with it.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("bob")
+        .page("https://bob.ibm.com/docs/shell/getting-started/install-and-setup")
+        .note(
+            "Bob Shell needs Node.js 22.15 or later. Sign in with your IBMid the first \
+             time you run `bob`.",
+        )
+        .method(
+            InstallMethod::new(
+                Os::UNIX,
+                MethodKind::Script,
+                "curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --pm npm",
+            )
+            .needs("bash")
+            .needs("npm"),
+        )
 }
 
 /*-- tests --*/

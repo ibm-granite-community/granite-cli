@@ -204,6 +204,11 @@ mod tests {
     }
 
     #[test]
+    fn json_output_cannot_lend_the_terminal() {
+        assert!(!make().can_lend_terminal());
+    }
+
+    #[test]
     fn json_table_output_is_valid_json_with_correct_type() {
         let out = make();
         out.table(

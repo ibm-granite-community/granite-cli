@@ -21,6 +21,9 @@ pub struct AppContext {
     /// provider the sources hand out points at it, which is why setting it
     /// discards them.
     model_proxy: Option<crate::proxy::ProxyHandle>,
+    /// Where installs look programs up, run commands and check providers.
+    /// Test builds start with a fake that finds nothing and runs nothing.
+    install_env: std::sync::Arc<dyn crate::utils::install::InstallEnv>,
 }
 
 impl AppContext {
@@ -33,7 +36,23 @@ impl AppContext {
             ui,
             sources: std::sync::Mutex::new(None),
             model_proxy: None,
+            install_env: default_install_env(),
         }
+    }
+
+    /// The install environment commands use for PATH lookups, install
+    /// commands and health checks.
+    pub(crate) fn install_env(&self) -> std::sync::Arc<dyn crate::utils::install::InstallEnv> {
+        self.install_env.clone()
+    }
+
+    /// Replace the install environment, for tests that describe a machine.
+    #[cfg(test)]
+    pub(crate) fn set_install_env(
+        &mut self,
+        env: std::sync::Arc<dyn crate::utils::install::InstallEnv>,
+    ) {
+        self.install_env = env;
     }
 
     /// The configuration as it now stands.
@@ -76,4 +95,16 @@ impl AppContext {
     fn invalidate(&mut self) {
         *self.sources.lock().unwrap() = None;
     }
+}
+
+/*-- private --*/
+
+#[cfg(not(test))]
+fn default_install_env() -> std::sync::Arc<dyn crate::utils::install::InstallEnv> {
+    std::sync::Arc::new(crate::utils::install::RealInstallEnv)
+}
+
+#[cfg(test)]
+fn default_install_env() -> std::sync::Arc<dyn crate::utils::install::InstallEnv> {
+    std::sync::Arc::new(crate::utils::test_support::FakeInstallEnv::default())
 }

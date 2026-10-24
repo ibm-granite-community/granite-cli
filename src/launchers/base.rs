@@ -474,6 +474,8 @@ pub struct LauncherMetadata {
     /// enable-time validation reads it, so the two cannot disagree.
     pub mcp_transports: HashSet<crate::capabilities::McpTransportKind>,
     pub tags: Vec<String>,
+    /// How to install this type's tool. Its `program` is `default_command`.
+    pub install: crate::utils::install::InstallInfo,
 }
 
 impl std::fmt::Display for LauncherMetadata {
@@ -687,6 +689,7 @@ pub(crate) mod tests {
                 supported_capabilities: HashSet::new(),
                 mcp_transports: HashSet::new(),
                 tags: vec![],
+                install: Default::default(),
             }
         }
     }
@@ -785,6 +788,7 @@ pub(crate) mod tests {
             supported_capabilities: HashSet::new(),
             mcp_transports: HashSet::new(),
             tags: vec![],
+            install: Default::default(),
         };
         assert_eq!(meta.to_string(), "A test launcher");
     }
@@ -798,6 +802,7 @@ pub(crate) mod tests {
             supported_capabilities: HashSet::new(),
             mcp_transports: HashSet::new(),
             tags: vec!["claude".to_string(), "anthropic".to_string()],
+            install: Default::default(),
         };
         let fields = meta.search_fields();
         assert!(fields.contains(&"Claude Code"));

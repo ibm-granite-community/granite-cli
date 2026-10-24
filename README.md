@@ -59,6 +59,22 @@ If building from source is required, the script handles all Termux-specific buil
 granite-cli --help
 ```
 
+### Set up providers and agent tools
+
+`granite-cli setup` finds the model servers and agent tools on this machine
+and configures them. When it finds none of a kind, it offers to install one,
+showing the command it would run.
+
+| Flag | Purpose |
+|---|---|
+| `--auto` | Configure everything found, without asking. Installs nothing unless `--install` is given |
+| `--install <type>` | With `--auto`: install this launcher or provider type first, without asking. Repeatable, e.g. `--install ollama --install opencode`. A type already on PATH or configured is not installed again. A provider is installed but not started |
+| `--pull` | Pull model weights at the end without asking |
+| `--skip-pull` | Skip pulling model weights |
+
+`granite-cli launcher info <type>` and `granite-cli provider info <type>` show
+how to install a type on this machine.
+
 ### Shell completion
 
 `granite-cli completions <SHELL>` prints a completion script to stdout. Supported shells are `bash`, `zsh`, `fish`, `elvish` and `powershell`. The install script writes the script for bash and fish to the directories below, and prints the zsh steps.

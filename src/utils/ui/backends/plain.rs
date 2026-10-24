@@ -16,6 +16,12 @@ impl ConfigConstructable for PlainOutput {
 }
 
 impl Ui for PlainOutput {
+    /// Plain output goes straight to stdout, so a child process can share
+    /// the terminal when standard input is one.
+    fn can_lend_terminal(&self) -> bool {
+        std::io::IsTerminal::is_terminal(&std::io::stdin())
+    }
+
     fn table(&self, title: &str, headers: &[&str], rows: &[Vec<String>]) {
         println!("\n{title}");
         let col_count = headers.len();

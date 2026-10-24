@@ -17,6 +17,7 @@ use crate::launchers::shared::mcp_cli::{
     STDIO_HTTP_AND_SSE, mcp_binding_request, register_mcp_server, remove_mcp_server, transport_set,
 };
 use crate::registry::{ConfigConstructable, ConstructError};
+use crate::utils::install::{InstallInfo, InstallMethod, MethodKind, Os};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
 
@@ -432,8 +433,54 @@ impl HasClaudeLauncherMetadata for ClaudeLauncher {
             ]),
             mcp_transports: transport_set(STDIO_HTTP_AND_SSE),
             tags: vec!["claude".to_string(), "anthropic".to_string()],
+            install: install_info(),
         }
     }
+}
+
+/*-- private --*/
+
+/// Install instructions for Claude Code.
+///
+/// Source, checked 2026-10-17: https://code.claude.com/docs/en/setup. The
+/// vendor recommends the native installer, which puts `claude` in
+/// `~/.local/bin`.
+fn install_info() -> InstallInfo {
+    InstallInfo::default()
+        .program("claude")
+        .page("https://code.claude.com/docs/en/setup")
+        .method(
+            InstallMethod::new(
+                Os::UNIX,
+                MethodKind::Script,
+                "curl -fsSL https://claude.ai/install.sh | bash",
+            )
+            .needs("bash")
+            .bin_dir("~/.local/bin"),
+        )
+        .method(
+            InstallMethod::new(
+                &[Os::Windows],
+                MethodKind::Script,
+                "irm https://claude.ai/install.ps1 | iex",
+            )
+            .bin_dir("~/.local/bin"),
+        )
+        .method(InstallMethod::new(
+            &[Os::Mac],
+            MethodKind::Brew,
+            "brew install --cask claude-code",
+        ))
+        .method(InstallMethod::new(
+            &[Os::Windows],
+            MethodKind::Winget,
+            "winget install Anthropic.ClaudeCode",
+        ))
+        .method(InstallMethod::new(
+            Os::ANY,
+            MethodKind::Npm,
+            "npm install -g @anthropic-ai/claude-code",
+        ))
 }
 
 /*-- tests --*/

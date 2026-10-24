@@ -194,6 +194,14 @@ pub trait Ui: Send + Sync + Any {
         )
     }
 
+    /// Whether a child process can be given this session's terminal, to
+    /// show its own output and read its own input. False for every backend
+    /// that does not write straight to a terminal, and for the TUI, which
+    /// owns the terminal while it runs.
+    fn can_lend_terminal(&self) -> bool {
+        false
+    }
+
     /// Ask the user to pick one of `items`, returning the chosen index.
     fn select(&self, prompt: &str, items: &[String], default: usize) -> anyhow::Result<usize> {
         Ok(dialoguer::Select::new()
@@ -344,6 +352,11 @@ pub(crate) mod tests {
         /// so a test only sets this when it is testing what happens without
         /// a person to ask.
         pub interactive: RefCell<Option<bool>>,
+
+        /// Answer for `can_lend_terminal()`. `None`, the default, answers
+        /// true, as for a terminal session, so a test only sets this when it
+        /// is testing a UI that cannot lend the terminal, such as the TUI.
+        pub lends_terminal: RefCell<Option<bool>>,
     }
 
     impl ConfigConstructable for CaptureUi {
@@ -360,6 +373,10 @@ pub(crate) mod tests {
     impl Ui for CaptureUi {
         fn is_interactive(&self) -> bool {
             self.interactive.borrow().unwrap_or(true)
+        }
+
+        fn can_lend_terminal(&self) -> bool {
+            self.lends_terminal.borrow().unwrap_or(true)
         }
 
         fn table(&self, title: &str, headers: &[&str], rows: &[Vec<String>]) {
