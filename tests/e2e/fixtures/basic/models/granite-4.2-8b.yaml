@@ -1,0 +1,5 @@
+model_id: granite-4.2-8b
+model_type: granite-4.2-8b
+provider_id: ollama
+variant: GGUF/Q8_0
+config: {}

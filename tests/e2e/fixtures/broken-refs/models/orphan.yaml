@@ -1,0 +1,5 @@
+model_id: orphan
+model_type: granite-4.2-3b
+provider_id: gone
+variant: GGUF/Q8_0
+config: {}

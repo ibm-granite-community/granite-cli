@@ -1,0 +1,5 @@
+launcher_id: opencode
+type: opencode
+enabled_capabilities:
+- agent-model
+config: {}

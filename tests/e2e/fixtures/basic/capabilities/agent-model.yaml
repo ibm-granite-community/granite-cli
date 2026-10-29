@@ -1,0 +1,4 @@
+capability_id: agent-model
+type: agent-model
+config:
+  model_id: granite-4.2-8b
