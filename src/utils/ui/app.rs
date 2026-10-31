@@ -2776,6 +2776,7 @@ mod tests {
         config.models.insert(
             "my-local-model".to_string(),
             crate::config::ModelConfig {
+                discovered: None,
                 model_id: "my-local-model".to_string(),
                 model_type: "custom".to_string(),
                 provider_id: "local-openai".to_string(),

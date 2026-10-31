@@ -1,8 +1,9 @@
 use crate::models::huggingface::hf_repo_id;
-use crate::models::{ModelFunction, ModelMetadata, ModelVariant};
+use crate::models::{ModelFunction, ModelMetadata, ModelType, ModelVariant};
 use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
-    ProviderError, ProviderMetadata, ProviderType, http_health_check,
+    ProviderError, ProviderMetadata, ProviderModel, ProviderType, http_health_check,
+    is_unsupported_listing_status, parse_parameter_count,
 };
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
 use crate::utils::ui::Ui;
@@ -34,6 +35,10 @@ pub(crate) struct OllamaProviderConfig {
     /// Endpoint to use for health checks
     #[serde(default = "default_ollama_health_endpoint")]
     pub(crate) health_check_endpoint: String,
+
+    /// Mirror the models this server reports into configured models.
+    #[serde(default = "default_discover_models")]
+    pub(crate) discover_models: bool,
 }
 
 fn default_base_url() -> String {
@@ -52,6 +57,10 @@ fn default_ollama_health_endpoint() -> String {
     "/api/tags".to_string()
 }
 
+fn default_discover_models() -> bool {
+    true
+}
+
 impl Default for OllamaProviderConfig {
     fn default() -> Self {
         Self {
@@ -60,6 +69,7 @@ impl Default for OllamaProviderConfig {
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),
             health_check_endpoint: default_ollama_health_endpoint(),
+            discover_models: default_discover_models(),
         }
     }
 }
@@ -190,6 +200,57 @@ impl OllamaProvider {
 
         map
     }
+
+    /// `POST /api/show` for one model. Failure is not fatal: the caller keeps
+    /// the entry it got from `/api/tags` without context or capabilities.
+    async fn show_model(&self, id: &str) -> Option<OllamaShowResponse> {
+        let url = format!("{}/api/show", self.config.base_url);
+        let mut request = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "model": id }));
+        if let Some(key) = &self.config.api_key {
+            request = request.bearer_auth(&key.0);
+        }
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<OllamaShowResponse>().await.ok()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    models: Vec<OllamaModelTag>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModelTag {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    details: Option<OllamaModelDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModelDetails {
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    parameter_size: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    model_info: HashMap<String, serde_json::Value>,
 }
 
 impl ConfigConstructable for OllamaProvider {
@@ -275,6 +336,111 @@ impl Provider for OllamaProvider {
             self.config.api_key.as_ref(),
         )
         .await
+    }
+
+    fn discover_models(&self) -> bool {
+        self.config.discover_models
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
+        let url = format!("{}/api/tags", self.config.base_url);
+        let mut request = self.client.get(&url);
+        if let Some(key) = &self.config.api_key {
+            request = request.bearer_auth(&key.0);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(if is_unsupported_listing_status(status) {
+                ProviderError::Unsupported(format!("Ollama model discovery ({status})"))
+            } else {
+                ProviderError::Other(format!("Ollama model listing failed ({status}): {body}"))
+            });
+        }
+        let tags: OllamaTagsResponse = response
+            .json()
+            .await
+            .map_err(|e| ProviderError::Other(format!("invalid Ollama /api/tags response: {e}")))?;
+
+        let mut models = Vec::new();
+        for tag in tags.models {
+            let id = if tag.name.is_empty() {
+                tag.model
+            } else {
+                tag.name
+            };
+            if id.is_empty() {
+                continue;
+            }
+
+            // `/api/show` is the only source for context and capabilities;
+            // a failure leaves the `/api/tags` entry usable.
+            let shown = self.show_model(&id).await;
+            let capabilities = shown
+                .as_ref()
+                .map(|s| s.capabilities.as_slice())
+                .unwrap_or_default();
+            let context_length = shown.as_ref().and_then(|s| {
+                s.model_info
+                    .iter()
+                    .filter(|(key, _)| key.ends_with(".context_length"))
+                    .filter_map(|(_, value)| value.as_u64())
+                    .max()
+            });
+            let is_embedding = capabilities.iter().any(|c| c == "embedding");
+            let supported_functions = if capabilities.is_empty() {
+                // Older Ollama builds have no capabilities field. These are
+                // chat servers, so the optimistic chat/tool default applies.
+                vec![ModelFunction::Chat, ModelFunction::ToolCalling]
+            } else {
+                let mut functions = Vec::new();
+                if capabilities.iter().any(|c| c == "completion") {
+                    functions.push(ModelFunction::Chat);
+                }
+                if capabilities.iter().any(|c| c == "tools") {
+                    functions.push(ModelFunction::ToolCalling);
+                }
+                if capabilities.iter().any(|c| c == "thinking") {
+                    functions.push(ModelFunction::Thinking);
+                }
+                if capabilities.iter().any(|c| c == "vision") {
+                    functions.push(ModelFunction::ImageUnderstanding);
+                }
+                if is_embedding {
+                    functions.push(ModelFunction::Embeddings);
+                }
+                functions
+            };
+
+            let family = tag.details.as_ref().and_then(|d| d.family.clone());
+            let parameter_size = tag
+                .details
+                .as_ref()
+                .and_then(|d| d.parameter_size.as_deref());
+            let display_name = match (family, parameter_size) {
+                (Some(family), Some(size)) => Some(format!("{family} {size}")),
+                (Some(family), None) => Some(family),
+                _ => None,
+            };
+
+            models.push(ProviderModel {
+                id,
+                display_name,
+                context_length,
+                parameter_count: parameter_size.and_then(parse_parameter_count),
+                disk_size_bytes: tag.size,
+                model_type: Some(if is_embedding {
+                    ModelType::Embedding
+                } else {
+                    ModelType::Text
+                }),
+                supported_functions,
+            });
+        }
+
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
     }
 
     async fn pull_model(
@@ -432,6 +598,7 @@ mod tests {
         assert_eq!(config.timeout_secs, 10);
         assert!(config.verify_ssl);
         assert_eq!(config.health_check_endpoint, "/api/tags");
+        assert!(config.discover_models);
     }
 
     #[test]
@@ -711,5 +878,144 @@ mod tests {
         } else {
             panic!("expected PullOutcome::Error, got {result:?}");
         }
+    }
+
+    async fn discovery_server(show_status_failure: bool) -> String {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+
+        async fn tags() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "models": [
+                    {
+                        "name": "granite4:8b",
+                        "model": "granite4:8b",
+                        "size": 4_900_000_000u64,
+                        "details": {
+                            "family": "granite",
+                            "parameter_size": "8.0B",
+                            "quantization_level": "Q4_K_M"
+                        }
+                    },
+                    {
+                        "name": "nomic-embed-text:latest",
+                        "model": "nomic-embed-text:latest",
+                        "size": 274_000_000u64,
+                        "details": { "family": "nomic-bert", "parameter_size": "137M" }
+                    }
+                ]
+            }))
+        }
+
+        async fn show(axum::Json(body): axum::Json<serde_json::Value>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let model = body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if model.contains("embed") {
+                return Json(serde_json::json!({
+                    "capabilities": ["embedding"],
+                    "model_info": { "nomic_bert.context_length": 2048 }
+                }))
+                .into_response();
+            }
+            Json(serde_json::json!({
+                "capabilities": ["completion", "tools", "vision", "thinking"],
+                "model_info": { "granite.context_length": 131072 }
+            }))
+            .into_response()
+        }
+
+        let app = if show_status_failure {
+            Router::new().route("/api/tags", get(tags)).route(
+                "/api/show",
+                post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no") }),
+            )
+        } else {
+            Router::new()
+                .route("/api/tags", get(tags))
+                .route("/api/show", post(show))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn list_models_reads_tags_and_show() {
+        let provider = OllamaProvider::new(
+            "test",
+            &serde_json::json!({ "base_url": discovery_server(false).await }),
+        )
+        .unwrap();
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 2);
+
+        let chat = models.iter().find(|m| m.id == "granite4:8b").unwrap();
+        assert_eq!(chat.context_length, Some(131072));
+        assert_eq!(chat.parameter_count, Some(8_000_000_000));
+        assert_eq!(chat.disk_size_bytes, Some(4_900_000_000));
+        assert!(chat.supported_functions.contains(&ModelFunction::Chat));
+        assert!(
+            chat.supported_functions
+                .contains(&ModelFunction::ToolCalling)
+        );
+        assert!(chat.supported_functions.contains(&ModelFunction::Thinking));
+        assert!(
+            chat.supported_functions
+                .contains(&ModelFunction::ImageUnderstanding)
+        );
+        assert_eq!(chat.model_type, Some(ModelType::Text));
+
+        let embedding = models
+            .iter()
+            .find(|m| m.id == "nomic-embed-text:latest")
+            .unwrap();
+        assert_eq!(embedding.context_length, Some(2048));
+        assert_eq!(embedding.model_type, Some(ModelType::Embedding));
+        assert_eq!(
+            embedding.supported_functions,
+            vec![ModelFunction::Embeddings]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_degrades_when_show_fails() {
+        let provider = OllamaProvider::new(
+            "test",
+            &serde_json::json!({ "base_url": discovery_server(true).await }),
+        )
+        .unwrap();
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 2);
+        let chat = models.iter().find(|m| m.id == "granite4:8b").unwrap();
+        assert_eq!(chat.context_length, None);
+        assert_eq!(
+            chat.supported_functions,
+            vec![ModelFunction::Chat, ModelFunction::ToolCalling]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_fails_when_tags_are_not_a_model_list() {
+        use axum::{Router, routing::get};
+        async fn html() -> &'static str {
+            "<html>not found</html>"
+        }
+        let app = Router::new().route("/api/tags", get(html));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = OllamaProvider::new(
+            "test",
+            &serde_json::json!({ "base_url": format!("http://{addr}") }),
+        )
+        .unwrap();
+        assert!(provider.list_models().await.is_err());
     }
 }

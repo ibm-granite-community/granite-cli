@@ -92,15 +92,18 @@ pub(crate) fn prompt_with_current(
 /// How a removal command should behave when other configured instances point
 /// at the entity being removed.
 ///
-/// Passed as `--dependents <cascade|refuse|leave>` on the CLI. When the flag
-/// is omitted the caller passes `None`: an interactive session asks what to
-/// do, and a session that cannot ask refuses with exit code 1 and an error
-/// naming the three policies.
+/// Passed as `--dependents <cascade|discovered|refuse|leave>` on the CLI.
+/// When the flag is omitted the caller passes `None`: an interactive session
+/// asks what to do, and a session that cannot ask refuses with exit code 1
+/// and an error naming the four policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum DependentsPolicy {
     /// Remove the target and every dependent automatically, without asking.
     /// Cascades recursively so dependents-of-dependents are taken too.
     Cascade,
+    /// Remove the target and any dependents that provider discovery created,
+    /// without asking. Other dependents are left configured but broken.
+    Discovered,
     /// Refuse to remove the target and exit with code 1 if anything depends
     /// on it.
     Refuse,
@@ -129,12 +132,15 @@ pub(crate) enum Removal {
 ///   depends on the target. Nothing is removed or printed beyond the error.
 /// - `Some(Cascade)`: removes the target and all dependents automatically,
 ///   reporting what will be removed before doing so.
+/// - `Some(Discovered)`: removes the target and any dependents that provider
+///   discovery created, reporting what will be removed and what will be left
+///   broken. It never removes a catalog or hand-made model.
 /// - `Some(Leave)`: removes only the target; warns about what was left
 ///   broken. Same as the old non-interactive fallback.
 /// - `None`, interactive session: prompts the user with three choices.
 /// - `None`, non-interactive session (`--output json` / `--output markdown`,
 ///   or no terminal to ask on): fails with a non-zero exit, like `Refuse`,
-///   with an error that names the three policies.
+///   with an error that names the four policies.
 pub(crate) fn confirm_removal(
     ctx: &crate::AppContext,
     kind: RefKind,
@@ -150,7 +156,8 @@ pub(crate) fn confirm_removal(
         Some(DependentsPolicy::Refuse) | None if !ctx.ui.is_interactive() => {
             anyhow::bail!(
                 "Cannot remove {kind} '{id}' because other configured instances depend on it. \
-                 Pass --dependents cascade, --dependents leave, or --dependents refuse."
+                 Pass --dependents cascade, --dependents discovered, --dependents leave, or \
+                 --dependents refuse."
             );
         }
         Some(DependentsPolicy::Refuse) => {
@@ -170,6 +177,59 @@ pub(crate) fn confirm_removal(
                 ));
             }
             return Ok(Removal::Proceed { with: stranded });
+        }
+        Some(DependentsPolicy::Discovered) => {
+            let (discovered, left): (Vec<_>, Vec<_>) =
+                stranded.iter().cloned().partition(|(kind, dependent_id)| {
+                    *kind == RefKind::Model
+                        && ctx
+                            .config()
+                            .get_model(dependent_id)
+                            .is_some_and(|model| model.discovered.is_some())
+                });
+
+            if discovered.is_empty() {
+                ctx.ui.warn(&format!("Removing {kind} '{id}' will break:"));
+                for (dependent_kind, dependent_id) in &left {
+                    let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
+                        .map(|t| format!(" ({t})"))
+                        .unwrap_or_default();
+                    ctx.ui.info(&format!(
+                        "  - {dependent_kind} '{dependent_id}'{type_suffix}"
+                    ));
+                }
+                ctx.ui.warn(&format!(
+                    "Removing only {kind} '{id}'. What depended on it needs fixing."
+                ));
+                return Ok(Removal::Proceed { with: Vec::new() });
+            }
+
+            ctx.ui.warn(&format!(
+                "Removing {kind} '{id}' and its discovered models:"
+            ));
+            for (dependent_kind, dependent_id) in &discovered {
+                let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
+                    .map(|t| format!(" ({t})"))
+                    .unwrap_or_default();
+                ctx.ui.info(&format!(
+                    "  - {dependent_kind} '{dependent_id}'{type_suffix}"
+                ));
+            }
+            if !left.is_empty() {
+                ctx.ui.warn("Leaving other dependents in place:");
+                for (dependent_kind, dependent_id) in &left {
+                    let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
+                        .map(|t| format!(" ({t})"))
+                        .unwrap_or_default();
+                    ctx.ui.info(&format!(
+                        "  - {dependent_kind} '{dependent_id}'{type_suffix}"
+                    ));
+                }
+                ctx.ui.warn(&format!(
+                    "What was left after removing {kind} '{id}' needs fixing."
+                ));
+            }
+            return Ok(Removal::Proceed { with: discovered });
         }
         Some(DependentsPolicy::Leave) => {
             ctx.ui.warn(&format!("Removing {kind} '{id}' will break:"));
@@ -230,6 +290,9 @@ pub(crate) fn confirm_removal(
 ///
 /// `policy` is threaded down so that second-level dependents are also
 /// removed automatically when the original call used `--dependents cascade`.
+/// Under `--dependents discovered`, each removal applies the same filter, so
+/// a non-discovered capability or launcher reached through a removed
+/// discovered model is left in place rather than cascaded.
 pub(crate) fn remove_all(
     ctx: &mut crate::AppContext,
     ids: &[(RefKind, String)],
@@ -726,7 +789,9 @@ fn remove(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CapabilityConfig, LauncherConfig, ModelConfig, ProviderConfig};
+    use crate::config::{
+        CapabilityConfig, DiscoveredModel, LauncherConfig, ModelConfig, ProviderConfig,
+    };
     use crate::utils::ui::base::tests::CaptureUi;
     use std::sync::Arc;
 
@@ -876,6 +941,7 @@ mod tests {
         ctx.config_mut().models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 provider_id: "ollama".to_string(),
@@ -913,6 +979,33 @@ mod tests {
             .get_mut("chat")
             .unwrap()
             .config = serde_json::json!({ "model_id": "granite-3.1-8b-instruct" });
+        ctx
+    }
+
+    /// Provider `ollama` has one catalog model and one discovery-managed
+    /// model. Capability `chat` points at the discovered one, so removing the
+    /// discovered model would strand a non-discovered dependent too.
+    fn ctx_provider_with_discovered_and_user_models() -> crate::AppContext {
+        let mut ctx = ctx_model_with_one_dependent();
+        ctx.config_mut().models.insert(
+            "managed".to_string(),
+            ModelConfig {
+                model_id: "managed".to_string(),
+                model_type: "custom".to_string(),
+                provider_id: "ollama".to_string(),
+                variant: None,
+                discovered: Some(DiscoveredModel {
+                    provider_id: "ollama".to_string(),
+                    provider_model_id: "llama3:8b".to_string(),
+                }),
+                config: serde_json::json!({ "family": "Managed" }),
+            },
+        );
+        ctx.config_mut()
+            .capabilities
+            .get_mut("chat")
+            .unwrap()
+            .config = serde_json::json!({ "model_id": "managed" });
         ctx
     }
 
@@ -1052,6 +1145,59 @@ mod tests {
         assert!(ctx.config().get_provider("ollama").is_none());
         assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_none());
         assert!(ctx.config().get_capability("chat").is_none());
+    }
+
+    #[test]
+    fn removing_with_discovered_removes_discovered_models_and_leaves_other_dependents() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_provider_with_discovered_and_user_models();
+
+        ProviderCommands::remove(&mut ctx, "ollama", Some(DependentsPolicy::Discovered)).unwrap();
+
+        assert!(prompts(&ctx).is_empty());
+        assert!(ctx.config().get_provider("ollama").is_none());
+        assert!(ctx.config().get_model("managed").is_none());
+        // The catalog model, and the capability that pointed at the
+        // discovered model, are deliberately left in place.
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_some());
+        assert!(ctx.config().get_capability("chat").is_some());
+
+        let warns = capture(&ctx).warns.borrow().clone();
+        assert!(
+            warns.iter().any(|w| w.contains("discovered models")),
+            "{warns:?}"
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("Leaving other dependents in place")),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn removing_a_discovered_model_with_the_discovered_policy_bypasses_the_discovery_guard() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_provider_with_discovered_and_user_models();
+
+        ModelCommands::remove(&mut ctx, "managed", Some(DependentsPolicy::Discovered)).unwrap();
+
+        assert!(ctx.config().get_model("managed").is_none());
+        assert!(ctx.config().get_provider("ollama").is_some());
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_some());
+        assert!(ctx.config().get_capability("chat").is_some());
+    }
+
+    #[test]
+    fn removing_with_discovered_and_no_discovered_dependents_behaves_like_leave() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_model_with_one_dependent();
+
+        ProviderCommands::remove(&mut ctx, "ollama", Some(DependentsPolicy::Discovered)).unwrap();
+
+        assert!(ctx.config().get_provider("ollama").is_none());
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_some());
+        assert!(ctx.config().get_capability("chat").is_some());
     }
 
     #[test]
@@ -1363,6 +1509,7 @@ mod tests {
         ctx.config_mut().models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 provider_id: "gone-provider".to_string(),

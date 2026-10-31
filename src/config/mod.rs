@@ -76,10 +76,25 @@ pub(crate) struct ModelConfig {
     pub(crate) model_type: String,
     pub(crate) provider_id: String,
     pub(crate) variant: Option<String>,
+    /// Present only on entries provider discovery created. `None` for catalog
+    /// models and hand-made custom models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) discovered: Option<DiscoveredModel>,
     /// Model-type-specific config (e.g. `CustomModelConfig`'s fields for a
     /// `"custom"` instance). `{}` for catalog models, which take no config
     /// beyond `provider_config`.
     pub(crate) config: serde_json::Value,
+}
+
+/// Provenance for a model entry provider discovery created. Its presence is
+/// what lets sync know it may remove the entry; catalog and hand-made custom
+/// models do not carry it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DiscoveredModel {
+    /// Provider instance that created this entry.
+    pub(crate) provider_id: String,
+    /// Name requests must use upstream.
+    pub(crate) provider_model_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,15 +570,75 @@ impl Config {
     }
 
     fn id_to_filename(id: &str) -> String {
-        // NOTE: This replaces huggingface-style '/' delimiters which are not
-        // platform-specific
-        id.replace('/', PATH_DELIM)
+        // Keep `/` mapped to `PATH_DELIM` for existing configs, and escape
+        // characters that Windows rejects in file names. `%` is escaped too so
+        // the mapping stays reversible.
+        let mut filename = String::with_capacity(id.len());
+        for ch in id.chars() {
+            match ch {
+                '/' => filename.push_str(PATH_DELIM),
+                '%' => filename.push_str("%25"),
+                ':' => filename.push_str("%3A"),
+                '\\' => filename.push_str("%5C"),
+                '*' => filename.push_str("%2A"),
+                '?' => filename.push_str("%3F"),
+                '"' => filename.push_str("%22"),
+                '<' => filename.push_str("%3C"),
+                '>' => filename.push_str("%3E"),
+                '|' => filename.push_str("%7C"),
+                ch if (ch as u32) < 0x20 || ch == '\u{7f}' => {
+                    filename.push_str(&format!("%{:02X}", ch as u32));
+                }
+                ch => filename.push(ch),
+            }
+        }
+        filename
     }
 
     fn id_from_filename(id: &str) -> String {
-        // NOTE: This replaces huggingface-style '/' delimiters which are not
-        // platform-specific
-        id.replace(PATH_DELIM, "/")
+        // Undo the escapes above, then restore `/` from the legacy delimiter.
+        let bytes = id.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let (Some(high), Some(low)) =
+                    (Self::hex_value(bytes[i + 1]), Self::hex_value(bytes[i + 2]))
+            {
+                decoded.push(high * 16 + low);
+                i += 3;
+            } else {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&decoded).replace(PATH_DELIM, "/")
+    }
+
+    fn hex_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    /// Deletes the YAML file backing an entry, plus the pre-encoding filename
+    /// when it round-trips to the same id. The second check keeps an old name
+    /// that happens to be another id's current encoded name from being removed.
+    fn remove_config_file(dir: Result<PathBuf>, id: &str) {
+        let Ok(dir) = dir else {
+            return;
+        };
+        let current_name = Self::id_to_filename(id);
+        let _ = fs::remove_file(dir.join(format!("{current_name}.yaml")));
+
+        let legacy_name = id.replace('/', PATH_DELIM);
+        if legacy_name != current_name && Self::id_from_filename(&legacy_name) == id {
+            let _ = fs::remove_file(dir.join(format!("{legacy_name}.yaml")));
+        }
     }
 
     fn save(&self) -> Result<()> {
@@ -630,14 +705,38 @@ impl Config {
 
     pub(crate) fn remove_model(&mut self, id: &str) -> Result<()> {
         self.models.remove(id);
-        let path = Self::models_dir().ok().and_then(|d| {
-            let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
-            if p.exists() { Some(p) } else { None }
-        });
-        if let Some(p) = path {
-            let _ = fs::remove_file(&p);
+        Self::remove_model_file(id);
+        self.save()
+    }
+
+    /// Applies one provider's discovery result: removes model entries the
+    /// provider no longer reports, adds the ones it does, and saves once.
+    ///
+    /// Saving per model would rewrite the whole configuration for each one,
+    /// and `save()` alone would leave the YAML files of removed entries
+    /// behind, so removals delete their files here.
+    pub(crate) fn apply_model_changes(
+        &mut self,
+        additions: Vec<(String, ModelConfig)>,
+        removals: &[String],
+    ) -> Result<()> {
+        if additions.is_empty() && removals.is_empty() {
+            return Ok(());
+        }
+        for id in removals {
+            self.models.remove(id);
+            Self::remove_model_file(id);
+        }
+        for (id, config) in additions {
+            self.models.insert(id, config);
         }
         self.save()
+    }
+
+    /// Deletes the YAML file backing a model entry, best effort; an absent
+    /// file is not an error.
+    fn remove_model_file(id: &str) {
+        Self::remove_config_file(Self::models_dir(), id);
     }
 
     pub(crate) fn update_model(
@@ -666,13 +765,7 @@ impl Config {
 
     pub(crate) fn remove_provider(&mut self, id: &str) -> Result<()> {
         self.providers.remove(id);
-        let path = Self::providers_dir().ok().and_then(|d| {
-            let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
-            if p.exists() { Some(p) } else { None }
-        });
-        if let Some(p) = path {
-            let _ = fs::remove_file(&p);
-        }
+        Self::remove_config_file(Self::providers_dir(), id);
         self.save()
     }
 
@@ -702,13 +795,7 @@ impl Config {
 
     pub(crate) fn remove_capability(&mut self, id: &str) -> Result<()> {
         self.capabilities.remove(id);
-        let path = Self::capabilities_dir().ok().and_then(|d| {
-            let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
-            if p.exists() { Some(p) } else { None }
-        });
-        if let Some(p) = path {
-            let _ = fs::remove_file(&p);
-        }
+        Self::remove_config_file(Self::capabilities_dir(), id);
         self.save()
     }
 
@@ -738,13 +825,7 @@ impl Config {
 
     pub(crate) fn remove_launcher(&mut self, id: &str) -> Result<()> {
         self.launchers.remove(id);
-        let path = Self::launchers_dir().ok().and_then(|d| {
-            let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
-            if p.exists() { Some(p) } else { None }
-        });
-        if let Some(p) = path {
-            let _ = fs::remove_file(&p);
-        }
+        Self::remove_config_file(Self::launchers_dir(), id);
         self.save()
     }
 
@@ -894,6 +975,45 @@ mod tests {
         let mut config = serde_json::json!({"command_path": "claude"});
         translate_paths_in_config(&mut config, true);
         assert_eq!(config["command_path"], "claude");
+    }
+
+    #[test]
+    fn ids_with_windows_invalid_characters_round_trip_through_filenames() {
+        let ids = [
+            "granite:8b",
+            "org/model:Q4_K_M",
+            "a%b\\c*d?e\"f<g>h|i",
+            "control\u{1f}",
+            "naive-model",
+        ];
+        for id in ids {
+            let filename = Config::id_to_filename(id);
+            assert!(
+                !filename.contains(['/', ':', '\\', '*', '?', '"', '<', '>', '|', '\u{1f}']),
+                "{id} produced an unsafe filename: {filename}"
+            );
+            assert_eq!(Config::id_from_filename(&filename), id);
+        }
+        assert_eq!(Config::id_to_filename("granite:8b"), "granite%3A8b");
+        assert_eq!(Config::id_to_filename("org/model"), "org---model");
+    }
+
+    #[test]
+    fn removing_an_id_cleans_up_its_legacy_filename_only_when_unambiguous() {
+        let _home = TestConfigHome::new();
+        let dir = Config::models_dir().unwrap();
+        let legacy = dir.join("granite:8b.yaml");
+        let other_ids_current = dir.join("a%3Ab.yaml");
+        fs::write(&legacy, "legacy").unwrap();
+        fs::write(&other_ids_current, "other").unwrap();
+
+        Config::remove_config_file(Ok(dir.clone()), "granite:8b");
+        assert!(!legacy.exists());
+
+        // `a%3Ab` is the legacy name for this id, but it is also the current
+        // encoded name for `a:b`, so the guard leaves it alone.
+        Config::remove_config_file(Ok(dir), "a%3Ab");
+        assert!(other_ids_current.exists());
     }
     use super::*;
 

@@ -1,8 +1,8 @@
 use crate::models::huggingface::hf_repo_id;
-use crate::models::{ModelFunction, ModelMetadata, ModelVariant};
+use crate::models::{ModelFunction, ModelMetadata, ModelType, ModelVariant};
 use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
-    ProviderError, ProviderMetadata, ProviderType,
+    ProviderError, ProviderMetadata, ProviderModel, ProviderType, is_unsupported_listing_status,
 };
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
 use crate::utils::ui::Ui;
@@ -41,6 +41,27 @@ struct LlamaCppModelStatus {
     failed: bool,
 }
 
+/// One entry from the router's `GET /models` discovery response. Only the
+/// fields sync uses are represented; the endpoint also returns presets, args,
+/// and tags, which are noise here.
+#[derive(Debug, Deserialize)]
+struct LlamaCppDiscoveryResponse {
+    data: Vec<LlamaCppDiscoveryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaCppDiscoveryEntry {
+    id: String,
+    #[serde(default)]
+    architecture: Option<LlamaCppArchitecture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaCppArchitecture {
+    #[serde(default)]
+    input_modalities: Vec<String>,
+}
+
 /// Find the byte offset of the next `\n\n` frame terminator.
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
@@ -68,6 +89,10 @@ pub(crate) struct LlamaCppProviderConfig {
     /// Endpoint to use for health checks
     #[serde(default = "default_llamacpp_health_endpoint")]
     pub(crate) health_check_endpoint: String,
+
+    /// Mirror the models this server reports into configured models.
+    #[serde(default = "default_discover_models")]
+    pub(crate) discover_models: bool,
 }
 
 fn default_base_url() -> String {
@@ -86,6 +111,10 @@ fn default_llamacpp_health_endpoint() -> String {
     "/health".to_string()
 }
 
+fn default_discover_models() -> bool {
+    true
+}
+
 impl Default for LlamaCppProviderConfig {
     fn default() -> Self {
         Self {
@@ -94,6 +123,7 @@ impl Default for LlamaCppProviderConfig {
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),
             health_check_endpoint: default_llamacpp_health_endpoint(),
+            discover_models: default_discover_models(),
         }
     }
 }
@@ -423,6 +453,78 @@ impl Provider for LlamaCppProvider {
         }
     }
 
+    fn discover_models(&self) -> bool {
+        self.config.discover_models
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
+        let url = format!("{}/models", self.config.base_url);
+        let mut request = self.client.get(&url);
+        if let Some(key) = &self.config.api_key {
+            request = request.bearer_auth(&key.0);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(if is_unsupported_listing_status(status) {
+                ProviderError::Unsupported(format!("llama.cpp model discovery ({status})"))
+            } else {
+                ProviderError::Other(format!("llama.cpp model listing failed ({status}): {body}"))
+            });
+        }
+        let payload: LlamaCppDiscoveryResponse = response.json().await.map_err(|e| {
+            ProviderError::Other(format!("invalid llama.cpp /models response: {e}"))
+        })?;
+
+        let mut models = Vec::new();
+        for entry in payload.data {
+            if entry.id.is_empty() {
+                continue;
+            }
+            let modalities = entry
+                .architecture
+                .map(|a| a.input_modalities)
+                .unwrap_or_default();
+            let has_image = modalities.iter().any(|m| m == "image");
+            let has_audio = modalities.iter().any(|m| m == "audio");
+
+            let (model_type, supported_functions) = if has_audio {
+                (
+                    ModelType::Speech,
+                    vec![ModelFunction::Chat, ModelFunction::Transcription],
+                )
+            } else if has_image {
+                (
+                    ModelType::Vision,
+                    vec![
+                        ModelFunction::Chat,
+                        ModelFunction::ToolCalling,
+                        ModelFunction::ImageUnderstanding,
+                    ],
+                )
+            } else {
+                (
+                    ModelType::Text,
+                    vec![ModelFunction::Chat, ModelFunction::ToolCalling],
+                )
+            };
+
+            models.push(ProviderModel {
+                id: entry.id.clone(),
+                display_name: Some(entry.id),
+                context_length: None,
+                parameter_count: None,
+                disk_size_bytes: None,
+                model_type: Some(model_type),
+                supported_functions,
+            });
+        }
+
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
+    }
+
     async fn pull_model(
         &self,
         model: &ModelMetadata,
@@ -440,7 +542,6 @@ impl Provider for LlamaCppProvider {
             "{} ({} {})",
             model.family, variant.format, variant.precision
         );
-
         let post_url = format!("{}/models", self.config.base_url);
         let mut request = self
             .client
@@ -514,6 +615,7 @@ mod tests {
         assert_eq!(config.timeout_secs, 10);
         assert!(config.verify_ssl);
         assert_eq!(config.health_check_endpoint, "/health"); // /health and /v1/health are aliases
+        assert!(config.discover_models);
     }
 
     #[test]
@@ -654,5 +756,98 @@ mod tests {
         let json = r#"{"data":[{"id":"owner/repo:Q4_K_M","status":{"value":"error","failed":true}}],"object":"list"}"#;
         let parsed: LlamaCppModelsResponse = serde_json::from_str(json).unwrap();
         assert!(parsed.data[0].status.failed);
+    }
+
+    async fn discovery_server() -> String {
+        use axum::{Json, Router, routing::get};
+
+        async fn models() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "Qwen-3.8-27b-d4-UD-Q4_K_XL",
+                        "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
+                        "status": { "value": "unloaded" }
+                    },
+                    {
+                        "id": "Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M",
+                        "architecture": { "input_modalities": ["text", "image"], "output_modalities": ["text"] },
+                        "status": { "value": "loaded" }
+                    },
+                    {
+                        "id": "ibm-granite/granite-4.0-1b-speech-GGUF:Q4_K_M",
+                        "architecture": { "input_modalities": ["text", "audio"], "output_modalities": ["text"] },
+                        "status": { "value": "unloaded" }
+                    }
+                ]
+            }))
+        }
+
+        let app = Router::new().route("/models", get(models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn list_models_uses_router_models_and_modalities() {
+        let provider = LlamaCppProvider::new(
+            "test",
+            &serde_json::json!({ "base_url": discovery_server().await }),
+        )
+        .unwrap();
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 3);
+
+        let text = models
+            .iter()
+            .find(|m| m.id == "Qwen-3.8-27b-d4-UD-Q4_K_XL")
+            .unwrap();
+        assert_eq!(text.model_type, Some(ModelType::Text));
+        assert_eq!(
+            text.supported_functions,
+            vec![ModelFunction::Chat, ModelFunction::ToolCalling]
+        );
+
+        let vision = models
+            .iter()
+            .find(|m| m.id == "Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M")
+            .unwrap();
+        assert_eq!(vision.model_type, Some(ModelType::Vision));
+        assert!(
+            vision
+                .supported_functions
+                .contains(&ModelFunction::ImageUnderstanding)
+        );
+
+        let speech = models
+            .iter()
+            .find(|m| m.id == "ibm-granite/granite-4.0-1b-speech-GGUF:Q4_K_M")
+            .unwrap();
+        assert_eq!(speech.model_type, Some(ModelType::Speech));
+        assert_eq!(
+            speech.supported_functions,
+            vec![ModelFunction::Chat, ModelFunction::Transcription]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_fails_when_models_endpoint_fails() {
+        use axum::{Router, routing::get};
+        async fn fail() -> (axum::http::StatusCode, &'static str) {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+        }
+        let app = Router::new().route("/models", get(fail));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = LlamaCppProvider::new(
+            "test",
+            &serde_json::json!({ "base_url": format!("http://{addr}") }),
+        )
+        .unwrap();
+        assert!(provider.list_models().await.is_err());
     }
 }

@@ -1,8 +1,9 @@
 use crate::models::huggingface::hf_repo_id;
-use crate::models::{ModelFunction, ModelMetadata, ModelVariant};
+use crate::models::{ModelFunction, ModelMetadata, ModelType, ModelVariant};
 use crate::providers::base::{
     ApiEndpoint, ApiType, AuthType, HasProviderMetadata, HealthStatus, ModelFormat, Provider,
-    ProviderError, ProviderMetadata, ProviderType, http_health_check,
+    ProviderError, ProviderMetadata, ProviderModel, ProviderType, http_health_check,
+    is_unsupported_listing_status, parse_parameter_count,
 };
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
 use crate::utils::ui::Ui;
@@ -65,6 +66,10 @@ pub(crate) struct LMStudioProviderConfig {
     /// Endpoint to use for health checks
     #[serde(default = "default_lmstudio_health_endpoint")]
     health_check_endpoint: String,
+
+    /// Mirror the models this server reports into configured models.
+    #[serde(default = "default_discover_models")]
+    pub(crate) discover_models: bool,
 }
 
 fn default_base_url() -> String {
@@ -83,6 +88,10 @@ fn default_lmstudio_health_endpoint() -> String {
     "/v1/models".to_string()
 }
 
+fn default_discover_models() -> bool {
+    true
+}
+
 impl Default for LMStudioProviderConfig {
     fn default() -> Self {
         Self {
@@ -91,6 +100,7 @@ impl Default for LMStudioProviderConfig {
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),
             health_check_endpoint: default_lmstudio_health_endpoint(),
+            discover_models: default_discover_models(),
         }
     }
 }
@@ -149,6 +159,39 @@ impl LMStudioProvider {
 
         formats
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct LMStudioModelsResponse {
+    models: Vec<LMStudioModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LMStudioModel {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    max_context_length: Option<u64>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+    #[serde(default)]
+    params_string: Option<String>,
+    #[serde(default)]
+    capabilities: Option<LMStudioCapabilities>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LMStudioCapabilities {
+    #[serde(default)]
+    vision: bool,
+    #[serde(default)]
+    trained_for_tool_use: bool,
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
 }
 
 impl ConfigConstructable for LMStudioProvider {
@@ -221,6 +264,73 @@ impl Provider for LMStudioProvider {
             self.config.api_key.as_ref(),
         )
         .await
+    }
+
+    fn discover_models(&self) -> bool {
+        self.config.discover_models
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
+        let url = format!("{}/api/v1/models", self.config.base_url);
+        let mut request = self.client.get(&url);
+        if let Some(key) = &self.config.api_key {
+            request = request.bearer_auth(&key.0);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(if is_unsupported_listing_status(status) {
+                ProviderError::Unsupported(format!("LM Studio model discovery ({status})"))
+            } else {
+                ProviderError::Other(format!("LM Studio model listing failed ({status}): {body}"))
+            });
+        }
+        let payload: LMStudioModelsResponse = response.json().await.map_err(|e| {
+            ProviderError::Other(format!("invalid LM Studio /api/v1/models response: {e}"))
+        })?;
+
+        let mut models = Vec::new();
+        for model in payload.models {
+            if model.key.is_empty() {
+                continue;
+            }
+            let kind = model.kind.as_deref().unwrap_or("llm");
+            let capabilities = model.capabilities.as_ref();
+            let (model_type, supported_functions) = match kind {
+                "embedding" => (ModelType::Embedding, vec![ModelFunction::Embeddings]),
+                "decision" => (ModelType::Text, vec![ModelFunction::Decision]),
+                _ => {
+                    let mut functions = vec![ModelFunction::Chat];
+                    if capabilities.is_some_and(|c| c.trained_for_tool_use) {
+                        functions.push(ModelFunction::ToolCalling);
+                    }
+                    if capabilities.is_some_and(|c| c.vision) {
+                        functions.push(ModelFunction::ImageUnderstanding);
+                    }
+                    if capabilities.is_some_and(|c| c.reasoning.is_some()) {
+                        functions.push(ModelFunction::Thinking);
+                    }
+                    (ModelType::Text, functions)
+                }
+            };
+
+            models.push(ProviderModel {
+                display_name: Some(model.display_name.unwrap_or_else(|| model.key.clone())),
+                id: model.key,
+                context_length: model.max_context_length,
+                parameter_count: model
+                    .params_string
+                    .as_deref()
+                    .and_then(parse_parameter_count),
+                disk_size_bytes: model.size_bytes,
+                model_type: Some(model_type),
+                supported_functions,
+            });
+        }
+
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
     }
 
     async fn pull_model(
@@ -367,6 +477,7 @@ mod tests {
         assert_eq!(config.timeout_secs, 10);
         assert!(config.verify_ssl);
         assert_eq!(config.health_check_endpoint, "/v1/models");
+        assert!(config.discover_models);
     }
 
     #[test]
@@ -483,5 +594,116 @@ mod tests {
             hf_repo_id("https://huggingface.co/ibm-granite/granite-speech-4.1-2b"),
             Some("ibm-granite/granite-speech-4.1-2b")
         );
+    }
+
+    async fn discovery_server() -> String {
+        use axum::{Json, Router, routing::get};
+
+        async fn models() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "models": [
+                    {
+                        "type": "llm",
+                        "key": "google/gemma-4-26b-a4b",
+                        "display_name": "Gemma 4 26B A4B",
+                        "max_context_length": 262144u64,
+                        "size_bytes": 17_990_911_801u64,
+                        "params_string": "26B-A4B",
+                        "capabilities": {
+                            "vision": true,
+                            "trained_for_tool_use": true,
+                            "reasoning": { "allowed_options": ["off", "on"], "default": "on" }
+                        }
+                    },
+                    {
+                        "type": "llm",
+                        "key": "deepseek-r1",
+                        "display_name": "DeepSeek R1",
+                        "max_context_length": 131072u64,
+                        "size_bytes": 40_492_610_355u64,
+                        "params_string": "671B",
+                        "capabilities": {
+                            "vision": false,
+                            "trained_for_tool_use": true
+                        }
+                    },
+                    {
+                        "type": "embedding",
+                        "key": "nomic-embed-text",
+                        "display_name": "Nomic Embed Text",
+                        "max_context_length": 2048u64,
+                        "size_bytes": 274_290_560u64,
+                        "params_string": null
+                    }
+                ]
+            }))
+        }
+
+        let app = Router::new().route("/api/v1/models", get(models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn list_models_maps_types_and_capabilities() {
+        let provider = LMStudioProvider::new(
+            "test",
+            &serde_json::json!({ "base_url": discovery_server().await }),
+        )
+        .unwrap();
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 3);
+
+        let gemma = models
+            .iter()
+            .find(|m| m.id == "google/gemma-4-26b-a4b")
+            .unwrap();
+        assert_eq!(gemma.model_type, Some(ModelType::Text));
+        assert_eq!(gemma.context_length, Some(262144));
+        assert_eq!(gemma.parameter_count, None);
+        assert!(gemma.supported_functions.contains(&ModelFunction::Chat));
+        assert!(
+            gemma
+                .supported_functions
+                .contains(&ModelFunction::ToolCalling)
+        );
+        assert!(
+            gemma
+                .supported_functions
+                .contains(&ModelFunction::ImageUnderstanding)
+        );
+        assert!(gemma.supported_functions.contains(&ModelFunction::Thinking));
+
+        let r1 = models.iter().find(|m| m.id == "deepseek-r1").unwrap();
+        assert_eq!(r1.parameter_count, Some(671_000_000_000));
+        assert!(!r1.supported_functions.contains(&ModelFunction::Thinking));
+
+        let embedding = models.iter().find(|m| m.id == "nomic-embed-text").unwrap();
+        assert_eq!(embedding.model_type, Some(ModelType::Embedding));
+        assert_eq!(
+            embedding.supported_functions,
+            vec![ModelFunction::Embeddings]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_fails_on_a_malformed_response() {
+        use axum::{Router, routing::get};
+        async fn not_models() -> &'static str {
+            "{}"
+        }
+        let app = Router::new().route("/api/v1/models", get(not_models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = LMStudioProvider::new(
+            "test",
+            &serde_json::json!({ "base_url": format!("http://{addr}") }),
+        )
+        .unwrap();
+        assert!(provider.list_models().await.is_err());
     }
 }

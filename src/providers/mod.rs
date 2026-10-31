@@ -149,12 +149,33 @@ impl crate::dependency::Configured<dyn Provider> for ProviderSource {
     }
 }
 
+/*-- Model discovery ---------------------------------------------------------*/
+
+/// Whether a provider instance's type config has discovery on, applying the
+/// type's default when the field is absent. Reads configuration only, so a
+/// provider whose discovery is off is never constructed (and no TLS client is
+/// built for a hosted type that does not support discovery).
+///
+/// `provider_type` is the registry key, not the instance id.
+pub(crate) fn discovery_enabled(provider_type: &str, config: &serde_json::Value) -> bool {
+    config
+        .get("discover_models")
+        .and_then(|value| value.as_bool())
+        .or_else(|| {
+            PROVIDER_REGISTRY
+                .default_config(provider_type)
+                .get("discover_models")
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false)
+}
+
 /*-- Module Declarations -----------------------------------------------------*/
 
 mod base;
 pub(crate) use base::{
     ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError, ProviderMetadata,
-    ProviderType, PullResult,
+    ProviderModel, ProviderType, PullResult,
 };
 
 mod openai;
@@ -279,5 +300,28 @@ mod tests {
         let mut ids = resolution.existing_instances;
         ids.sort();
         assert_eq!(ids, vec!["llama-cpp".to_string(), "ollama".to_string()]);
+    }
+
+    #[test]
+    fn discovery_enabled_uses_the_type_default_when_the_field_is_absent() {
+        // An Ollama config written before the field existed still gets the
+        // local default (on), while types without the field stay off.
+        assert!(discovery_enabled(
+            "ollama",
+            &serde_json::json!({ "base_url": "http://localhost:11434" })
+        ));
+        assert!(!discovery_enabled(
+            "openai-compatible",
+            &serde_json::json!({ "base_url": "http://localhost:8000" })
+        ));
+        assert!(!discovery_enabled("openrouter", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn discovery_enabled_honours_an_explicit_false() {
+        assert!(!discovery_enabled(
+            "ollama",
+            &serde_json::json!({ "discover_models": false })
+        ));
     }
 }

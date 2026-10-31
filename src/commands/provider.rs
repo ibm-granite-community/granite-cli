@@ -89,10 +89,13 @@ impl ProviderCommands {
                     .and_then(|v| v.as_str())
                     .unwrap_or("-")
                     .to_string();
+                let discovery =
+                    crate::providers::discovery_enabled(&cfg.provider_type, &cfg.config);
                 vec![
                     id.clone(),
                     cfg.provider_type.clone(),
                     base_url,
+                    if discovery { "yes" } else { "-" }.to_string(),
                     notes.get(id).cloned().unwrap_or_default(),
                 ]
             })
@@ -107,7 +110,7 @@ impl ProviderCommands {
 
         ctx.ui.table(
             &format!("Configured Providers ({} providers)", rows.len()),
-            &["ID", "TYPE", "BASE URL", "NOTES"],
+            &["ID", "TYPE", "BASE URL", "DISCOVERY", "NOTES"],
             &rows,
         );
         Ok(())
@@ -196,6 +199,10 @@ impl ProviderCommands {
 
     /// Interactive provider setup wizard.
     ///
+    /// For a provider type whose config has `discover_models`, the config
+    /// prompt asks whether to mirror the models the provider reports; a
+    /// successful listing is then applied after the health check.
+    ///
     /// `provider_type` is the catalog/registry key (e.g. `openai-compatible`).
     /// `instance_id` is this instance's nickname, distinct from its type --
     /// defaults to `provider_type` when not given, but a caller may pass a
@@ -269,9 +276,7 @@ impl ProviderCommands {
             .ok_or_else(|| {
                 anyhow::anyhow!("No config schema registered for provider type '{provider_type}'")
             })?;
-        let defaults = existing_config
-            .map(|c| c.config.clone())
-            .unwrap_or_else(|| PROVIDER_REGISTRY.default_config(provider_type));
+        let defaults = prompt_defaults(provider_type, existing_config);
 
         let config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
 
@@ -304,6 +309,27 @@ impl ProviderCommands {
         ctx.ui.info(&format!(
             "\nProvider instance '{instance_id}' configured successfully!"
         ));
+        // The schema prompt already asked whether to discover models; honour
+        // it now that the provider is saved and reachable.
+        let reports = crate::commands::shared::discovery::sync_providers(
+            ctx,
+            std::slice::from_ref(&instance_id),
+        )
+        .await;
+        for report in reports {
+            match &report.status {
+                crate::commands::shared::discovery::SyncStatus::Synced => {
+                    ctx.ui.info(&format!("Discovery: {}", report.summary()));
+                }
+                crate::commands::shared::discovery::SyncStatus::Failed(error) => {
+                    ctx.ui.warn(&format!("Model discovery failed: {error}"));
+                }
+                crate::commands::shared::discovery::SyncStatus::Skipped => {}
+            }
+            for warning in &report.warnings {
+                ctx.ui.warn(warning);
+            }
+        }
         ctx.ui.info("Supported APIs:");
         for (func, endpoints) in &provider_def.default_function_endpoints {
             let endpoint_strs: Vec<String> = endpoints
@@ -317,10 +343,12 @@ impl ProviderCommands {
         Ok(())
     }
 
-    /// Check health of a provider or all configured providers.
+    /// Check health of a provider or all configured providers, and (unless
+    /// `sync` is false) reconcile the models each healthy provider reports.
     pub(crate) async fn health(
         ctx: &mut crate::AppContext,
         provider_id: Option<&str>,
+        sync: bool,
     ) -> Result<()> {
         let providers_to_check: Vec<String> = match provider_id {
             Some(id) => vec![id.to_string()],
@@ -332,6 +360,7 @@ impl ProviderCommands {
             return Ok(());
         }
 
+        let mut healthy = Vec::new();
         for id in &providers_to_check {
             match Self::check_provider_health(ctx, id).await {
                 Ok(status) => {
@@ -341,9 +370,31 @@ impl ProviderCommands {
                         format!("{}ms", status.latency.as_millis())
                     };
                     ctx.ui.status(id, status.healthy, &detail);
+                    if status.healthy {
+                        healthy.push(id.clone());
+                    }
                 }
                 Err(e) => {
                     ctx.ui.status(id, false, &e.to_string());
+                }
+            }
+        }
+
+        if sync {
+            let reports = crate::commands::shared::discovery::sync_providers(ctx, &healthy).await;
+            for report in reports {
+                match &report.status {
+                    crate::commands::shared::discovery::SyncStatus::Synced => {
+                        ctx.ui.info(&format!("Discovery: {}", report.summary()));
+                    }
+                    crate::commands::shared::discovery::SyncStatus::Failed(error) => {
+                        ctx.ui
+                            .warn(&format!("Discovery {}: {error}", report.provider_id));
+                    }
+                    crate::commands::shared::discovery::SyncStatus::Skipped => {}
+                }
+                for warning in &report.warnings {
+                    ctx.ui.warn(warning);
                 }
             }
         }
@@ -412,6 +463,29 @@ impl ProviderCommands {
 
         Ok(status)
     }
+}
+
+/*-- private -------------------------------------------------------------------*/
+
+/// The values to pre-fill the config prompt with. The type's defaults fill in
+/// fields an older config does not have yet (notably `discover_models`), so
+/// reconfiguring does not silently invert a default the runtime still uses.
+fn prompt_defaults(
+    provider_type: &str,
+    existing: Option<&crate::config::ProviderConfig>,
+) -> serde_json::Value {
+    let mut defaults = PROVIDER_REGISTRY.default_config(provider_type);
+    let Some(existing) = existing else {
+        return defaults;
+    };
+    if let (Some(defaults), Some(existing)) =
+        (defaults.as_object_mut(), existing.config.as_object())
+    {
+        for (key, value) in existing {
+            defaults.insert(key.clone(), value.clone());
+        }
+    }
+    defaults
 }
 
 /*-- tests --*/
@@ -571,6 +645,36 @@ mod tests {
     }
 
     #[test]
+    fn list_shows_discovery_state_for_each_provider_type() {
+        let mut ctx = test_ctx();
+        ctx.config_mut().providers.insert(
+            "local-ollama".to_string(),
+            ProviderConfig {
+                provider_id: "local-ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({ "base_url": "http://localhost:11434" }),
+            },
+        );
+        ctx.config_mut().providers.insert(
+            "prod-openai".to_string(),
+            ProviderConfig {
+                provider_id: "prod-openai".to_string(),
+                provider_type: "openai-compatible".to_string(),
+                config: serde_json::json!({ "base_url": "http://prod" }),
+            },
+        );
+
+        ProviderCommands::list(&ctx).unwrap();
+        let tables = tables!(ctx);
+        let (_, headers, rows) = &tables[0];
+        let discovery = headers.iter().position(|h| h == "DISCOVERY").unwrap();
+        let ollama = rows.iter().find(|row| row[0] == "local-ollama").unwrap();
+        let openai = rows.iter().find(|row| row[0] == "prod-openai").unwrap();
+        assert_eq!(ollama[discovery], "yes");
+        assert_eq!(openai[discovery], "-");
+    }
+
+    #[test]
     fn list_sorted_by_type_then_id() {
         let mut ctx = test_ctx();
         ctx.config_mut().providers.insert(
@@ -722,6 +826,29 @@ mod tests {
 
     // -- setup -----------------------------------------------------------------
 
+    #[test]
+    fn setup_defaults_fill_a_missing_discover_models_from_the_type_default() {
+        let existing = ProviderConfig {
+            provider_id: "old-ollama".to_string(),
+            provider_type: "ollama".to_string(),
+            config: serde_json::json!({ "base_url": "http://old:11434" }),
+        };
+        let defaults = prompt_defaults("ollama", Some(&existing));
+        assert_eq!(defaults["base_url"], "http://old:11434");
+        assert_eq!(defaults["discover_models"], true);
+    }
+
+    #[test]
+    fn setup_defaults_keep_an_explicit_discover_models_choice() {
+        let existing = ProviderConfig {
+            provider_id: "off-ollama".to_string(),
+            provider_type: "ollama".to_string(),
+            config: serde_json::json!({ "discover_models": false }),
+        };
+        let defaults = prompt_defaults("ollama", Some(&existing));
+        assert_eq!(defaults["discover_models"], false);
+    }
+
     /// A provider that could not be saved must fail the setup, not report
     /// success over configuration that never reached disk.
     #[cfg(unix)]
@@ -753,7 +880,9 @@ mod tests {
     #[tokio::test]
     async fn health_no_providers_emits_info_message() {
         let mut ctx = test_ctx();
-        ProviderCommands::health(&mut ctx, None).await.unwrap();
+        ProviderCommands::health(&mut ctx, None, false)
+            .await
+            .unwrap();
         assert!(!infos!(ctx).is_empty());
         assert!(statuses!(ctx).is_empty());
     }

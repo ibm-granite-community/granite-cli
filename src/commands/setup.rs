@@ -1298,6 +1298,8 @@ impl SetupCommands {
         )
         .await?;
 
+        Self::sync_discovered(ctx, &selected_providers).await;
+
         // Phase 6: Pull (optional)
         match pull {
             Some(false) => {}
@@ -1376,6 +1378,8 @@ impl SetupCommands {
             &selection.recommended_capability_types_by_launcher,
         )
         .await?;
+
+        Self::sync_discovered(ctx, &selection.providers).await;
 
         // Only pull if explicitly requested via --pull; never prompt in auto mode.
         if pull == Some(true) {
@@ -2367,6 +2371,7 @@ impl SetupCommands {
             }
 
             let model_config = crate::config::ModelConfig {
+                discovered: None,
                 model_id: model_id.clone(),
                 model_type: model_id.clone(),
                 config: serde_json::json!({}),
@@ -2704,6 +2709,32 @@ impl SetupCommands {
 
     /*-- Summary phase -------------------------------------------------------*/
 
+    /// Reconciles the models of the providers the wizard just configured.
+    /// Discovery is part of each provider type's defaults, so a local
+    /// provider set up here already has the models it reports available for
+    /// the next run. Failures are warnings; setup has already succeeded.
+    async fn sync_discovered(ctx: &mut crate::AppContext, providers: &HashSet<String>) {
+        let ids: Vec<String> = providers.iter().cloned().collect();
+        let reports = crate::commands::shared::discovery::sync_providers(ctx, &ids).await;
+        for report in reports {
+            if matches!(
+                report.status,
+                crate::commands::shared::discovery::SyncStatus::Synced
+            ) {
+                ctx.ui.info(&format!("Discovery: {}", report.summary()));
+            }
+            if let crate::commands::shared::discovery::SyncStatus::Failed(error) = &report.status {
+                ctx.ui.warn(&format!(
+                    "Model discovery for '{}' failed: {error}",
+                    report.provider_id
+                ));
+            }
+            for warning in &report.warnings {
+                ctx.ui.warn(warning);
+            }
+        }
+    }
+
     fn print_summary(
         ctx: &crate::AppContext,
         selected_caps: &HashSet<String>,
@@ -2802,6 +2833,7 @@ mod tests {
         ctx.config_mut().models.insert(
             id.to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: id.to_string(),
                 model_type: id.to_string(),
                 config: serde_json::json!({}),
@@ -3788,6 +3820,7 @@ mod tests {
         ctx.config_mut().models.insert(
             model_id.to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: model_id.to_string(),
                 model_type: model_id.to_string(),
                 config: serde_json::json!({}),

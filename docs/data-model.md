@@ -71,5 +71,32 @@ A capability's model id is stored inside its `config` blob, under the key that
 its type's `CapabilityMetadata.dependencies[].config_key` names. Reading that id
 needs the capability's type reference to resolve first.
 
+## Provider model discovery
+
+`ProviderConfig.config` may carry `discover_models: bool` for provider types
+whose listing API granite-cli understands (Ollama, LM Studio, llama.cpp). It is
+a setting, not a reference. When it is on, a successful listing from that
+provider is authoritative for the model entries discovery created from it.
+
+Those entries add a field the diagram does not show:
+
+```yaml
+# models/<id>.yaml
+model_id: llama3:8b
+model_type: custom
+provider_id: ollama
+variant: ~
+discovered:
+  provider_id: ollama
+  provider_model_id: llama3:8b
+config: { ... }        # CustomModelConfig fields
+```
+
+`discovered` is provenance, not a second reference: `ModelConfig.provider_id`
+remains the required id reference. Its presence is what lets sync remove the
+entry when the provider stops reporting it, and what makes `model remove`
+refuse while that provider's discovery is on. Catalog entries and hand-made
+custom models have no `discovered` field and are never touched by sync.
+
 In YAML, `provider_type`, `capability_type` and `launcher_type` are written as
 `type`. `model_type` keeps its name.

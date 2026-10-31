@@ -96,6 +96,15 @@ impl ModelSource {
         self.configs.get(model_id).and_then(|mc| mc.variant.clone())
     }
 
+    /// The provider's own name for `model_id`, when discovery created the
+    /// entry under a different configured instance id.
+    pub(crate) fn provider_model_id(&self, model_id: &str) -> Option<String> {
+        self.configs
+            .get(model_id)
+            .and_then(|mc| mc.discovered.as_ref())
+            .map(|discovered| discovered.provider_model_id.clone())
+    }
+
     /// The model configured under `model_id` (the instance id -- matches
     /// `ModelConfig.model_id`, which config loading enforces equals the outer
     /// `config.models` key), built on the first ask and returned from the
@@ -162,6 +171,7 @@ impl base::ModelLookup for ModelSource {
             model,
             self.provider_for(model_id)?,
             self.configured_variant(model_id),
+            self.provider_model_id(model_id),
         ))
     }
 }
@@ -265,6 +275,7 @@ pub(crate) use base::{
 pub(crate) use base::{LayerKind, LayerTypeCount};
 
 mod custom;
+pub(crate) mod discovery;
 
 pub(crate) mod context_fit;
 pub(crate) use context_fit::{ContextFit, required_gb};
@@ -306,6 +317,7 @@ mod tests {
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
@@ -316,6 +328,7 @@ mod tests {
         config.models.insert(
             "granite-guardian-3.1-8b".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-guardian-3.1-8b".to_string(),
                 model_type: "granite-guardian-3.1-8b".to_string(),
                 config: serde_json::json!({}),
@@ -352,6 +365,7 @@ mod tests {
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
@@ -373,6 +387,7 @@ mod tests {
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
@@ -402,6 +417,7 @@ mod tests {
         config.models.insert(
             "not-a-real-model".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "not-a-real-model".to_string(),
                 model_type: "not-a-real-model".to_string(),
                 config: serde_json::json!({}),
@@ -422,6 +438,7 @@ mod tests {
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
@@ -448,6 +465,7 @@ mod tests {
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
@@ -491,6 +509,7 @@ mod tests {
         config.models.insert(
             "mystery".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "mystery".to_string(),
                 model_type: "not-a-catalog-id".to_string(),
                 config: serde_json::json!({}),
@@ -517,6 +536,7 @@ mod tests {
             config.models.insert(
                 id.to_string(),
                 ModelConfig {
+                    discovered: None,
                     model_id: id.to_string(),
                     model_type: id.to_string(),
                     config: serde_json::json!({}),
@@ -549,6 +569,7 @@ mod tests {
             config.models.insert(
                 id.to_string(),
                 ModelConfig {
+                    discovered: None,
                     model_id: id.to_string(),
                     model_type: model_type.to_string(),
                     config: serde_json::json!({}),
@@ -597,6 +618,7 @@ mod tests {
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),
@@ -668,6 +690,7 @@ mod tests {
         config.models.insert(
             model_id.to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: model_id.to_string(),
                 model_type: model_id.to_string(),
                 config: serde_json::json!({}),

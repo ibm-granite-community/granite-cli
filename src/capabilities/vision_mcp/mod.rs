@@ -308,6 +308,7 @@ mod tests {
         config.models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "granite-3.1-8b-instruct".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 config: serde_json::json!({}),

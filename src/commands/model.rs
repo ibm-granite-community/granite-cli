@@ -629,11 +629,17 @@ impl ModelCommands {
 
                 ctx.ui.detail("Type Metadata", &type_fields);
 
-                let instance_fields: Vec<(&str, String)> = vec![
+                let mut instance_fields: Vec<(&str, String)> = vec![
                     ("Config: Type", model_config.model_type.clone()),
                     ("Config: Provider", model_config.provider_id.clone()),
                     ("Config: Variant", variant_field(&model_config.variant)),
                 ];
+                if let Some(discovered) = &model_config.discovered {
+                    instance_fields
+                        .push(("Config: Discovered from", discovered.provider_id.clone()));
+                    instance_fields
+                        .push(("Config: Wire name", discovered.provider_model_id.clone()));
+                }
                 ctx.ui.detail(id, &instance_fields);
                 return Ok(());
             }
@@ -718,6 +724,9 @@ impl ModelCommands {
         };
 
         let existing_config = ctx.config().get_model(&instance_id).cloned();
+        let existing_discovered = existing_config
+            .as_ref()
+            .and_then(|config| config.discovered.clone());
         if existing_config.is_some() && !force_overwrite {
             let overwrite = ctx.ui.confirm(
                 &format!("Model '{instance_id}' is already configured. Overwrite?"),
@@ -787,7 +796,19 @@ impl ModelCommands {
             Self::select_provider(ctx, &resolution, current_provider.as_deref()).await?
         };
 
+        if let Some(discovered) = &existing_discovered
+            && discovered.provider_id != provider_id
+        {
+            anyhow::bail!(
+                "Model '{instance_id}' was discovered from provider '{}'. Turn that \
+                 provider's discovery off before reconfiguring the model against a \
+                 different provider.",
+                discovered.provider_id
+            );
+        }
+
         let model_config = crate::config::ModelConfig {
+            discovered: existing_discovered,
             model_id: instance_id.clone(),
             model_type: model_type.to_string(),
             provider_id: provider_id.clone(),
@@ -944,6 +965,37 @@ impl ModelCommands {
     ) -> Result<()> {
         if ctx.config().get_model(model_id).is_none() {
             anyhow::bail!("No model configured with id '{model_id}'. Nothing to remove.");
+        }
+
+        // A discovery-managed model belongs to its provider while that
+        // provider's discovery is on: removing it here would only be undone
+        // by the next sync. Turning discovery off, or naming the discovered
+        // policy, is the explicit escape hatch. If the provider cannot be
+        // built, no sync can re-add the model, so allow the removal there too.
+        let remove_discovered = matches!(
+            policy,
+            Some(crate::commands::shared::remediation::DependentsPolicy::Discovered)
+        );
+        let discovered = ctx
+            .config()
+            .get_model(model_id)
+            .and_then(|config| config.discovered.clone());
+        if let Some(discovered) = discovered {
+            let discovery_on = ctx
+                .sources()
+                .providers()
+                .upstream(&discovered.provider_id)
+                .map(|provider| provider.discover_models())
+                .unwrap_or(false);
+            if discovery_on && !remove_discovered {
+                anyhow::bail!(
+                    "Model '{model_id}' is managed by provider '{}', which has model discovery on. \
+                     Remove it at the provider instead: turn discovery off (provider setup {}), or \
+                     remove the provider. Re-running with discovery on would only discover it again.",
+                    discovered.provider_id,
+                    discovered.provider_id
+                );
+            }
         }
 
         // Anything pointing at it would be stranded by this removal.
@@ -1145,6 +1197,7 @@ mod tests {
         ctx.config_mut().models.insert(
             id.to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: id.to_string(),
                 model_type: id.to_string(),
                 provider_id: provider_id.unwrap_or("ollama").to_string(),
@@ -1166,6 +1219,7 @@ mod tests {
         config.models.insert(
             model_id.to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: model_id.to_string(),
                 model_type: model_id.to_string(),
                 provider_id: provider_id.to_string(),
@@ -1983,6 +2037,86 @@ mod tests {
 
     // -- remove -------------------------------------------------------------
 
+    fn ctx_with_discovered_model(discover: bool) -> crate::AppContext {
+        ctx_with_discovered_model_of_type(
+            "ollama",
+            serde_json::json!({ "discover_models": discover }),
+        )
+    }
+
+    fn ctx_with_discovered_model_of_type(
+        provider_type: &str,
+        provider_config: serde_json::Value,
+    ) -> crate::AppContext {
+        let mut config = Config::default();
+        config.providers.insert(
+            "my-ollama".to_string(),
+            crate::config::ProviderConfig {
+                provider_id: "my-ollama".to_string(),
+                provider_type: provider_type.to_string(),
+                config: provider_config,
+            },
+        );
+        config.models.insert(
+            "managed".to_string(),
+            ModelConfig {
+                model_id: "managed".to_string(),
+                model_type: "custom".to_string(),
+                provider_id: "my-ollama".to_string(),
+                variant: None,
+                discovered: Some(crate::config::DiscoveredModel {
+                    provider_id: "my-ollama".to_string(),
+                    provider_model_id: "llama3:8b".to_string(),
+                }),
+                config: serde_json::json!({ "family": "managed" }),
+            },
+        );
+        crate::AppContext::new(config, Arc::new(CaptureUi::default()))
+    }
+
+    #[test]
+    fn remove_refuses_a_discovery_managed_model_while_discovery_is_on() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_discovered_model(true);
+        let error = ModelCommands::remove(&mut ctx, "managed", None)
+            .expect_err("a managed model must not be removable while discovery is on");
+        assert!(error.to_string().contains("managed by provider"), "{error}");
+        assert!(ctx.config().get_model("managed").is_some());
+    }
+
+    #[test]
+    fn remove_allows_a_discovery_managed_model_once_discovery_is_off() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_discovered_model(false);
+        ModelCommands::remove(&mut ctx, "managed", None).unwrap();
+        assert!(ctx.config().get_model("managed").is_none());
+    }
+
+    #[test]
+    fn remove_allows_a_discovered_model_when_its_provider_cannot_be_built() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_discovered_model_of_type(
+            "not-a-provider-type",
+            serde_json::json!({ "discover_models": true }),
+        );
+        ModelCommands::remove(&mut ctx, "managed", None).unwrap();
+        assert!(ctx.config().get_model("managed").is_none());
+    }
+
+    #[test]
+    fn remove_allows_a_discovered_model_on_a_type_without_discovery() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_discovered_model_of_type(
+            "openai-compatible",
+            serde_json::json!({
+                "base_url": "http://localhost:8000",
+                "discover_models": true
+            }),
+        );
+        ModelCommands::remove(&mut ctx, "managed", None).unwrap();
+        assert!(ctx.config().get_model("managed").is_none());
+    }
+
     #[test]
     fn remove_existing_model_succeeds_and_disappears_from_list() {
         let _home = crate::config::TestConfigHome::new();
@@ -2039,6 +2173,7 @@ mod tests {
         ctx.config_mut().models.insert(
             instance_id.to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: instance_id.to_string(),
                 model_type: "custom".to_string(),
                 provider_id: provider_id.unwrap_or("ollama").to_string(),
@@ -2148,6 +2283,7 @@ mod tests {
         config.models.insert(
             "my-custom".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "my-custom".to_string(),
                 model_type: "custom".to_string(),
                 provider_id: "openai".to_string(),
@@ -2212,6 +2348,106 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("variant")),
             "should not have prompted for a variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_on_a_discovered_model_preserves_provenance() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut config = config_with_provider(
+            "my-ollama",
+            "ollama",
+            serde_json::json!({ "discover_models": true }),
+        );
+        config.models.insert(
+            "managed".to_string(),
+            ModelConfig {
+                model_id: "managed".to_string(),
+                model_type: "custom".to_string(),
+                provider_id: "my-ollama".to_string(),
+                variant: None,
+                discovered: Some(crate::config::DiscoveredModel {
+                    provider_id: "my-ollama".to_string(),
+                    provider_model_id: "llama3:8b".to_string(),
+                }),
+                config: serde_json::json!({ "family": "Managed" }),
+            },
+        );
+        let mut ctx = ctx_with_config(config);
+
+        ModelCommands::setup(&mut ctx, "custom", Some("managed"), true)
+            .await
+            .unwrap();
+
+        let configured = ctx.config().get_model("managed").unwrap();
+        assert_eq!(configured.provider_id, "my-ollama");
+        assert_eq!(
+            configured.discovered,
+            Some(crate::config::DiscoveredModel {
+                provider_id: "my-ollama".to_string(),
+                provider_model_id: "llama3:8b".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_refuses_to_move_a_discovered_model_to_another_provider() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut config = config_with_provider(
+            "my-openai",
+            "openai-compatible",
+            serde_json::json!({ "base_url": "http://localhost:8080" }),
+        );
+        config.models.insert(
+            "managed".to_string(),
+            ModelConfig {
+                model_id: "managed".to_string(),
+                model_type: "custom".to_string(),
+                provider_id: "gone".to_string(),
+                variant: None,
+                discovered: Some(crate::config::DiscoveredModel {
+                    provider_id: "gone".to_string(),
+                    provider_model_id: "llama3:8b".to_string(),
+                }),
+                config: serde_json::json!({ "family": "Managed" }),
+            },
+        );
+        let mut ctx = ctx_with_config(config);
+
+        let error = ModelCommands::setup(&mut ctx, "custom", Some("managed"), true)
+            .await
+            .expect_err("a discovered model must keep its provider");
+        assert!(
+            error.to_string().contains("discovered from provider"),
+            "{error}"
+        );
+
+        let configured = ctx.config().get_model("managed").unwrap();
+        assert_eq!(configured.provider_id, "gone");
+        assert!(configured.discovered.is_some());
+    }
+
+    #[tokio::test]
+    async fn info_shows_discovered_provenance() {
+        let mut ctx = ctx_with_discovered_model(false);
+        ModelCommands::info(&mut ctx, "managed").await.unwrap();
+
+        let details = details!(ctx);
+        let (_, fields) = details
+            .iter()
+            .find(|(title, _)| title == "managed")
+            .expect("a detail record for the model instance");
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| k == "Config: Discovered from" && v == "my-ollama"),
+            "{fields:?}"
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| k == "Config: Wire name" && v == "llama3:8b"),
+            "{fields:?}"
         );
     }
 

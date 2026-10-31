@@ -240,6 +240,10 @@ pub(crate) struct ConfiguredModel {
     /// user configured a specific variant. Used at bind time to resolve the
     /// provider-specific model alias.
     configured_variant: Option<String>,
+    /// The name the provider knows this model by, from
+    /// `ModelConfig.discovered` when discovery created the entry. Sends the
+    /// right name even when the configured instance id is different.
+    provider_model_id: Option<String>,
 }
 
 /// Resolves a `"format/precision"` variant string (as stored in
@@ -266,11 +270,13 @@ impl ConfiguredModel {
         model: std::sync::Arc<dyn Model>,
         provider: std::sync::Arc<dyn crate::providers::Provider>,
         configured_variant: Option<String>,
+        provider_model_id: Option<String>,
     ) -> Self {
         Self {
             model,
             provider,
             configured_variant,
+            provider_model_id,
         }
     }
 
@@ -286,6 +292,7 @@ impl ConfiguredModel {
             model,
             provider,
             configured_variant,
+            provider_model_id: None,
         }
     }
 
@@ -335,6 +342,7 @@ impl ConfiguredModel {
             })?;
         let model_name = provider
             .model_alias(model_id.to_string(), self.resolve_variant())
+            .or_else(|| self.provider_model_id.clone())
             .unwrap_or_else(|| model_id.to_string());
         Ok((provider, endpoint, model_name))
     }
@@ -399,7 +407,15 @@ impl Searchable for ModelMetadata {
 /*-- Supporting Types --------------------------------------------------------*/
 
 #[derive(
-    Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema, clap::ValueEnum,
+    Debug,
+    Clone,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    clap::ValueEnum,
 )]
 pub(crate) enum ModelType {
     #[default]

@@ -371,6 +371,7 @@ mod tests {
         config.models.insert(
             "my-model".to_string(),
             ModelConfig {
+                discovered: None,
                 model_id: "my-model".to_string(),
                 model_type: "granite-3.1-8b-instruct".to_string(),
                 provider_id: "my-ollama".to_string(),

@@ -548,6 +548,7 @@ mod tests {
 
     fn model(id: &str, model_type: &str, provider_id: Option<&str>) -> ModelConfig {
         ModelConfig {
+            discovered: None,
             model_id: id.to_string(),
             model_type: model_type.to_string(),
             provider_id: provider_id.unwrap_or("ollama").to_string(),
@@ -999,6 +1000,7 @@ mod tests {
         config.models.insert(
             "m-vision".into(),
             ModelConfig {
+                discovered: None,
                 model_id: "m-vision".to_string(),
                 model_type: "custom".to_string(),
                 provider_id: "p1".to_string(),

@@ -267,8 +267,9 @@ enum ModelSubcommands {
         model_id: String,
 
         /// How to handle other configured instances that depend on this model.
-        /// `cascade` removes them too; `refuse` aborts with a non-zero exit;
-        /// `leave` removes only this model and leaves dependents broken.
+        /// `cascade` removes them too; `discovered` removes only dependents
+        /// created by provider discovery; `refuse` aborts with a non-zero
+        /// exit; `leave` removes only this model and leaves dependents broken.
         /// Omitting the flag prompts when the run can ask; otherwise, when
         /// something depends on it, it aborts with a non-zero exit that
         /// names the policies.
@@ -309,7 +310,8 @@ enum CapabilitySubcommands {
         capability_id: String,
 
         /// How to handle other configured instances that depend on this
-        /// capability. `cascade` removes them too; `refuse` aborts with a
+        /// capability. `cascade` removes them too; `discovered` removes only
+        /// dependents created by provider discovery; `refuse` aborts with a
         /// non-zero exit; `leave` removes only this capability and leaves
         /// dependents broken. Omitting the flag prompts when the run can
         /// ask; otherwise, when something depends on it, it aborts with a
@@ -337,7 +339,8 @@ enum ProviderSubcommands {
         provider_id: String,
     },
 
-    /// Interactive provider setup wizard
+    /// Interactive provider setup wizard, including whether to mirror the
+    /// models the provider reports (for provider types that support it)
     Setup {
         /// Catalog provider type to set up (e.g. `openai-compatible`)
         provider_type: String,
@@ -349,10 +352,16 @@ enum ProviderSubcommands {
         instance_id: Option<String>,
     },
 
-    /// Check provider health
+    /// Check provider health, then reconcile the models each healthy provider
+    /// reports when its model discovery is on
     Health {
         /// Provider ID (optional, checks all if not specified)
         provider_id: Option<String>,
+
+        /// Do not reconcile the models each healthy provider reports.
+        /// Discovery is on by default for providers configured for it.
+        #[arg(long)]
+        no_sync: bool,
     },
 
     /// Remove a configured provider instance
@@ -361,7 +370,8 @@ enum ProviderSubcommands {
         provider_id: String,
 
         /// How to handle other configured instances that depend on this
-        /// provider. `cascade` removes them too; `refuse` aborts with a
+        /// provider. `cascade` removes them too; `discovered` removes only
+        /// dependents created by provider discovery; `refuse` aborts with a
         /// non-zero exit; `leave` removes only this provider and leaves
         /// dependents broken. Omitting the flag prompts when the run can
         /// ask; otherwise, when something depends on it, it aborts with a
@@ -403,7 +413,8 @@ enum LauncherSubcommands {
         launcher_id: String,
 
         /// How to handle other configured instances that depend on this
-        /// launcher. `cascade` removes them too; `refuse` aborts with a
+        /// launcher. `cascade` removes them too; `discovered` removes only
+        /// dependents created by provider discovery; `refuse` aborts with a
         /// non-zero exit; `leave` removes only this launcher and leaves
         /// dependents broken. Omitting the flag prompts when the run can
         /// ask; otherwise, when something depends on it, it aborts with a
@@ -835,9 +846,10 @@ async fn run_provider_command(
             provider_type,
             instance_id,
         } => ProviderCommands::setup(ctx, &provider_type, instance_id.as_deref(), false).await,
-        ProviderSubcommands::Health { provider_id } => {
-            ProviderCommands::health(ctx, provider_id.as_deref()).await
-        }
+        ProviderSubcommands::Health {
+            provider_id,
+            no_sync,
+        } => ProviderCommands::health(ctx, provider_id.as_deref(), !no_sync).await,
         ProviderSubcommands::Remove {
             provider_id,
             dependents,

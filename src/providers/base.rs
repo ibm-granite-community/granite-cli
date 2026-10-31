@@ -1,4 +1,4 @@
-use crate::models::{ModelFunction, ModelVariant};
+use crate::models::{ModelFunction, ModelType, ModelVariant};
 use crate::registry::{ConfigConstructable, Secret};
 use crate::utils::Searchable;
 use async_trait::async_trait;
@@ -204,6 +204,70 @@ pub(crate) trait Provider: crate::registry::Named + Send + Sync {
     ) -> Result<PullResult, ProviderError> {
         Ok(PullResult::Unnecessary)
     }
+
+    /// Whether this instance is configured to mirror the provider's reported
+    /// model list into configured models. Providers whose type config has no
+    /// `discover_models` setting keep the default, which also means "cannot
+    /// list models".
+    fn discover_models(&self) -> bool {
+        false
+    }
+
+    /// Models this provider instance currently serves. The default says the
+    /// provider cannot be asked, so a caller can tell "unsupported" from
+    /// "supported and empty".
+    async fn list_models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
+        Err(ProviderError::Unsupported("model discovery".to_string()))
+    }
+}
+
+/*-- ProviderModel -----------------------------------------------------------*/
+
+/// One model a provider reports as available, reduced to what its listing
+/// endpoint says. Fields the provider does not report stay `None`, never
+/// guessed here -- the importer decides defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderModel {
+    /// The name requests must use. Always present.
+    pub(crate) id: String,
+    /// Human-facing name, when the provider gives one.
+    pub(crate) display_name: Option<String>,
+    /// Context window in tokens, when reported.
+    pub(crate) context_length: Option<u64>,
+    /// Parameter count (not download size), when reported.
+    pub(crate) parameter_count: Option<u64>,
+    /// On-disk/download size in bytes, for display only.
+    pub(crate) disk_size_bytes: Option<u64>,
+    pub(crate) model_type: Option<ModelType>,
+    /// Empty when the listing says nothing about capabilities. Not a fallback
+    /// list: falling back is the importer's decision, not the parser's.
+    pub(crate) supported_functions: Vec<ModelFunction>,
+}
+
+/// Parses a human-readable parameter count such as `7B`, `8.0B`, or `258M`
+/// into a count. Returns `None` for compound strings such as `26B-A4B` that
+/// do not describe a single number.
+pub(crate) fn parse_parameter_count(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    let (number, multiplier) = match raw.chars().last()? {
+        'B' | 'b' => (&raw[..raw.len() - 1], 1_000_000_000_f64),
+        'M' | 'm' => (&raw[..raw.len() - 1], 1_000_000_f64),
+        'K' | 'k' => (&raw[..raw.len() - 1], 1_000_f64),
+        _ => return None,
+    };
+    let value: f64 = number.parse().ok()?;
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    Some((value * multiplier) as u64)
+}
+
+/// Whether a model-listing endpoint is absent rather than broken. A 404 or
+/// 405 means the provider cannot be asked for its models, not that discovery
+/// failed, so callers can skip it instead of reporting a write-affecting
+/// failure.
+pub(crate) fn is_unsupported_listing_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
 }
 
 /*-- Pull Result Types -------------------------------------------------------*/
@@ -397,6 +461,9 @@ pub(crate) enum ProviderError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
     #[error("Provider error: {0}")]
     Other(String),
 }
@@ -481,6 +548,36 @@ mod tests {
         );
         assert_eq!(ModelFunction::Transcription.to_string(), "Transcription");
         assert_eq!(ModelFunction::Decision.to_string(), "Decision");
+    }
+
+    #[test]
+    fn parse_parameter_count_understands_suffixes() {
+        assert_eq!(parse_parameter_count("8.0B"), Some(8_000_000_000));
+        assert_eq!(parse_parameter_count("7B"), Some(7_000_000_000));
+        assert_eq!(parse_parameter_count("258M"), Some(258_000_000));
+        assert_eq!(parse_parameter_count("1.5K"), Some(1_500));
+    }
+
+    #[test]
+    fn parse_parameter_count_rejects_compound_and_invalid_values() {
+        assert_eq!(parse_parameter_count("26B-A4B"), None);
+        assert_eq!(parse_parameter_count("671B"), Some(671_000_000_000));
+        assert_eq!(parse_parameter_count(""), None);
+        assert_eq!(parse_parameter_count("many"), None);
+        assert_eq!(parse_parameter_count("0B"), None);
+    }
+
+    #[test]
+    fn missing_listing_endpoints_are_unsupported() {
+        assert!(is_unsupported_listing_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(is_unsupported_listing_status(
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ));
+        assert!(!is_unsupported_listing_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 
     #[test]
