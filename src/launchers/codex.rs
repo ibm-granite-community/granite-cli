@@ -31,7 +31,7 @@ use crate::capabilities::{
 };
 use crate::launchers::base::HasLauncherMetadata as HasCodexLauncherMetadata;
 use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
-use crate::launchers::shared::mcp_cli::mcp_binding_request;
+use crate::launchers::shared::mcp_cli::{mcp_binding_request, transport_set};
 use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
@@ -110,10 +110,6 @@ impl crate::registry::Named for CodexLauncher {
 
 #[async_trait]
 impl Launcher for CodexLauncher {
-    fn name(&self) -> &str {
-        "Codex CLI"
-    }
-
     fn command(&self) -> &str {
         self.config.command_path.as_deref().unwrap_or("codex")
     }
@@ -129,7 +125,7 @@ impl Launcher for CodexLauncher {
         }
 
         if capability_types.contains(&BindingType::Mcp) {
-            let binding = capability.bind(mcp_binding_request()).await?;
+            let binding = capability.bind(mcp_binding_request(&Self::metadata().mcp_transports)).await?;
             match binding {
                 Binding::Mcp(binding) => {
                     self.bound_mcp_bindings
@@ -310,6 +306,7 @@ impl HasCodexLauncherMetadata for CodexLauncher {
                 BindingType::Mcp,
                 BindingType::SubAgent,
             ]),
+            mcp_transports: transport_set(&crate::launchers::shared::mcp_cli::STDIO_HTTP_AND_SSE),
             tags: vec!["codex".to_string(), "openai".to_string()],
         }
     }
@@ -1597,12 +1594,6 @@ mod tests {
         }
 
         impl crate::capabilities::CapabilityInfo for FakeSubAgentCapability {
-            fn name(&self) -> &str {
-                "Fake"
-            }
-            fn description(&self) -> &str {
-                "test"
-            }
             fn binding_types(&self) -> HashSet<BindingType> {
                 HashSet::from([BindingType::SubAgent])
             }
@@ -1658,12 +1649,6 @@ mod tests {
         }
 
         impl crate::capabilities::CapabilityInfo for FakeAgentModelCapability {
-            fn name(&self) -> &str {
-                "Fake"
-            }
-            fn description(&self) -> &str {
-                "test"
-            }
             fn binding_types(&self) -> HashSet<BindingType> {
                 HashSet::from([BindingType::AgentModel])
             }
