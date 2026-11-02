@@ -125,7 +125,9 @@ impl Launcher for CodexLauncher {
         }
 
         if capability_types.contains(&BindingType::Mcp) {
-            let binding = capability.bind(mcp_binding_request(&Self::metadata().mcp_transports)).await?;
+            let binding = capability
+                .bind(mcp_binding_request(&Self::metadata().mcp_transports))
+                .await?;
             match binding {
                 Binding::Mcp(binding) => {
                     self.bound_mcp_bindings
@@ -306,7 +308,7 @@ impl HasCodexLauncherMetadata for CodexLauncher {
                 BindingType::Mcp,
                 BindingType::SubAgent,
             ]),
-            mcp_transports: transport_set(&crate::launchers::shared::mcp_cli::STDIO_HTTP_AND_SSE),
+            mcp_transports: transport_set(crate::launchers::shared::mcp_cli::STDIO_HTTP_AND_SSE),
             tags: vec!["codex".to_string(), "openai".to_string()],
         }
     }
