@@ -15,28 +15,28 @@ use std::time::Duration;
 /*-- Ollama Provider Configuration -------------------------------------------*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct OllamaProviderConfig {
+pub(crate) struct OllamaProviderConfig {
     /// Base URL for the Ollama API
-    #[serde(default = "default_ollama_url")]
-    pub base_url: String,
+    #[serde(default = "default_base_url")]
+    pub(crate) base_url: String,
 
     /// API key for authentication (optional)
-    pub api_key: Option<Secret>,
+    pub(crate) api_key: Option<Secret>,
 
     /// Timeout for health checks in seconds
     #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
+    pub(crate) timeout_secs: u64,
 
     /// Whether to verify SSL certificates
     #[serde(default = "default_verify_ssl")]
-    pub verify_ssl: bool,
+    pub(crate) verify_ssl: bool,
 
     /// Endpoint to use for health checks
     #[serde(default = "default_ollama_health_endpoint")]
-    pub health_check_endpoint: String,
+    pub(crate) health_check_endpoint: String,
 }
 
-fn default_ollama_url() -> String {
+fn default_base_url() -> String {
     "http://localhost:11434".to_string()
 }
 
@@ -55,7 +55,7 @@ fn default_ollama_health_endpoint() -> String {
 impl Default for OllamaProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: default_ollama_url(),
+            base_url: default_base_url(),
             api_key: None,
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),
@@ -66,7 +66,7 @@ impl Default for OllamaProviderConfig {
 
 /*-- Ollama Provider Implementation ------------------------------------------*/
 
-pub struct OllamaProvider {
+pub(crate) struct OllamaProvider {
     instance_id: String,
     config: OllamaProviderConfig,
     client: reqwest::Client,
@@ -371,7 +371,7 @@ impl HasProviderMetadata for OllamaProvider {
             description: "Local inference server supporting multiple API protocols and GGUF models"
                 .to_string(),
             provider_type: ProviderType::Local,
-            default_endpoint: "http://localhost:11434".to_string(),
+            default_base_urls: vec!["http://localhost:11434".to_string()],
             supported_api_types: vec![ApiType::OpenAI, ApiType::Ollama, ApiType::Anthropic],
             default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: vec![ModelFormat::GGUF, ModelFormat::Ollama],

@@ -1,14 +1,14 @@
-pub mod capability;
-pub mod hardware;
-pub mod launcher;
-pub mod model;
-pub mod provider;
-pub mod setup;
-pub mod shared;
+pub(crate) mod capability;
+pub(crate) mod hardware;
+pub(crate) mod launcher;
+pub(crate) mod model;
+pub(crate) mod provider;
+pub(crate) mod setup;
+pub(crate) mod shared;
 
-pub use capability::CapabilityCommands;
-pub use hardware::HardwareCommands;
-pub use launcher::LauncherCommands;
-pub use model::ModelCommands;
-pub use provider::ProviderCommands;
-pub use setup::SetupCommands;
+pub(crate) use capability::CapabilityCommands;
+pub(crate) use hardware::HardwareCommands;
+pub(crate) use launcher::LauncherCommands;
+pub(crate) use model::ModelCommands;
+pub(crate) use provider::ProviderCommands;
+pub(crate) use setup::SetupCommands;

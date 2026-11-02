@@ -10,7 +10,7 @@ use crate::utils::hardware::HardwareProfile;
 /// fits, floored to the nearest power of two (the estimate is approximate,
 /// so a round number avoids implying false precision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextFit {
+pub(crate) enum ContextFit {
     Full,
     Partial(u64),
     None,
@@ -106,7 +106,7 @@ pub(crate) fn estimate(
 /// alongside it wherever the model's `ModelArchitecture` and `native_dtype`
 /// are available -- most usefully at `context_tokens = model.context_length`
 /// for a "full context" estimate.
-pub fn required_gb(
+pub(crate) fn required_gb(
     architecture: &ModelArchitecture,
     variant: &ModelVariant,
     native_dtype: &str,

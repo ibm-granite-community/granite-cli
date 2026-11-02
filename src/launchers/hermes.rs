@@ -28,7 +28,7 @@ use crate::capabilities::{
     ResolvedCapability, VoiceInputBinding, VoiceInputBindingRequest,
 };
 use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
-use crate::launchers::shared::mcp_cli::mcp_binding_request;
+use crate::launchers::shared::mcp_cli::{STDIO_AND_HTTP, mcp_binding_request, transport_set};
 use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
@@ -38,20 +38,20 @@ use_channel!("HRMES");
 /*-- public --*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
-pub struct HermesLauncherConfig {
+pub(crate) struct HermesLauncherConfig {
     /// Override path to the `hermes` binary for non-PATH installs.
     /// Leave unset to use PATH lookup.
     #[serde(default)]
-    pub command_path: Option<String>,
+    pub(crate) command_path: Option<String>,
 
     /// Extra keys merged (shallow, last-write-wins) into the generated
     /// hermes config file -- e.g. `model.context_length` or provider-specific
     /// overrides. Necessary because the entry is regenerated on every launch.
     #[serde(default)]
-    pub model_overrides: Option<serde_json::Value>,
+    pub(crate) model_overrides: Option<serde_json::Value>,
 }
 
-pub struct HermesLauncher {
+pub(crate) struct HermesLauncher {
     instance_id: String,
     config: HermesLauncherConfig,
     bound_binding: Option<AgentModelBinding>,
@@ -86,10 +86,6 @@ impl crate::registry::Named for HermesLauncher {
 
 #[async_trait]
 impl Launcher for HermesLauncher {
-    fn name(&self) -> &str {
-        "Hermes CLI"
-    }
-
     fn command(&self) -> &str {
         self.config.command_path.as_deref().unwrap_or("hermes")
     }
@@ -110,7 +106,9 @@ impl Launcher for HermesLauncher {
         }
 
         if capability_types.contains(&BindingType::Mcp) {
-            let binding = capability.bind(mcp_binding_request()).await?;
+            let binding = capability
+                .bind(mcp_binding_request(&Self::metadata().mcp_transports))
+                .await?;
             match binding {
                 Binding::Mcp(binding) => {
                     self.bound_mcp_bindings
@@ -246,6 +244,7 @@ impl HasHermesLauncherMetadata for HermesLauncher {
                 BindingType::Mcp,
                 BindingType::VoiceInput,
             ]),
+            mcp_transports: transport_set(STDIO_AND_HTTP),
             tags: vec!["hermes".to_string(), "agent".to_string()],
         }
     }

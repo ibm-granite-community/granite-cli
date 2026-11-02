@@ -14,7 +14,7 @@ use_channel!("HUGFC");
 /// Extract `"owner/repo"` from a HF repo URL, a HF blob URL, or a bare repo
 /// id. Returns `None` if `url` doesn't look like a HuggingFace reference
 /// (e.g. an `ollama.com` library URL).
-pub fn hf_repo_id(url: &str) -> Option<&str> {
+pub(crate) fn hf_repo_id(url: &str) -> Option<&str> {
     alog_channel!(MessageLevel::Debug2, "Analyzing URL: {}", url);
     let rest = if url.starts_with("https://huggingface.co/") {
         url.strip_prefix("https://huggingface.co/")?

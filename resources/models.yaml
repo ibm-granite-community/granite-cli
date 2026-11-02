@@ -1,5 +1,5 @@
 # Granite Models Catalog
-# Generated: 2026-10-18 03:06:54 UTC
+# Generated: 2026-10-21 17:44:03 UTC
 # Source: HuggingFace ibm-granite organization
 
 - id: granite-3.0-1b-a400m-instruct
@@ -3520,6 +3520,50 @@
     - speech
     - transcription
 
+- id: granite-speech-4.1-2b-nar
+  family: "Granite Speech"
+  version: "4.1"
+  size: 2254635356
+  context_length: 8192
+  model_type: "Speech"
+  huggingface_repo: "ibm-granite/granite-speech-4.1-2b-nar"
+  native_dtype: "bfloat16"
+  architecture:
+    num_hidden_layers: 40
+    hidden_size: 2048
+    num_attention_heads: 16
+    num_key_value_heads: 4
+    head_dim: 128
+    layer_types:
+      - kind: full_attention
+        count: 40
+  supported_functions:
+    - Chat
+    - Transcription
+    - ToolCalling
+  variants:
+    - format: safetensors
+      precision: bfloat16
+      size_gb: 4.509
+      url: "https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar"
+    - format: MLX
+      precision: bfloat16
+      size_gb: 4.509
+      url: "https://huggingface.co/mlx-community/granite-speech-4.1-2b-nar-mlx"
+    - format: MLX
+      precision: 5bit
+      size_gb: 2.368
+      url: "https://huggingface.co/mlx-community/granite-speech-4.1-2b-nar-mlx-5bit"
+  description: |
+    Granite-Speech-4.1-2B-NAR is a non-autoregressive (NAR) speech recognition model that formulates ASR as conditional transcript editing.
+    Instead of decoding tokens one at a time, it edits a CTC hypothesis in a single forward pass using a bidirectional LLM, achieving competitive accuracy with faster inference than autoregressive alternatives.
+    The model is based on the **NLE** (Non-autoregressive LLM-based Editing) architecture described in [this paper](https://arxiv.org/abs/2603.08397).
+  tags:
+    - audio
+    - efficient
+    - speech
+    - transcription
+
 - id: granite-speech-4.1-2b-plus
   family: "Granite Speech"
   version: "4.1"
@@ -3571,7 +3615,104 @@
       size_gb: 4.224
       url: "https://huggingface.co/ibm-granite/granite-speech-4.1-2b-plus"
   description: |
-    Granite-Speech-4.1-2B-Plus has similar capabilities to the [Granite-Speech-4.1-2B](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) model. The plus model adds two new community-requested rich transcription features that can be activated with a simple prompt change: speaker-attributed ASR (speaker labels and word transcripts) and word-level timing information. Unlike the base mode, the plus model doesn't provide punctuation and capitalization.
+    Granite-Speech-4.1-2B-Plus (GSP) has similar capabilities to the [Granite-Speech-4.1-2B](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) model. The plus model adds two new community-requested rich transcription features that can be activated with a simple prompt change: speaker-attributed ASR (speaker labels and word transcripts) and word-level timing information. Unlike the base model, the plus model doesn't provide punctuation and capitalization.
+  tags:
+    - audio
+    - efficient
+    - speech
+    - transcription
+
+- id: granite-speech-5.0-2b
+  family: "Granite Speech"
+  version: "5.0"
+  size: 2313207132
+  context_length: 8192
+  model_type: "Speech"
+  huggingface_repo: "ibm-granite/granite-speech-5.0-2b"
+  native_dtype: "bfloat16"
+  architecture:
+    num_hidden_layers: 40
+    hidden_size: 2048
+    num_attention_heads: 16
+    num_key_value_heads: 4
+    head_dim: 128
+    layer_types:
+      - kind: full_attention
+        count: 40
+  supported_functions:
+    - Chat
+    - Transcription
+  variants:
+    - format: GGUF
+      precision: Q2_K
+      size_gb: 0.769
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q2_K.gguf"
+    - format: GGUF
+      precision: Q3_K_L
+      size_gb: 1.014
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q3_K_L.gguf"
+    - format: GGUF
+      precision: Q3_K_M
+      size_gb: 0.949
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q3_K_M.gguf"
+    - format: GGUF
+      precision: Q3_K_S
+      size_gb: 0.874
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q3_K_S.gguf"
+    - format: GGUF
+      precision: Q4_0
+      size_gb: 1.091
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q4_0.gguf"
+    - format: GGUF
+      precision: Q4_1
+      size_gb: 1.193
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q4_1.gguf"
+    - format: GGUF
+      precision: Q4_K_M
+      size_gb: 1.139
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q4_K_M.gguf"
+    - format: GGUF
+      precision: Q4_K_S
+      size_gb: 1.096
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q4_K_S.gguf"
+    - format: GGUF
+      precision: Q5_0
+      size_gb: 1.295
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q5_0.gguf"
+    - format: GGUF
+      precision: Q5_1
+      size_gb: 1.397
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q5_1.gguf"
+    - format: GGUF
+      precision: Q5_K_M
+      size_gb: 1.32
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q5_K_M.gguf"
+    - format: GGUF
+      precision: Q5_K_S
+      size_gb: 1.295
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q5_K_S.gguf"
+    - format: GGUF
+      precision: Q6_K
+      size_gb: 1.511
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q6_K.gguf"
+    - format: GGUF
+      precision: Q8_0
+      size_gb: 1.956
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-Q8_0.gguf"
+    - format: GGUF
+      precision: BF16
+      size_gb: 3.678
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/granite-speech-5.0-2b-bf16.gguf"
+    - format: GGUF
+      precision: F16
+      size_gb: 1.159
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b-GGUF/blob/main/mmproj-model-f16.gguf"
+    - format: safetensors
+      precision: bfloat16
+      size_gb: 5.038
+      url: "https://huggingface.co/ibm-granite/granite-speech-5.0-2b"
+  description: |
+    Granite Speech 5.0 2B is a compact and efficient speech-language model, specifically designed for multilingual automatic speech recognition (ASR) and bidirectional automatic speech translation (AST) for English, French, German, Spanish, Portuguese and Japanese.
   tags:
     - audio
     - efficient
@@ -3604,9 +3745,9 @@
       size_gb: 0.946
       url: "https://huggingface.co/ibm-granite/granite-speech-5.0-470m-turboctc"
   description: |
-    Granite Speech 5.0 TurboCTC is a compact 470 million parameter English ASR model with very high inference speed that is well suited for deployment on laptops, smartphones and other edge devices. 
-    The model consists of a conformer acoustic encoder with block self-attention, self-conditioning and temporal downsampling with an output layer corresponding to 16,384 BPE units. 
-    It was trained on approximately 60,000 hours of English audio from public corpora using Connectionist Temporal Classification (CTC) and inference is done non-autoregressively with greedy decoding.
+    Granite Speech 5.0 TurboCTC is a compact 470 million parameter multilingual ASR model for English, French, German, Spanish, Portuguese, Italian and Japanese with very high inference speed that is well suited for deployment on laptops, smartphones and other edge devices. 
+    The model consists of a conformer acoustic encoder with block self-attention, self-conditioning and temporal downsampling with an output layer corresponding to 16,384 multilingual BPE units. 
+    It was trained on approximately 153,000 hours of multilingual audio from public corpora using Connectionist Temporal Classification (CTC) and inference is done non-autoregressively with greedy decoding. The model outputs punctuated and capitalized transcripts.
   tags:
     - audio
     - efficient

@@ -123,11 +123,11 @@ impl PromptState {
     }
 }
 
-pub struct SetupPane {
+pub(crate) struct SetupPane {
     /// The title shown in the pane border (e.g. "model setup — granite-3.3-8b-instruct").
-    pub title: String,
+    pub(crate) title: String,
     /// Lines of info/warn/error output accumulated so far.
-    pub output: std::sync::Arc<std::sync::Mutex<Vec<OutputLine>>>,
+    pub(crate) output: std::sync::Arc<std::sync::Mutex<Vec<OutputLine>>>,
     /// Live pull/download states shared with the `TuiUi`.
     pulls: std::sync::Arc<std::sync::Mutex<HashMap<u64, PullState>>>,
     /// How many output lines to scroll (↑↓ when no prompt is active).
@@ -140,11 +140,11 @@ pub struct SetupPane {
     /// next one (i.e. the setup task is computing between prompts).
     active: Option<PromptState>,
     /// Set to `true` once `prompt_rx` is disconnected (task finished).
-    pub finished: bool,
+    pub(crate) finished: bool,
 }
 
 impl SetupPane {
-    pub fn new(
+    pub(crate) fn new(
         title: String,
         output: std::sync::Arc<std::sync::Mutex<Vec<OutputLine>>>,
         pulls: std::sync::Arc<std::sync::Mutex<HashMap<u64, PullState>>>,
@@ -165,7 +165,7 @@ impl SetupPane {
 
     /// Poll for a new prompt from the setup task (non-blocking).
     /// Returns `true` if a new prompt arrived and the pane needs a redraw.
-    pub fn poll(&mut self) -> bool {
+    pub(crate) fn poll(&mut self) -> bool {
         match self.prompt_rx.try_recv() {
             Ok(prompt) => {
                 self.active = Some(PromptState::from_prompt(prompt));
@@ -181,7 +181,7 @@ impl SetupPane {
     }
 
     /// Current footer hint.
-    pub fn hint(&self) -> String {
+    pub(crate) fn hint(&self) -> String {
         match &self.active {
             Some(p) => p.hint(),
             None if self.finished => render_hints(&[Hint::Close]),
@@ -190,7 +190,7 @@ impl SetupPane {
     }
 
     /// Handle a key event.  Returns `true` if the pane consumed the key.
-    pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+    pub(crate) fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::KeyCode;
 
         // Esc always cancels setup from any prompt state.
@@ -322,7 +322,7 @@ impl SetupPane {
     }
 
     /// Render the setup pane into `area`.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
         // Collect active (not-yet-done) pulls to size the bars region.
         let active_pulls: Vec<PullState> = self
             .pulls

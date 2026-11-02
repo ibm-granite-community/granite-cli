@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#DEBUG
-set -x
-
 # Generates YAML from model metadata JSON
 # Input: models.json
 # Output: models.yaml

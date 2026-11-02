@@ -42,7 +42,8 @@ pub(crate) enum Outcome {
     /// Nothing was broken, or everything broken was fixed.
     Clean,
     /// Something is still broken: the user declined to fix it, or there was
-    /// nobody to ask.
+    /// nobody to ask. Also returned when the user chose to remove the
+    /// instance the caller named, which leaves nothing to validate.
     Unresolved,
 }
 
@@ -92,10 +93,11 @@ pub(crate) fn prompt_with_current(
 /// at the entity being removed.
 ///
 /// Passed as `--dependents <cascade|refuse|leave>` on the CLI. When the flag
-/// is omitted the caller passes `None` and the behaviour falls back to asking
-/// interactively (or leaving dependents stranded in non-interactive sessions).
+/// is omitted the caller passes `None`: an interactive session asks what to
+/// do, and a session that cannot ask refuses with exit code 1 and an error
+/// naming the three policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum DependentsPolicy {
+pub(crate) enum DependentsPolicy {
     /// Remove the target and every dependent automatically, without asking.
     /// Cascades recursively so dependents-of-dependents are taken too.
     Cascade,
@@ -103,7 +105,6 @@ pub enum DependentsPolicy {
     /// on it.
     Refuse,
     /// Remove only the target. Dependents are left configured but broken.
-    /// This is the non-interactive default when no flag is given.
     Leave,
 }
 
@@ -256,10 +257,10 @@ pub(crate) fn remove_all(
 /// that instance, since a capability may be enabled by more than one launcher.
 ///
 /// The loop ends when validation comes back clean, when the user declines,
-/// or when every repair on offer has been tried against the same problem. A
-/// repair that changes nothing is dropped from the choices rather than ending
-/// the run, so it always terminates and always leaves the remaining repairs
-/// reachable.
+/// when a removal takes the instance the caller named, or when every repair
+/// on offer has been tried against the same problem. A repair that changes
+/// nothing is dropped from the choices rather than ending the run, so it
+/// always terminates and always leaves the remaining repairs reachable.
 pub(crate) async fn remediate(
     ctx: &mut crate::AppContext,
     kind: RefKind,
@@ -317,6 +318,14 @@ pub(crate) async fn remediate(
             Choice::Remove => {
                 previous = Some(error);
                 remove(ctx, fix.kind, &fix.id, None)?;
+                // The removal took the instance the caller named, either as
+                // the fix itself or as a dependent of it. Validating again
+                // would report it as not configured right after the removal
+                // said it was removed. The caller checks whether it still
+                // exists.
+                if type_name(kind, id, ctx.config()).is_none() {
+                    return Ok(Outcome::Unresolved);
+                }
             }
             Choice::Disable => {
                 previous = Some(error);
@@ -441,7 +450,7 @@ impl ResetPlan {
 /// fields that did not need replacing. Construction reads settings and does no
 /// I/O, so trying a few is cheap.
 fn plan_reset(kind: RefKind, type_name: &str, current: &serde_json::Value) -> Option<ResetPlan> {
-    let defaults = default_settings(kind, type_name)?;
+    let defaults = default_settings(kind, type_name);
     let (Some(current_fields), Some(default_fields)) = (current.as_object(), defaults.as_object())
     else {
         return constructs(kind, type_name, &defaults).then(|| ResetPlan {
@@ -500,7 +509,7 @@ fn constructs(kind: RefKind, type_name: &str, settings: &serde_json::Value) -> b
 }
 
 /// A type's default settings, as its registry entry declares them.
-fn default_settings(kind: RefKind, type_name: &str) -> Option<serde_json::Value> {
+fn default_settings(kind: RefKind, type_name: &str) -> serde_json::Value {
     match kind {
         RefKind::Launcher => crate::launchers::LAUNCHER_REGISTRY.default_config(type_name),
         RefKind::Capability => crate::capabilities::CAPABILITY_REGISTRY.default_config(type_name),
@@ -788,8 +797,7 @@ mod tests {
             settings.get("timeout_secs"),
             crate::providers::PROVIDER_REGISTRY
                 .default_config("ollama")
-                .as_ref()
-                .and_then(|defaults| defaults.get("timeout_secs")),
+                .get("timeout_secs"),
             "the field that could not be read now holds its type's default"
         );
         assert_eq!(
@@ -1389,6 +1397,35 @@ mod tests {
             Some("gone-provider"),
         );
         assert!(capture(&ctx).confirm_answers.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_the_named_instance_ends_without_reporting_it_missing() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_a_dangling_provider_ref();
+        // Reconfigure, remove, skip: remove is the second.
+        answer(&ctx, &[1]);
+
+        let outcome = remediate(
+            &mut ctx,
+            RefKind::Model,
+            "granite-3.1-8b-instruct",
+            OnDecline::Skip,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_none());
+        assert_eq!(outcome, Outcome::Unresolved);
+        assert_eq!(prompts(&ctx).len(), 1);
+        let warns = capture(&ctx).warns.borrow().clone();
+        assert!(
+            !warns
+                .iter()
+                .any(|w| w == "model 'granite-3.1-8b-instruct' is not configured"),
+            "the model the user chose to remove is not reported as missing: {warns:?}"
+        );
     }
 
     #[tokio::test]

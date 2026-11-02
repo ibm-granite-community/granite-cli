@@ -49,29 +49,29 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 /*-- llama.cpp Provider Configuration ----------------------------------------*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct LlamaCppProviderConfig {
+pub(crate) struct LlamaCppProviderConfig {
     /// Base URL for the llama.cpp server
-    #[serde(default = "default_llamacpp_url")]
-    pub base_url: String,
+    #[serde(default = "default_base_url")]
+    pub(crate) base_url: String,
 
     /// API key for authentication (optional)
-    pub api_key: Option<Secret>,
+    pub(crate) api_key: Option<Secret>,
 
     /// Timeout for health checks in seconds
     #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
+    pub(crate) timeout_secs: u64,
 
     /// Whether to verify SSL certificates
     #[serde(default = "default_verify_ssl")]
-    pub verify_ssl: bool,
+    pub(crate) verify_ssl: bool,
 
     /// Endpoint to use for health checks
     #[serde(default = "default_llamacpp_health_endpoint")]
-    pub health_check_endpoint: String,
+    pub(crate) health_check_endpoint: String,
 }
 
-fn default_llamacpp_url() -> String {
-    "http://localhost:8080".to_string()
+fn default_base_url() -> String {
+    LlamaCppProvider::metadata().default_base_urls[0].clone()
 }
 
 fn default_timeout() -> u64 {
@@ -89,7 +89,7 @@ fn default_llamacpp_health_endpoint() -> String {
 impl Default for LlamaCppProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: default_llamacpp_url(),
+            base_url: default_base_url(),
             api_key: None,
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),
@@ -100,7 +100,7 @@ impl Default for LlamaCppProviderConfig {
 
 /*-- llama.cpp Provider Implementation ---------------------------------------*/
 
-pub struct LlamaCppProvider {
+pub(crate) struct LlamaCppProvider {
     instance_id: String,
     config: LlamaCppProviderConfig,
     client: reqwest::Client,
@@ -482,7 +482,10 @@ impl HasProviderMetadata for LlamaCppProvider {
             name: "llama.cpp".to_string(),
             description: "High-performance local inference server for GGUF models with OpenAI and Anthropic API compatibility".to_string(),
             provider_type: ProviderType::Local,
-            default_endpoint: "http://localhost:8080".to_string(),
+            default_base_urls: vec![
+                "http://localhost:9931".to_string(),
+                "http://localhost:8080".to_string(),
+            ],
             supported_api_types: vec![ApiType::OpenAI, ApiType::Anthropic],
             default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: vec![ModelFormat::GGUF],
@@ -506,7 +509,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = LlamaCppProviderConfig::default();
-        assert_eq!(config.base_url, "http://localhost:8080");
+        assert_eq!(config.base_url, "http://localhost:9931");
         assert!(config.api_key.is_none());
         assert_eq!(config.timeout_secs, 10);
         assert!(config.verify_ssl);
@@ -539,6 +542,10 @@ mod tests {
     fn test_provider_metadata() {
         let meta = LlamaCppProvider::metadata();
         assert_eq!(meta.name, "llama.cpp");
+        assert_eq!(
+            meta.default_base_urls,
+            vec!["http://localhost:9931", "http://localhost:8080"]
+        );
         assert!(meta.supported_api_types.contains(&ApiType::OpenAI));
         assert!(meta.supported_api_types.contains(&ApiType::Anthropic));
         assert!(

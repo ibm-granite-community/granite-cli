@@ -71,58 +71,58 @@ impl ConfigPathTranslator for recommended_config::RecommendedConfiguration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Config {
-    pub models: HashMap<String, ModelConfig>,
-    pub providers: HashMap<String, ProviderConfig>,
-    pub capabilities: HashMap<String, CapabilityConfig>,
-    pub launchers: HashMap<String, LauncherConfig>,
-    pub recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
+pub(crate) struct Config {
+    pub(crate) models: HashMap<String, ModelConfig>,
+    pub(crate) providers: HashMap<String, ProviderConfig>,
+    pub(crate) capabilities: HashMap<String, CapabilityConfig>,
+    pub(crate) launchers: HashMap<String, LauncherConfig>,
+    pub(crate) recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
     pub(crate) hardware: HashMap<String, HardwareConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ModelConfig {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ModelConfig {
     /// Instance id -- the config/file key this model is stored under.
     /// Defaults to `model_type` (see `commands::ModelCommands::setup`), but
     /// may differ to let the same catalog type be configured more than once
     /// (e.g. against different providers or precisions).
-    pub model_id: String,
+    pub(crate) model_id: String,
     /// Registry key: the catalog id this instance was constructed from (a
     /// `resources/models.yaml` id, or `"custom"`).
-    pub model_type: String,
-    pub provider_id: String,
-    pub variant: Option<String>,
+    pub(crate) model_type: String,
+    pub(crate) provider_id: String,
+    pub(crate) variant: Option<String>,
     /// Model-type-specific config (e.g. `CustomModelConfig`'s fields for a
     /// `"custom"` instance). `{}` for catalog models, which take no config
     /// beyond `provider_config`.
-    pub config: serde_json::Value,
+    pub(crate) config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    pub provider_id: String,
+pub(crate) struct ProviderConfig {
+    pub(crate) provider_id: String,
     #[serde(rename = "type")]
-    pub provider_type: String,
-    pub config: serde_json::Value,
+    pub(crate) provider_type: String,
+    pub(crate) config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CapabilityConfig {
-    pub capability_id: String,
+pub(crate) struct CapabilityConfig {
+    pub(crate) capability_id: String,
     #[serde(rename = "type")]
-    pub capability_type: String,
-    pub config: serde_json::Value,
+    pub(crate) capability_type: String,
+    pub(crate) config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LauncherConfig {
-    pub launcher_id: String,
+pub(crate) struct LauncherConfig {
+    pub(crate) launcher_id: String,
     #[serde(rename = "type")]
-    pub launcher_type: String,
+    pub(crate) launcher_type: String,
     /// Capability IDs enabled for this launcher instance.
-    pub enabled_capabilities: Vec<String>,
+    pub(crate) enabled_capabilities: Vec<String>,
     /// Launcher-type-specific config passed to `ConfigConstructable::new`.
-    pub config: serde_json::Value,
+    pub(crate) config: serde_json::Value,
 }
 
 /*-- Windows / WSL ----------------------------------------------------------*/
@@ -149,7 +149,7 @@ fn windows_to_wsl(path: &str) -> Option<String> {
 ///
 /// `/mnt/c/Users/gabel/AppData/Roaming/granite-cli\launchers` →
 /// `C:\Users\gabel\AppData\Roaming\granite-cli\launchers`
-pub fn translate_wsl_to_windows(path: &str) -> Option<String> {
+pub(crate) fn translate_wsl_to_windows(path: &str) -> Option<String> {
     let path = path.trim();
     if !path.starts_with("/mnt/") {
         return None;
@@ -203,7 +203,12 @@ fn translate_paths_in_value(value: &serde_json::Value, to_wsl: bool) -> serde_js
 /// conversion restores Windows-native paths for disk persistence.
 #[cfg(not(windows))]
 fn translate_paths_in_config(config: &mut serde_json::Value, to_wsl: bool) {
-    config["command_path"] = translate_paths_in_value(&config["command_path"], to_wsl);
+    // Only keys already present are translated. Indexing `config["command_path"]`
+    // for assignment would insert a `null` entry into every config it touches,
+    // which a type with `deny_unknown_fields` then refuses on the next load.
+    if let Some(command_path) = config.get_mut("command_path") {
+        *command_path = translate_paths_in_value(command_path, to_wsl);
+    }
     if let Some(overrides) = config.get_mut("provider_overrides") {
         *overrides = translate_paths_in_value(overrides, to_wsl);
     }
@@ -407,7 +412,7 @@ impl Config {
     ///
     /// The path is returned without being created; callers create it when they
     /// actually write, so a dry run leaves no trace.
-    pub fn launcher_state_dir(launcher_id: &str) -> Result<PathBuf> {
+    pub(crate) fn launcher_state_dir(launcher_id: &str) -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("launcher-state").join(launcher_id))
     }
 
@@ -492,7 +497,7 @@ impl Config {
         Ok(map)
     }
 
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Self::ensure_directories()?;
 
         let mut config = Config::default();
@@ -644,16 +649,16 @@ impl Config {
 
     // -- Model --
 
-    pub fn get_model(&self, id: &str) -> Option<&ModelConfig> {
+    pub(crate) fn get_model(&self, id: &str) -> Option<&ModelConfig> {
         self.models.get(id)
     }
 
-    pub fn insert_model(&mut self, id: &str, config: ModelConfig) -> Result<()> {
+    pub(crate) fn insert_model(&mut self, id: &str, config: ModelConfig) -> Result<()> {
         self.models.insert(id.to_string(), config);
         self.save()
     }
 
-    pub fn remove_model(&mut self, id: &str) -> Result<()> {
+    pub(crate) fn remove_model(&mut self, id: &str) -> Result<()> {
         self.models.remove(id);
         let path = Self::models_dir().ok().and_then(|d| {
             let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
@@ -665,7 +670,11 @@ impl Config {
         self.save()
     }
 
-    pub fn update_model(&mut self, id: &str, f: impl FnOnce(&mut ModelConfig)) -> Result<()> {
+    pub(crate) fn update_model(
+        &mut self,
+        id: &str,
+        f: impl FnOnce(&mut ModelConfig),
+    ) -> Result<()> {
         if let Some(model) = self.models.get_mut(id) {
             f(model);
             self.save()
@@ -676,16 +685,16 @@ impl Config {
 
     // -- Provider --
 
-    pub fn get_provider(&self, id: &str) -> Option<&ProviderConfig> {
+    pub(crate) fn get_provider(&self, id: &str) -> Option<&ProviderConfig> {
         self.providers.get(id)
     }
 
-    pub fn insert_provider(&mut self, id: &str, config: ProviderConfig) -> Result<()> {
+    pub(crate) fn insert_provider(&mut self, id: &str, config: ProviderConfig) -> Result<()> {
         self.providers.insert(id.to_string(), config);
         self.save()
     }
 
-    pub fn remove_provider(&mut self, id: &str) -> Result<()> {
+    pub(crate) fn remove_provider(&mut self, id: &str) -> Result<()> {
         self.providers.remove(id);
         let path = Self::providers_dir().ok().and_then(|d| {
             let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
@@ -697,7 +706,11 @@ impl Config {
         self.save()
     }
 
-    pub fn update_provider(&mut self, id: &str, f: impl FnOnce(&mut ProviderConfig)) -> Result<()> {
+    pub(crate) fn update_provider(
+        &mut self,
+        id: &str,
+        f: impl FnOnce(&mut ProviderConfig),
+    ) -> Result<()> {
         if let Some(provider) = self.providers.get_mut(id) {
             f(provider);
             self.save()
@@ -708,16 +721,16 @@ impl Config {
 
     // -- Capability --
 
-    pub fn get_capability(&self, id: &str) -> Option<&CapabilityConfig> {
+    pub(crate) fn get_capability(&self, id: &str) -> Option<&CapabilityConfig> {
         self.capabilities.get(id)
     }
 
-    pub fn insert_capability(&mut self, id: &str, config: CapabilityConfig) -> Result<()> {
+    pub(crate) fn insert_capability(&mut self, id: &str, config: CapabilityConfig) -> Result<()> {
         self.capabilities.insert(id.to_string(), config);
         self.save()
     }
 
-    pub fn remove_capability(&mut self, id: &str) -> Result<()> {
+    pub(crate) fn remove_capability(&mut self, id: &str) -> Result<()> {
         self.capabilities.remove(id);
         let path = Self::capabilities_dir().ok().and_then(|d| {
             let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
@@ -729,7 +742,7 @@ impl Config {
         self.save()
     }
 
-    pub fn update_capability(
+    pub(crate) fn update_capability(
         &mut self,
         id: &str,
         f: impl FnOnce(&mut CapabilityConfig),
@@ -744,16 +757,16 @@ impl Config {
 
     // -- Launcher --
 
-    pub fn get_launcher(&self, id: &str) -> Option<&LauncherConfig> {
+    pub(crate) fn get_launcher(&self, id: &str) -> Option<&LauncherConfig> {
         self.launchers.get(id)
     }
 
-    pub fn insert_launcher(&mut self, id: &str, config: LauncherConfig) -> Result<()> {
+    pub(crate) fn insert_launcher(&mut self, id: &str, config: LauncherConfig) -> Result<()> {
         self.launchers.insert(id.to_string(), config);
         self.save()
     }
 
-    pub fn remove_launcher(&mut self, id: &str) -> Result<()> {
+    pub(crate) fn remove_launcher(&mut self, id: &str) -> Result<()> {
         self.launchers.remove(id);
         let path = Self::launchers_dir().ok().and_then(|d| {
             let p = d.join(format!("{}.yaml", Self::id_to_filename(id)));
@@ -765,7 +778,11 @@ impl Config {
         self.save()
     }
 
-    pub fn update_launcher(&mut self, id: &str, f: impl FnOnce(&mut LauncherConfig)) -> Result<()> {
+    pub(crate) fn update_launcher(
+        &mut self,
+        id: &str,
+        f: impl FnOnce(&mut LauncherConfig),
+    ) -> Result<()> {
         if let Some(launcher) = self.launchers.get_mut(id) {
             f(launcher);
             self.save()
@@ -944,6 +961,23 @@ impl Drop for TestConfigHome {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn path_translation_does_not_add_command_path_to_configs_without_one() {
+        // A capability with `deny_unknown_fields` rejects a stray
+        // `command_path: null` on the next load.
+        let mut config = serde_json::json!({"type": "http", "url": "http://x"});
+        translate_paths_in_config(&mut config, true);
+        translate_paths_in_config(&mut config, false);
+        assert!(config.get("command_path").is_none(), "{config}");
+    }
+
+    #[test]
+    fn path_translation_still_translates_an_existing_command_path() {
+        let mut config = serde_json::json!({"command_path": "claude"});
+        translate_paths_in_config(&mut config, true);
+        assert_eq!(config["command_path"], "claude");
+    }
     use super::*;
 
     #[test]
@@ -1152,10 +1186,11 @@ mod tests {
     fn local_hardware_profile_cannot_be_removed() {
         let _home = TestConfigHome::new();
         let mut config = Config::new().unwrap();
-        let local =
-            HardwareConfig::local_from_detection(crate::utils::HardwareProfile::with_memory(
+        let local = HardwareConfig::local_from_detection(
+            crate::utils::hardware::HardwareProfile::with_memory(
                 crate::utils::hardware::Memory::System { ram_gb: 64.0 },
-            ));
+            ),
+        );
         config
             .insert_hardware(hardware::LOCAL_HARDWARE_ID, local)
             .unwrap();

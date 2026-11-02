@@ -22,7 +22,7 @@ use std::path::PathBuf;
 /// This lets users set `command_path` to a bare name like `"claude"` and
 /// still have the launcher succeed as long as that name is on `PATH` —
 /// the same behaviour as the default (unset) path.
-pub fn resolve_shell_command(
+pub(crate) fn resolve_shell_command(
     command_path: &Option<String>,
     default_command: &str,
 ) -> anyhow::Result<PathBuf> {

@@ -6,7 +6,7 @@
 /// fields — adding a new searchable field is a one-line change here, not in
 /// the command. The same trait can be implemented for `ProviderMetadata` and
 /// `CapabilityMetadata` to enable `provider search` / `capability search`.
-pub trait Searchable {
+pub(crate) trait Searchable {
     /// All string values that should be matched against a search query.
     /// The item ID is matched separately by the caller (it is the registry
     /// key, not a field on the metadata struct).

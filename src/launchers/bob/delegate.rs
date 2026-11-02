@@ -12,7 +12,9 @@
 // Standard
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 // Third Party
 use rmcp::model::{
@@ -24,6 +26,7 @@ use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
+use tokio::sync::{oneshot, watch};
 
 // Local
 use crate::capabilities::{
@@ -83,14 +86,6 @@ impl crate::registry::Named for StaticCapabilityBinding {
 }
 
 impl crate::capabilities::CapabilityInfo for StaticCapabilityBinding {
-    fn name(&self) -> &str {
-        "Static Binding"
-    }
-
-    fn description(&self) -> &str {
-        "internal: hands a pre-resolved binding to a backing launcher"
-    }
-
     fn binding_types(&self) -> std::collections::HashSet<BindingType> {
         std::collections::HashSet::from([self.binding.binding_type()])
     }
@@ -151,22 +146,255 @@ fn delegate_tool_input_schema() -> serde_json::Map<String, serde_json::Value> {
     .clone()
 }
 
+/// How long one `tools/call` blocks on its sub-agent before replying "still
+/// working". Bob's MCP client abandons any call after 300s (the largest
+/// `timeout` it honors), so this stays comfortably below that.
+const WAIT_BUDGET: Duration = Duration::from_secs(240);
+
+/// Name of the tool that collects the result of a job reported as still working.
+const WAIT_TOOL_NAME: &str = "sub-agent-wait";
+
+/// Name of the tool that stops a running job.
+const CANCEL_TOOL_NAME: &str = "sub-agent-cancel";
+
+/// A finished job's result: the sub-agent's output, or the error text.
+type JobOutcome = Result<String, String>;
+
+/// What a caller gets back after waiting on a job.
+#[derive(Debug, PartialEq)]
+enum JobReply {
+    Finished(JobOutcome),
+    /// Still going; carries the job id to wait on.
+    Running(String),
+}
+
+/// Why a job's result is an error, when it did not run to completion.
+const CANCELLED_MESSAGE: &str = "the sub-agent job was cancelled";
+
+/// One background sub-agent run, identified to callers by its table id.
+struct Job {
+    tool: String,
+    task: String,
+    outcome: watch::Receiver<Option<JobOutcome>>,
+    /// Dropping or firing this stops the job's work (and so kills `pi`).
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+/// Background sub-agent runs, decoupled from the HTTP request that started
+/// them. Bob abandons a request after 300s and then retries it; running the
+/// work detached lets a retry (or `sub-agent-wait`) pick up the same run
+/// instead of orphaning it and starting a duplicate.
+#[derive(Default)]
+struct JobTable {
+    next_id: AtomicU64,
+    jobs: Mutex<HashMap<String, Job>>,
+}
+
+impl JobTable {
+    /// Starts `work` as a detached job, unless a job for the same tool and
+    /// task is already in the table, in which case it attaches to that one
+    /// and drops `work` unpolled.
+    fn start_or_attach<F>(
+        &self,
+        tool: &str,
+        task: &str,
+        work: F,
+    ) -> (String, watch::Receiver<Option<JobOutcome>>)
+    where
+        F: Future<Output = JobOutcome> + Send + 'static,
+    {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((id, job)) = jobs.iter().find(|(_, j)| j.tool == tool && j.task == task) {
+            return (id.clone(), job.outcome.clone());
+        }
+        let id = format!("job-{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+        let (tx, rx) = watch::channel(None);
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            // Losing the race drops `work`, which is what stops the sub-agent.
+            // A dropped `cancel_tx` also wakes `cancel_rx`, so a job whose
+            // table is gone (the launch ended) is cancelled too.
+            let outcome = tokio::select! {
+                outcome = work => outcome,
+                _ = cancel_rx => Err(CANCELLED_MESSAGE.to_string()),
+            };
+            tx.send_replace(Some(outcome));
+        });
+        jobs.insert(
+            id.clone(),
+            Job {
+                tool: tool.to_string(),
+                task: task.to_string(),
+                outcome: rx.clone(),
+                cancel: Some(cancel_tx),
+            },
+        );
+        (id, rx)
+    }
+
+    /// Stops a running job and forgets it, returning whether `id` named one.
+    /// Any caller still waiting on it is told it was cancelled.
+    fn cancel(&self, id: &str) -> bool {
+        let job = self
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        match job {
+            Some(mut job) => {
+                if let Some(cancel) = job.cancel.take() {
+                    let _ = cancel.send(());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The receiver for an uncollected job, if `id` names one.
+    fn receiver_for(&self, id: &str) -> Option<watch::Receiver<Option<JobOutcome>>> {
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        jobs.get(id).map(|j| j.outcome.clone())
+    }
+
+    /// Waits up to `budget` for the job to finish. A finished job is removed
+    /// from the table, so its result is delivered once.
+    async fn await_outcome(
+        &self,
+        id: &str,
+        mut rx: watch::Receiver<Option<JobOutcome>>,
+        budget: Duration,
+    ) -> JobReply {
+        let outcome = match tokio::time::timeout(budget, rx.wait_for(Option::is_some)).await {
+            Err(_) => return JobReply::Running(id.to_string()),
+            Ok(Ok(value)) => value
+                .clone()
+                .unwrap_or_else(|| Err("sub-agent job ended unexpectedly".to_string())),
+            // The job's task died without reporting (e.g. it panicked).
+            Ok(Err(_)) => Err("sub-agent job ended unexpectedly".to_string()),
+        };
+        self.jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        JobReply::Finished(outcome)
+    }
+}
+
+/// Renders a job reply as the tool result Bob sees: the final output, an
+/// error, or a one-line pointer to `sub-agent-wait`. Nothing else is sent, so
+/// the sub-agent's transcript never enters Bob's context.
+fn job_reply_to_result(reply: JobReply) -> CallToolResult {
+    match reply {
+        JobReply::Finished(Ok(output)) => CallToolResult::success(vec![ContentBlock::text(output)]),
+        JobReply::Finished(Err(error)) => CallToolResult::error(vec![ContentBlock::text(error)]),
+        JobReply::Running(id) => CallToolResult::success(vec![ContentBlock::text(format!(
+            "The sub-agent is still working (job {id}). Call `{WAIT_TOOL_NAME}` with \
+             job_id \"{id}\" to collect its result."
+        ))]),
+    }
+}
+
+/// The `job_id` argument of a `sub-agent-wait`/`sub-agent-cancel` call.
+fn job_id_argument(request: &CallToolRequestParams) -> Option<&str> {
+    request
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("job_id"))
+        .and_then(|v| v.as_str())
+}
+
+/// The JSON Schema of the job-addressed tools (`sub-agent-wait` and
+/// `sub-agent-cancel`): a single required `job_id`.
+fn job_tool_input_schema() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "job_id": {
+                "type": "string",
+                "description": "The job id from a 'still working' reply.",
+            },
+        },
+        "required": ["job_id"],
+    })
+    .as_object()
+    .expect("object literal")
+    .clone()
+}
+
 /// Handles MCP `tools/list`/`tools/call` for the bound delegate sub-agents.
-/// `Clone` is cheap (two `Arc`s), which is what lets `call_tool` sidestep the
-/// trait method's `&self` / `+ '_` lifetime by cloning `self` into an owned
-/// `async move` block.
+/// `Clone` is cheap (a few `Arc`s), which is what lets `call_tool` sidestep
+/// the trait method's `&self` / `+ '_` lifetime by cloning `self` into an
+/// owned `async move` block.
 #[derive(Clone)]
-pub(crate) struct DelegateToolRegistry {
+struct DelegateToolRegistry {
     pi_binary: Arc<PathBuf>,
     agents: Arc<Vec<DelegateSubAgent>>,
+    jobs: Arc<JobTable>,
+    wait_budget: Duration,
 }
 
 impl DelegateToolRegistry {
+    /// Runs the sub-agent at `index` on `task` to completion.
+    async fn run_agent(&self, index: usize, task: &str) -> JobOutcome {
+        let agent = &self.agents[index];
+        let plain_ui = crate::utils::ui::backends::plain::PlainOutput;
+        agent
+            .pi
+            .run_delegated_task(
+                &self.pi_binary,
+                task,
+                &agent.system_prompt,
+                &agent.tools,
+                &agent.ctx,
+                &plain_ui,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// `sub-agent-cancel`: stops a job and kills its sub-agent process.
+    fn cancel_job(&self, request: &CallToolRequestParams) -> CallToolResult {
+        let Some(id) = job_id_argument(request) else {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "missing required string argument 'job_id'",
+            )]);
+        };
+        if self.jobs.cancel(id) {
+            CallToolResult::success(vec![ContentBlock::text(format!("Cancelled job {id}."))])
+        } else {
+            CallToolResult::error(vec![ContentBlock::text(format!(
+                "no such job '{id}' (unknown, or it already finished and was delivered)"
+            ))])
+        }
+    }
+
+    /// `sub-agent-wait`: waits on an already-started job.
+    async fn collect_job(&self, request: &CallToolRequestParams) -> CallToolResult {
+        let Some(id) = job_id_argument(request) else {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "missing required string argument 'job_id'",
+            )]);
+        };
+        let Some(rx) = self.jobs.receiver_for(id) else {
+            return CallToolResult::error(vec![ContentBlock::text(format!(
+                "no such job '{id}' (unknown, or its result was already delivered)"
+            ))]);
+        };
+        job_reply_to_result(self.jobs.await_outcome(id, rx, self.wait_budget).await)
+    }
+
     async fn call_tool_impl(
         &self,
         request: CallToolRequestParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let Some(agent) = self.agents.iter().find(|a| a.tool_name == request.name) else {
+        if request.name == WAIT_TOOL_NAME {
+            return Ok(self.collect_job(&request).await);
+        }
+        if request.name == CANCEL_TOOL_NAME {
+            return Ok(self.cancel_job(&request));
+        }
+        let Some(index) = self.agents.iter().position(|a| a.tool_name == request.name) else {
             return Err(ErrorData::method_not_found::<CallToolRequestMethod>());
         };
 
@@ -181,24 +409,14 @@ impl DelegateToolRegistry {
             )]));
         };
 
-        let plain_ui = crate::utils::ui::backends::plain::PlainOutput;
-        match agent
-            .pi
-            .run_delegated_task(
-                &self.pi_binary,
-                task,
-                &agent.system_prompt,
-                &agent.tools,
-                &agent.ctx,
-                &plain_ui,
-            )
-            .await
-        {
-            Ok(output) => Ok(CallToolResult::success(vec![ContentBlock::text(output)])),
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
-                e.to_string(),
-            )])),
-        }
+        let registry = self.clone();
+        let owned_task = task.to_string();
+        let (id, rx) = self.jobs.start_or_attach(&request.name, task, async move {
+            registry.run_agent(index, &owned_task).await
+        });
+        Ok(job_reply_to_result(
+            self.jobs.await_outcome(&id, rx, self.wait_budget).await,
+        ))
     }
 }
 
@@ -212,7 +430,7 @@ impl ServerHandler for DelegateToolRegistry {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let tools = self
+        let mut tools: Vec<Tool> = self
             .agents
             .iter()
             .map(|agent| {
@@ -223,6 +441,19 @@ impl ServerHandler for DelegateToolRegistry {
                 )
             })
             .collect();
+        tools.push(Tool::new(
+            WAIT_TOOL_NAME,
+            "Collect the result of a sub-agent call that replied it was still working. \
+             Blocks until the sub-agent finishes or about four minutes pass; if it replies \
+             still working again, call it again. Do not call it otherwise.",
+            job_tool_input_schema(),
+        ));
+        tools.push(Tool::new(
+            CANCEL_TOOL_NAME,
+            "Stop a running sub-agent job and kill its process. Use only when the user asks \
+             to abandon a sub-agent, or it is clearly hung.",
+            job_tool_input_schema(),
+        ));
         // The 2026-07-28 spec requires ttl_ms and cache_scope in tools/list
         // responses. Set them to sensible defaults when the protocol version
         // supports them; mirror the rmcp #[tool_handler] macro behavior.
@@ -282,6 +513,8 @@ pub(crate) async fn start_delegate_mcp_server(
     let registry = DelegateToolRegistry {
         pi_binary: Arc::new(binary),
         agents: Arc::new(agents),
+        jobs: Arc::new(JobTable::default()),
+        wait_budget: WAIT_BUDGET,
     };
     let service = StreamableHttpService::new(
         move || Ok(registry.clone()),
@@ -295,7 +528,11 @@ pub(crate) async fn start_delegate_mcp_server(
         crate::capabilities::McpBinding::Http {
             url,
             headers: HashMap::new(),
-            timeout: Some(7_200_000), // 2 hours in milliseconds
+            // Bob's client gives up on a call after at most 300s no matter what
+            // larger value is configured, and documents a fixed set of accepted
+            // values that includes 300000. Calls longer than `WAIT_BUDGET` are
+            // handled by the job table, not by a longer timeout.
+            timeout: Some(300_000),
         },
         server,
     ))
@@ -369,6 +606,181 @@ mod tests {
             crate::capabilities::McpBinding::Http { url, .. } => url.clone(),
             other => panic!("expected an Http McpBinding, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_job_that_finishes_within_budget_is_delivered_once() {
+        let table = JobTable::default();
+        let (id, rx) =
+            table.start_or_attach("explore", "look", async { Ok("found it".to_string()) });
+        let reply = table.await_outcome(&id, rx, Duration::from_secs(5)).await;
+        assert_eq!(reply, JobReply::Finished(Ok("found it".to_string())));
+        assert!(
+            table.receiver_for(&id).is_none(),
+            "result is delivered once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_past_its_budget_reports_running_and_can_be_collected_later() {
+        let table = JobTable::default();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let (id, rx) = table.start_or_attach("explore", "look", async move {
+            let _ = gate.await;
+            Ok("late".to_string())
+        });
+
+        let first = table
+            .await_outcome(&id, rx, Duration::from_millis(20))
+            .await;
+        assert_eq!(first, JobReply::Running(id.clone()));
+        assert!(
+            table.receiver_for(&id).is_some(),
+            "running job stays collectable"
+        );
+
+        release.send(()).unwrap();
+        let rx = table.receiver_for(&id).unwrap();
+        let second = table.await_outcome(&id, rx, Duration::from_secs(5)).await;
+        assert_eq!(second, JobReply::Finished(Ok("late".to_string())));
+    }
+
+    #[tokio::test]
+    async fn a_retry_of_the_same_call_attaches_instead_of_starting_a_second_job() {
+        let table = JobTable::default();
+        let runs = Arc::new(AtomicU64::new(0));
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let counter = runs.clone();
+        let (first_id, _rx) = table.start_or_attach("explore", "look", async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = gate.await;
+            Ok("once".to_string())
+        });
+        let counter = runs.clone();
+        let (second_id, rx) = table.start_or_attach("explore", "look", async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok("twice".to_string())
+        });
+        assert_eq!(first_id, second_id);
+
+        release.send(()).unwrap();
+        let reply = table
+            .await_outcome(&second_id, rx, Duration::from_secs(5))
+            .await;
+        assert_eq!(reply, JobReply::Finished(Ok("once".to_string())));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn different_tasks_get_different_jobs() {
+        let table = JobTable::default();
+        let (a, _) = table.start_or_attach("explore", "one", async { Ok(String::new()) });
+        let (b, _) = table.start_or_attach("explore", "two", async { Ok(String::new()) });
+        let (c, _) = table.start_or_attach("plan", "one", async { Ok(String::new()) });
+        assert!(a != b && a != c && b != c);
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_reports_its_error() {
+        let table = JobTable::default();
+        let (id, rx) = table.start_or_attach("explore", "look", async { Err("boom".to_string()) });
+        let reply = table.await_outcome(&id, rx, Duration::from_secs(5)).await;
+        assert_eq!(reply, JobReply::Finished(Err("boom".to_string())));
+    }
+
+    #[test]
+    fn running_reply_points_at_the_wait_tool_and_nothing_else() {
+        let result = job_reply_to_result(JobReply::Running("job-7".to_string()));
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("job-7"), "{json}");
+        assert!(json.contains(WAIT_TOOL_NAME), "{json}");
+        assert!(!json.contains("\"isError\":true"), "{json}");
+    }
+
+    /// Signals when dropped, standing in for the sub-agent process that
+    /// dropping a job's work future is meant to kill.
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_job_drops_its_work_and_tells_waiters() {
+        let table = JobTable::default();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (id, rx) = table.start_or_attach("explore", "look", async move {
+            let _guard = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<JobOutcome>().await
+        });
+        // Cancelling before the work first runs would drop it unstarted, with
+        // nothing to signal; wait until it is actually running.
+        started_rx.await.unwrap();
+
+        assert!(table.cancel(&id));
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("work should be dropped promptly")
+            .unwrap();
+        let reply = table.await_outcome(&id, rx, Duration::from_secs(5)).await;
+        assert_eq!(
+            reply,
+            JobReply::Finished(Err(CANCELLED_MESSAGE.to_string()))
+        );
+        assert!(table.receiver_for(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_job_reports_false() {
+        assert!(!JobTable::default().cancel("job-404"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_cannot_be_cancelled() {
+        let table = JobTable::default();
+        let (id, rx) = table.start_or_attach("explore", "look", async { Ok("done".to_string()) });
+        table.await_outcome(&id, rx, Duration::from_secs(5)).await;
+        assert!(!table.cancel(&id));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_task_can_be_started_again_as_a_fresh_job() {
+        let table = JobTable::default();
+        let (first, _rx) = table.start_or_attach("explore", "look", async {
+            std::future::pending::<JobOutcome>().await
+        });
+        assert!(table.cancel(&first));
+        let (second, rx) =
+            table.start_or_attach("explore", "look", async { Ok("again".to_string()) });
+        assert_ne!(first, second);
+        let reply = table
+            .await_outcome(&second, rx, Duration::from_secs(5))
+            .await;
+        assert_eq!(reply, JobReply::Finished(Ok("again".to_string())));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_table_cancels_running_jobs() {
+        let table = JobTable::default();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let _ = table.start_or_attach("explore", "look", async move {
+            let _guard = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<JobOutcome>().await
+        });
+        started_rx.await.unwrap();
+        drop(table);
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("work should be dropped when the table goes away")
+            .unwrap();
     }
 
     #[tokio::test]

@@ -16,20 +16,20 @@ use std::collections::HashSet;
 /*-- public --*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Validate)]
-pub struct SpeechToTextCapabilityConfig {
+pub(crate) struct SpeechToTextCapabilityConfig {
     /// Key into the configured models map (the user-chosen instance ID) for
     /// the transcription model this capability serves.
     #[validate(min_length = 1, message = "no model is selected")]
-    pub model_id: String,
+    pub(crate) model_id: String,
     /// Language hint (e.g. `en`). Leave unset to auto-detect.
     #[serde(default)]
-    pub language: Option<String>,
+    pub(crate) language: Option<String>,
     /// Request timeout in seconds; raise for self-hosted model cold starts.
     #[serde(default = "default_timeout_seconds")]
-    pub timeout_seconds: u64,
+    pub(crate) timeout_seconds: u64,
     /// Transport-level retries; 0 disables.
     #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
+    pub(crate) max_retries: u32,
 }
 
 impl Default for SpeechToTextCapabilityConfig {
@@ -43,14 +43,14 @@ impl Default for SpeechToTextCapabilityConfig {
     }
 }
 
-pub struct SpeechToTextCapability {
+pub(crate) struct SpeechToTextCapability {
     instance_id: String,
     config: SpeechToTextCapabilityConfig,
 }
 
 /// [`SpeechToTextCapability`] with the model its `model_id` names. Built only
 /// by `resolve_refs`.
-pub struct ResolvedSpeechToTextCapability {
+pub(crate) struct ResolvedSpeechToTextCapability {
     inner: SpeechToTextCapability,
     configured_model: ConfiguredModel,
 }
@@ -84,28 +84,12 @@ impl crate::registry::Named for ResolvedSpeechToTextCapability {
 }
 
 impl crate::capabilities::CapabilityInfo for SpeechToTextCapability {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn description(&self) -> &str {
-        DESCRIPTION
-    }
-
     fn binding_types(&self) -> HashSet<BindingType> {
         HashSet::from([BindingType::VoiceInput])
     }
 }
 
 impl crate::capabilities::CapabilityInfo for ResolvedSpeechToTextCapability {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn description(&self) -> &str {
-        DESCRIPTION
-    }
-
     fn binding_types(&self) -> HashSet<BindingType> {
         HashSet::from([BindingType::VoiceInput])
     }
@@ -180,6 +164,7 @@ impl HasCapabilityMetadata for SpeechToTextCapability {
                 "speech".to_string(),
             ],
             supported_binding_types: HashSet::from([BindingType::VoiceInput]),
+            auto_configurable: true,
         }
     }
 }

@@ -5,7 +5,7 @@ use crate::utils::ui::base::{HasUiMetadata, Ui, UiMetadata};
 
 /// Plain text backend with no ANSI codes.
 /// Suitable for CI, piped output, and non-ANSI terminals.
-pub struct PlainOutput;
+pub(crate) struct PlainOutput;
 
 impl ConfigConstructable for PlainOutput {
     type Config = NoConfig;

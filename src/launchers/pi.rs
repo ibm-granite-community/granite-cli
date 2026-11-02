@@ -10,7 +10,8 @@
 
 use crate::capabilities::{AgentModelBinding, BindingType, ResolvedCapability, ToolName};
 use crate::launchers::base::{
-    EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command, run_command_captured,
+    EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command,
+    run_command_captured_killable,
 };
 use crate::providers::ApiType;
 use crate::registry::{ConfigConstructable, ConstructError};
@@ -30,21 +31,21 @@ use_channel!("LNCHR");
 /// Every field should have a serde default so that delegate construction is
 /// possible from an empty settings object.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
-pub struct PiLauncherConfig {
+pub(crate) struct PiLauncherConfig {
     /// Override path to the `pi` binary for non-PATH installs.
     /// Leave unset to use PATH lookup.
     #[serde(default)]
-    pub command_path: Option<String>,
+    pub(crate) command_path: Option<String>,
 
     /// Extra keys merged (shallow, last-write-wins) into the generated Pi
     /// provider entry -- e.g. `compat` flags or other provider-level
     /// configuration a particular server needs. Necessary because the entry
     /// is regenerated on every launch.
     #[serde(default)]
-    pub provider_overrides: Option<serde_json::Value>,
+    pub(crate) provider_overrides: Option<serde_json::Value>,
 }
 
-pub struct PiLauncher {
+pub(crate) struct PiLauncher {
     instance_id: String,
     config: PiLauncherConfig,
     bound_binding: Option<AgentModelBinding>,
@@ -72,10 +73,6 @@ impl crate::registry::Named for PiLauncher {
 
 #[async_trait]
 impl Launcher for PiLauncher {
-    fn name(&self) -> &str {
-        "Pi CLI"
-    }
-
     fn command(&self) -> &str {
         self.config.command_path.as_deref().unwrap_or("pi")
     }
@@ -173,6 +170,7 @@ impl HasPiLauncherMetadata for PiLauncher {
             description: "Pi terminal coding agent harness".to_string(),
             default_command: "pi".to_string(),
             supported_capabilities: HashSet::from([BindingType::AgentModel]),
+            mcp_transports: HashSet::new(),
             tags: vec!["pi".to_string(), "coding-agent".to_string()],
         }
     }
@@ -280,7 +278,8 @@ impl PiLauncher {
     }
 
     /// Runs `pi` headlessly for one delegated sub-agent task and returns its
-    /// captured stdout. Requires a prior `bind_capability` call -- there is no
+    /// captured stdout. Dropping the returned future kills `pi` (see
+    /// [`run_command_captured_killable`]). Requires a prior `bind_capability` call -- there is no
     /// sensible way to pick a model on the caller's behalf, so an unbound
     /// launcher here is a bug in the caller, not a runtime condition.
     pub(crate) async fn run_delegated_task(
@@ -311,7 +310,7 @@ impl PiLauncher {
 
         let overlay = self.env_overlay(ctx).await?;
         let (status, stdout, stderr) =
-            run_command_captured(binary.to_path_buf(), &overlay, &full_args, ctx).await?;
+            run_command_captured_killable(binary.to_path_buf(), &overlay, &full_args, ctx).await?;
         if !status.success() {
             anyhow::bail!("pi exited with {status}: {stderr}");
         }
@@ -324,7 +323,7 @@ impl PiLauncher {
 /// no web-fetch/web-search built-ins and no MCP tool-name convention of its
 /// own to target, so those map to `None`; `Other` is the escape hatch and
 /// passes through verbatim, matching `Launcher::map_tool_name`'s default.
-pub(crate) fn pi_tool_name(tool: &ToolName) -> Option<String> {
+fn pi_tool_name(tool: &ToolName) -> Option<String> {
     match tool {
         ToolName::FileRead => Some("read".to_string()),
         ToolName::Shell => Some("bash".to_string()),
