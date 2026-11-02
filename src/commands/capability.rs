@@ -9,12 +9,12 @@ use crate::config::validation::RefKind;
 use crate::dependency::{self, Configured};
 use crate::utils::prompt_from_schema;
 
-pub struct CapabilityCommands;
+pub(crate) struct CapabilityCommands;
 
 use_channel!("CAPBL");
 
 impl CapabilityCommands {
-    pub fn catalog(ctx: &crate::AppContext) -> Result<()> {
+    pub(crate) fn catalog(ctx: &crate::AppContext) -> Result<()> {
         let capabilities = CAPABILITY_REGISTRY.entries();
 
         let mut rows: Vec<Vec<String>> = capabilities
@@ -39,7 +39,7 @@ impl CapabilityCommands {
         Ok(())
     }
 
-    pub fn list(ctx: &crate::AppContext) -> Result<()> {
+    pub(crate) fn list(ctx: &crate::AppContext) -> Result<()> {
         let notes = crate::commands::shared::remediation::dangling_notes(ctx, RefKind::Capability);
         let mut rows: Vec<Vec<String>> = ctx
             .config()
@@ -69,7 +69,7 @@ impl CapabilityCommands {
         Ok(())
     }
 
-    pub async fn info(ctx: &mut crate::AppContext, capability_id: &str) -> Result<()> {
+    pub(crate) async fn info(ctx: &mut crate::AppContext, capability_id: &str) -> Result<()> {
         // Only a configured instance can have a broken reference. An id that
         // names a catalog type is being browsed, not diagnosed.
         if ctx.config().get_capability(capability_id).is_some() {
@@ -112,11 +112,9 @@ impl CapabilityCommands {
                     let mut instance_fields: Vec<(&str, String)> = Vec::new();
 
                     instance_fields.push(("Config: Type", configured.capability_type.clone()));
-                    if let Some(obj) = configured.config.as_object() {
-                        for (k, v) in obj {
-                            instance_fields.push(("Config", format!("{k} = {v}")));
-                        }
-                    }
+                    let config_fields = crate::commands::shared::config_fields(&configured.config);
+                    instance_fields
+                        .extend(config_fields.iter().map(|(k, v)| (k.as_str(), v.clone())));
 
                     ctx.ui.detail(capability_id, &instance_fields);
                 }
@@ -149,7 +147,7 @@ impl CapabilityCommands {
     ///
     /// `force_overwrite` skips the "already configured, overwrite?" prompt,
     /// for callers that have already obtained confirmation (e.g. remediation).
-    pub async fn setup(
+    pub(crate) async fn setup(
         ctx: &mut crate::AppContext,
         capability_type: &str,
         instance_id: Option<&str>,
@@ -206,8 +204,7 @@ impl CapabilityCommands {
             })?;
         let defaults = existing_config
             .map(|c| c.config.clone())
-            .or_else(|| CAPABILITY_REGISTRY.default_config(capability_type))
-            .unwrap_or_else(|| serde_json::json!({}));
+            .unwrap_or_else(|| CAPABILITY_REGISTRY.default_config(capability_type));
 
         // Phase A: prompt for everything except dependency-resolved fields --
         // those are picked from configured instances below, never free-typed.
@@ -582,7 +579,7 @@ impl CapabilityCommands {
     /// `policy` controls what happens to dependents: `Cascade` removes them
     /// too, `Refuse` aborts, `Leave` strands them. `None` asks interactively
     /// or leaves in non-interactive sessions.
-    pub fn remove(
+    pub(crate) fn remove(
         ctx: &mut crate::AppContext,
         capability_id: &str,
         policy: Option<crate::commands::shared::remediation::DependentsPolicy>,

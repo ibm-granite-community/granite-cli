@@ -19,7 +19,7 @@ use crate::utils::ui::Ui;
 /// `model_alias` (so the alias used to register the route and the one
 /// `resolve_provider_endpoint` computes later stay consistent) and the real
 /// upstream call made by `health_check`/`pull_model` -- to `inner`.
-pub struct ProxiedProvider {
+pub(crate) struct ProxiedProvider {
     inner: Arc<dyn Provider>,
     local_base_url: String,
 }
@@ -29,7 +29,7 @@ impl ProxiedProvider {
     /// `local_base_url`. Wrapping has no side effects and cannot fail: the
     /// route to the real upstream is registered by the launch path, from the
     /// unwrapped provider, before anything is wrapped.
-    pub fn wrap(inner: Arc<dyn Provider>, local_base_url: String) -> Self {
+    pub(crate) fn wrap(inner: Arc<dyn Provider>, local_base_url: String) -> Self {
         Self {
             inner,
             local_base_url,

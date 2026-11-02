@@ -5,24 +5,31 @@ use crate::registry::ConfigConstructable;
 
 /*-- public --*/
 
-pub type TableRow = Vec<String>;
-pub type TableEntry = (String, Vec<String>, Vec<TableRow>);
-pub type DetailField = (String, String);
-pub type DetailEntry = (String, Vec<DetailField>);
-pub type SelectEntry = (String, Vec<String>, usize);
-pub type MultiSelectEntry = (String, Vec<String>, Vec<bool>);
+#[cfg(test)]
+type TableRow = Vec<String>;
+#[cfg(test)]
+type TableEntry = (String, Vec<String>, Vec<TableRow>);
+#[cfg(test)]
+type DetailField = (String, String);
+#[cfg(test)]
+type DetailEntry = (String, Vec<DetailField>);
+#[cfg(test)]
+type SelectEntry = (String, Vec<String>, usize);
+#[cfg(test)]
+type MultiSelectEntry = (String, Vec<String>, Vec<bool>);
 
 /// Metadata describing a registered UI backend.
 #[derive(Debug, Clone)]
-pub struct UiMetadata {
-    pub name: String,
-    pub description: String,
+pub(crate) struct UiMetadata {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) name: String,
+    pub(crate) description: String,
 }
 
 /// Opaque handle identifying an in-flight pull/download for progress reporting.
 /// Allocated by [`Ui::pull_start`] and passed back into [`Ui::pull_progress`]/[`Ui::pull_finish`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PullHandle(pub u64);
+pub(crate) struct PullHandle(pub(crate) u64);
 
 // Generate UiFactory and HasUiMetadata via the existing macro.
 use crate::define_factory;
@@ -30,7 +37,7 @@ define_factory!(Ui, UiMetadata, UiFactory);
 
 /// Global registry of UI backends.
 /// Backends are registered by name and constructed on demand via --output flag.
-pub static UI_REGISTRY: LazyLock<UiFactory> = LazyLock::new(|| {
+pub(crate) static UI_REGISTRY: LazyLock<UiFactory> = LazyLock::new(|| {
     let mut f = UiFactory::new();
     f.register::<crate::utils::ui::backends::terminal::TerminalOutput>("terminal");
     f.register::<crate::utils::ui::backends::plain::PlainOutput>("plain");
@@ -130,7 +137,7 @@ macro_rules! output_contract_tests {
 /// to concrete types at runtime via `downcast_ref::<T>()`. This enables
 /// test inspection of `CaptureUi` fields and allows prod code to
 /// access type-specific methods when necessary.
-pub trait Ui: Send + Sync + Any {
+pub(crate) trait Ui: Send + Sync + Any {
     /// Render a tabular result (catalog, list, health).
     fn table(&self, title: &str, headers: &[&str], rows: &[Vec<String>]);
 
@@ -162,6 +169,7 @@ pub trait Ui: Send + Sync + Any {
     fn pull_finish(&self, handle: PullHandle, label: &str, error: Option<&str>);
 
     /// Apply severity-based markings (e.g. green) to `msg`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn ok(&self, msg: &str) -> String {
         msg.to_string()
     }
@@ -294,56 +302,56 @@ pub(crate) mod tests {
     /// assert!(headers.contains(&"FAMILY".to_string()));
     /// ```
     #[derive(Default)]
-    pub struct CaptureUi {
+    pub(crate) struct CaptureUi {
         /// (title, headers, rows) for each table() call
-        pub tables: RefCell<Vec<TableEntry>>,
+        pub(crate) tables: RefCell<Vec<TableEntry>>,
         /// (title, fields) for each detail() call
-        pub details: RefCell<Vec<DetailEntry>>,
+        pub(crate) details: RefCell<Vec<DetailEntry>>,
         /// (label, ok, detail) for each status() call
-        pub statuses: RefCell<Vec<(String, bool, String)>>,
-        pub infos: RefCell<Vec<String>>,
-        pub warns: RefCell<Vec<String>>,
-        pub errors: RefCell<Vec<String>>,
-        pub oks: RefCell<Vec<String>>,
-        pub warn_marks: RefCell<Vec<String>>,
-        pub error_marks: RefCell<Vec<String>>,
-        pub detail_marks: RefCell<Vec<String>>,
+        pub(crate) statuses: RefCell<Vec<(String, bool, String)>>,
+        pub(crate) infos: RefCell<Vec<String>>,
+        pub(crate) warns: RefCell<Vec<String>>,
+        pub(crate) errors: RefCell<Vec<String>>,
+        oks: RefCell<Vec<String>>,
+        warn_marks: RefCell<Vec<String>>,
+        error_marks: RefCell<Vec<String>>,
+        detail_marks: RefCell<Vec<String>>,
 
         /// (prompt, items, default) for each select() call
-        pub select_prompts: RefCell<Vec<SelectEntry>>,
+        pub(crate) select_prompts: RefCell<Vec<SelectEntry>>,
         /// (prompt, items, defaults) for each multi_select() call
-        pub multi_select_prompts: RefCell<Vec<MultiSelectEntry>>,
+        pub(crate) multi_select_prompts: RefCell<Vec<MultiSelectEntry>>,
         /// (prompt, default) for each confirm() call
-        pub confirm_prompts: RefCell<Vec<(String, bool)>>,
+        pub(crate) confirm_prompts: RefCell<Vec<(String, bool)>>,
         /// (prompt, default) for each text() call
-        pub text_prompts: RefCell<Vec<(String, String)>>,
+        pub(crate) text_prompts: RefCell<Vec<(String, String)>>,
         /// prompt for each password() call
-        pub password_prompts: RefCell<Vec<String>>,
+        pub(crate) password_prompts: RefCell<Vec<String>>,
 
         /// Canned answers consumed in order by select(); falls back to `default` when empty.
-        pub select_answers: RefCell<VecDeque<usize>>,
+        pub(crate) select_answers: RefCell<VecDeque<usize>>,
         /// Canned answers consumed in order by multi_select(); falls back to `vec![]` when empty.
-        pub multi_select_answers: RefCell<VecDeque<Vec<usize>>>,
+        pub(crate) multi_select_answers: RefCell<VecDeque<Vec<usize>>>,
         /// Canned answers consumed in order by confirm(); falls back to `default` when empty.
-        pub confirm_answers: RefCell<VecDeque<bool>>,
+        pub(crate) confirm_answers: RefCell<VecDeque<bool>>,
         /// Canned answers consumed in order by text(); falls back to `default` when empty.
-        pub text_answers: RefCell<VecDeque<String>>,
+        pub(crate) text_answers: RefCell<VecDeque<String>>,
         /// Canned answers consumed in order by password(); falls back to "" when empty.
-        pub password_answers: RefCell<VecDeque<String>>,
+        pub(crate) password_answers: RefCell<VecDeque<String>>,
 
         /// (label, total_bytes) for each pull_start() call, in handle-allocation order.
-        pub pull_starts: RefCell<Vec<(String, Option<u64>)>>,
+        pull_starts: RefCell<Vec<(String, Option<u64>)>>,
         /// (handle, downloaded_bytes, total_bytes) for each pull_progress() call.
-        pub pull_progresses: RefCell<Vec<(PullHandle, u64, Option<u64>)>>,
+        pull_progresses: RefCell<Vec<(PullHandle, u64, Option<u64>)>>,
         /// (handle, label, error) for each pull_finish() call.
-        pub pull_finishes: RefCell<Vec<(PullHandle, String, Option<String>)>>,
+        pull_finishes: RefCell<Vec<(PullHandle, String, Option<String>)>>,
         /// Counter used to allocate sequential PullHandles.
-        pub next_pull_handle: RefCell<u64>,
+        next_pull_handle: RefCell<u64>,
 
         /// Answer for `is_interactive()`. `None`, the default, answers true,
         /// so a test only sets this when it is testing what happens without
         /// a person to ask.
-        pub interactive: RefCell<Option<bool>>,
+        pub(crate) interactive: RefCell<Option<bool>>,
     }
 
     impl ConfigConstructable for CaptureUi {

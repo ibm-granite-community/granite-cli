@@ -44,15 +44,15 @@ use_channel!("PRXY");
 /*-- public --*/
 
 /// One destination the proxy can forward a request to.
-pub struct UpstreamTarget {
-    pub base_url: String,
-    pub verify_ssl: bool,
-    pub auth: UpstreamAuth,
+pub(crate) struct UpstreamTarget {
+    pub(crate) base_url: String,
+    pub(crate) verify_ssl: bool,
+    pub(crate) auth: UpstreamAuth,
 }
 
 /// How the proxy should handle auth headers when forwarding to a target.
 #[derive(Clone)]
-pub enum UpstreamAuth {
+pub(crate) enum UpstreamAuth {
     /// Strip whatever auth the client sent and inject this instead (or send
     /// no auth at all if `None`) -- for a known granite-cli-resolved
     /// provider, whose credentials are unrelated to whatever the client
@@ -69,8 +69,8 @@ pub enum UpstreamAuth {
 /// one listening port; dispatch happens purely by the request's own
 /// `"model"` field.
 #[derive(Clone)]
-pub struct ProxyHandle {
-    pub local_base_url: String,
+pub(crate) struct ProxyHandle {
+    pub(crate) local_base_url: String,
     state: ProxyState,
 }
 
@@ -87,7 +87,7 @@ impl ProxyHandle {
     /// records usage under `label` for traffic dispatched to it. Works
     /// whether the proxy is already serving traffic or not. Fails only if
     /// `target`'s TLS client can't be built.
-    pub fn register_route(
+    pub(crate) fn register_route(
         &self,
         model_name: String,
         target: UpstreamTarget,
@@ -106,7 +106,7 @@ impl ProxyHandle {
     /// URL the launcher wrote into the tool's config rather than by guessing
     /// which provider a model name belongs to. Auth is passed through
     /// untouched. Works whether the proxy is already serving traffic or not.
-    pub fn register_provider(
+    pub(crate) fn register_provider(
         &self,
         provider_name: &str,
         base_url: String,
@@ -126,7 +126,8 @@ impl ProxyHandle {
 
     /// Sets (or replaces) the fallback target used for requests whose
     /// `"model"` field doesn't match any registered route or provider prefix.
-    pub fn set_default(&self, target: UpstreamTarget, label: String) -> anyhow::Result<()> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn set_default(&self, target: UpstreamTarget, label: String) -> anyhow::Result<()> {
         let resolved = ResolvedTarget::build(target)?;
         let mut table = self.state.routing.write().unwrap();
         table.default = resolved;
@@ -143,7 +144,7 @@ impl ProxyHandle {
     /// eagerly at that time avoids re-deriving (and getting wrong) an
     /// `UpstreamTarget` from already-proxied data. Fails if `model_name`
     /// has no registered route.
-    pub fn set_default_from_route(&self, model_name: &str) -> anyhow::Result<()> {
+    pub(crate) fn set_default_from_route(&self, model_name: &str) -> anyhow::Result<()> {
         let mut table = self.state.routing.write().unwrap();
         let target = table
             .routes
@@ -162,7 +163,7 @@ impl ProxyHandle {
 
     /// The shared tracker every route (including the default target)
     /// records usage into.
-    pub fn tracker(&self) -> Arc<UsageTracker> {
+    pub(crate) fn tracker(&self) -> Arc<UsageTracker> {
         Arc::clone(&self.state.tracker)
     }
 }
@@ -171,8 +172,8 @@ impl ProxyHandle {
 /// dispatching/tracking immediately; routes and the default target may be
 /// registered at any time via `handle`, before or after real traffic starts
 /// arriving.
-pub struct ProxyServer {
-    pub handle: ProxyHandle,
+pub(crate) struct ProxyServer {
+    pub(crate) handle: ProxyHandle,
     inner: SubServer,
 }
 
@@ -185,7 +186,7 @@ impl ProxyServer {
     /// Synchronous -- see `SubServer::spawn` -- so this can be called from
     /// inside sync code as long as a Tokio runtime is already running
     /// somewhere up the call stack.
-    pub fn start() -> anyhow::Result<Self> {
+    pub(crate) fn start() -> anyhow::Result<Self> {
         let ambient_base_url = std::env::var("ANTHROPIC_BASE_URL")
             .ok()
             .unwrap_or_else(|| "https://api.anthropic.com".to_string());
@@ -221,7 +222,7 @@ impl ProxyServer {
 
     /// Signal the server to stop accepting new connections and wait for it
     /// to finish draining in-flight ones.
-    pub async fn shutdown(self) {
+    pub(crate) async fn shutdown(self) {
         self.inner.shutdown().await;
     }
 }

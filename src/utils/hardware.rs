@@ -3,17 +3,17 @@ use serde::{Deserialize, Serialize};
 /*-- public --*/
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HardwareProfile {
-    pub os: String,
-    pub cpu_cores: u32,
-    pub cpu_arch: String,
-    pub gpu_vendor: Option<String>,
-    pub vram_gb: Option<f64>,
-    pub ram_gb: f64,
+pub(crate) struct HardwareProfile {
+    pub(crate) os: String,
+    pub(crate) cpu_cores: u32,
+    pub(crate) cpu_arch: String,
+    pub(crate) gpu_vendor: Option<String>,
+    pub(crate) vram_gb: Option<f64>,
+    pub(crate) ram_gb: f64,
 }
 
 impl HardwareProfile {
-    pub fn detect() -> Self {
+    fn detect() -> Self {
         let (gpu_vendor, vram_gb) = Self::detect_gpu();
         Self {
             os: std::env::consts::OS.to_string(),
@@ -50,7 +50,7 @@ impl HardwareProfile {
 
     /// Memory budget available for model weights + KV cache, after backing
     /// off the safety headroom (1.5x for VRAM, 2.0x for system RAM).
-    pub fn usable_memory_gb(&self) -> f64 {
+    pub(crate) fn usable_memory_gb(&self) -> f64 {
         match self.vram_gb {
             Some(vram) => vram / 1.5,
             None => self.ram_gb / 2.0,
@@ -58,7 +58,7 @@ impl HardwareProfile {
     }
 }
 
-pub fn detect_hardware() -> HardwareProfile {
+pub(crate) fn detect_hardware() -> HardwareProfile {
     HardwareProfile::detect()
 }
 
@@ -81,7 +81,7 @@ fn bytes_to_gb(bytes: u64) -> f64 {
 mod gpu {
     use super::bytes_to_gb;
 
-    pub fn detect_nvidia() -> Option<(Option<String>, Option<f64>)> {
+    pub(crate) fn detect_nvidia() -> Option<(Option<String>, Option<f64>)> {
         use nvml_wrapper::error::NvmlError;
 
         let nvml = nvml_wrapper::Nvml::init().ok()?;
@@ -98,7 +98,7 @@ mod gpu {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn detect_apple() -> Option<(Option<String>, Option<f64>)> {
+    pub(crate) fn detect_apple() -> Option<(Option<String>, Option<f64>)> {
         // MTLCreateSystemDefaultDevice requires CoreGraphics to be linked.
         #[link(name = "CoreGraphics", kind = "framework")]
         unsafe extern "C" {}
@@ -111,7 +111,7 @@ mod gpu {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn detect_amd_linux() -> Option<(Option<String>, Option<f64>)> {
+    pub(crate) fn detect_amd_linux() -> Option<(Option<String>, Option<f64>)> {
         const AMD_VENDOR_ID: &str = "0x1002";
 
         let drm_dir = std::fs::read_dir("/sys/class/drm").ok()?;
@@ -140,7 +140,7 @@ mod gpu {
     }
 
     #[cfg(target_os = "windows")]
-    pub fn detect_dxgi() -> Option<(Option<String>, Option<f64>)> {
+    pub(crate) fn detect_dxgi() -> Option<(Option<String>, Option<f64>)> {
         use windows::Win32::Graphics::Dxgi::{
             CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
         };

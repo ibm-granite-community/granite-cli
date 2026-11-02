@@ -9,10 +9,11 @@ use_channel!("LNCHR");
 
 /*-- public --*/
 
-pub static LAUNCHER_REGISTRY: LazyLock<base::LauncherFactory> = LazyLock::new(|| {
+pub(crate) static LAUNCHER_REGISTRY: LazyLock<base::LauncherFactory> = LazyLock::new(|| {
     let mut factory = base::LauncherFactory::new();
     factory.register::<claude::ClaudeLauncher>("claude");
     factory.register::<bob::BobLauncher>("bob");
+    factory.register::<bobide::BobIdeLauncher>("bobide");
     factory.register::<pi::PiLauncher>("pi");
     factory.register::<opencode::OpenCodeLauncher>("opencode");
     factory.register::<hermes::HermesLauncher>("hermes");
@@ -30,7 +31,7 @@ pub static LAUNCHER_REGISTRY: LazyLock<base::LauncherFactory> = LazyLock::new(||
 /// multiple named instances of one catalog type coexist (e.g. `claude-local`
 /// and `claude-enterprise` both backed by `claude`). The instance is kept, so
 /// every later ask for that id returns the same object.
-pub struct LauncherSource {
+pub(crate) struct LauncherSource {
     /// The settings for this kind, from the configuration snapshot the
     /// source was built from.
     configs: HashMap<String, crate::config::LauncherConfig>,
@@ -38,7 +39,7 @@ pub struct LauncherSource {
 }
 
 impl LauncherSource {
-    pub fn from_config(config: &crate::config::Config) -> Self {
+    pub(crate) fn new(config: &crate::config::Config) -> Self {
         Self {
             configs: config.launchers.clone(),
             cache: std::sync::Mutex::new(HashMap::new()),
@@ -49,7 +50,7 @@ impl LauncherSource {
     /// and returned from the cache on every one after it. Errors when no
     /// entry is configured under that id, or when its `launcher_type` is not
     /// in the registry.
-    pub fn get(&self, launcher_id: &str) -> anyhow::Result<std::sync::Arc<dyn Launcher>> {
+    pub(crate) fn get(&self, launcher_id: &str) -> anyhow::Result<std::sync::Arc<dyn Launcher>> {
         self.build(launcher_id)
             .map_err(|e| e.about("launcher", launcher_id))
     }
@@ -109,25 +110,18 @@ impl crate::dependency::Configured<dyn Launcher> for LauncherSource {
 /*-- Module Declarations -----------------------------------------------------*/
 
 mod base;
-pub mod bob;
-pub mod claude;
-pub mod codex;
-pub mod goose;
-pub mod hermes;
-pub mod openclaw;
-pub mod opencode;
-pub mod pi;
+pub(crate) mod bob;
+mod bobide;
+pub(crate) mod claude;
+pub(crate) mod codex;
+mod goose;
+pub(crate) mod hermes;
+mod openclaw;
+pub(crate) mod opencode;
+pub(crate) mod pi;
 
-pub(crate) use base::resolve_and_bind;
-pub use base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata};
-pub use bob::{BobLauncher, BobLauncherConfig};
-pub use claude::{ClaudeLauncher, ClaudeLauncherConfig};
-pub use codex::{CodexLauncher, CodexLauncherConfig};
-pub use goose::{GooseLauncher, GooseLauncherConfig};
-pub use hermes::{HermesLauncher, HermesLauncherConfig};
-pub use openclaw::{OpenClawLauncher, OpenClawLauncherConfig};
-pub use opencode::{OpenCodeLauncher, OpenCodeLauncherConfig};
-pub use pi::{PiLauncher, PiLauncherConfig};
+pub(crate) use base::{LaunchContext, Launcher, LauncherMetadata};
+pub(crate) use base::{McpTransportConflict, mcp_transport_conflict, resolve_and_bind};
 
 /*-- private shared modules --*/
 
@@ -160,6 +154,7 @@ mod tests {
         assert!(LAUNCHER_REGISTRY.get("bob").is_some());
         assert!(LAUNCHER_REGISTRY.get("pi").is_some());
         assert!(LAUNCHER_REGISTRY.get("opencode").is_some());
+        assert!(LAUNCHER_REGISTRY.get("bobide").is_some());
         assert!(LAUNCHER_REGISTRY.get("hermes").is_some());
         assert!(LAUNCHER_REGISTRY.get("goose").is_some());
         assert!(LAUNCHER_REGISTRY.get("openclaw").is_some());
@@ -187,7 +182,7 @@ mod tests {
             },
         );
 
-        let source = LauncherSource::from_config(&config);
+        let source = LauncherSource::new(&config);
         let ids: Vec<String> = source.instances().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids.len(), 2);
     }
@@ -195,17 +190,18 @@ mod tests {
     #[test]
     fn launcher_source_skips_unknown_types() {
         let config = config_with_launcher("mystery", "no-such-type");
-        let source = LauncherSource::from_config(&config);
+        let source = LauncherSource::new(&config);
         assert!(source.instances().is_empty());
     }
 
     #[test]
     fn launcher_source_catalog_contains_all_registered_types() {
         let config = Config::default();
-        let source = LauncherSource::from_config(&config);
+        let source = LauncherSource::new(&config);
         let catalog = source.catalog();
         assert!(catalog.contains_key("claude"));
         assert!(catalog.contains_key("bob"));
+        assert!(catalog.contains_key("bobide"));
         assert!(catalog.contains_key("pi"));
         assert!(catalog.contains_key("opencode"));
         assert!(catalog.contains_key("hermes"));
@@ -217,9 +213,10 @@ mod tests {
     #[test]
     fn launcher_source_config_schema_returns_schema_for_known_type() {
         let config = Config::default();
-        let source = LauncherSource::from_config(&config);
+        let source = LauncherSource::new(&config);
         assert!(source.config_schema("claude").is_some());
         assert!(source.config_schema("bob").is_some());
+        assert!(source.config_schema("bobide").is_some());
         assert!(source.config_schema("pi").is_some());
         assert!(source.config_schema("opencode").is_some());
         assert!(source.config_schema("hermes").is_some());

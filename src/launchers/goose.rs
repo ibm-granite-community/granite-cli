@@ -21,7 +21,7 @@ use crate::capabilities::{
     AgentModelBinding, ApiType, Binding, BindingType, McpBinding, ResolvedCapability,
 };
 use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
-use crate::launchers::shared::mcp_cli::mcp_binding_request;
+use crate::launchers::shared::mcp_cli::{STDIO_AND_HTTP, mcp_binding_request, transport_set};
 use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
@@ -31,13 +31,13 @@ use_channel!("GOOSE");
 /*-- public --*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
-pub struct GooseLauncherConfig {
+pub(crate) struct GooseLauncherConfig {
     /// Override path to the `goose` binary for non-PATH installs.
     #[serde(default)]
-    pub command_path: Option<String>,
+    pub(crate) command_path: Option<String>,
 }
 
-pub struct GooseLauncher {
+pub(crate) struct GooseLauncher {
     instance_id: String,
     config: GooseLauncherConfig,
     bound_binding: Option<AgentModelBinding>,
@@ -70,10 +70,6 @@ impl crate::registry::Named for GooseLauncher {
 
 #[async_trait]
 impl Launcher for GooseLauncher {
-    fn name(&self) -> &str {
-        "Goose CLI"
-    }
-
     fn command(&self) -> &str {
         self.config.command_path.as_deref().unwrap_or("goose")
     }
@@ -89,7 +85,9 @@ impl Launcher for GooseLauncher {
         }
 
         if capability_types.contains(&BindingType::Mcp) {
-            let binding = capability.bind(mcp_binding_request()).await?;
+            let binding = capability
+                .bind(mcp_binding_request(&Self::metadata().mcp_transports))
+                .await?;
             match binding {
                 Binding::Mcp(binding) => {
                     self.bound_mcp_bindings
@@ -275,6 +273,7 @@ impl HasGooseLauncherMetadata for GooseLauncher {
             description: "Goose Agent CLI launcher".to_string(),
             default_command: "goose".to_string(),
             supported_capabilities: HashSet::from([BindingType::AgentModel, BindingType::Mcp]),
+            mcp_transports: transport_set(STDIO_AND_HTTP),
             tags: vec!["goose".to_string(), "agent".to_string()],
         }
     }

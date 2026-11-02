@@ -1,1 +1,1 @@
-pub mod mcp_cli;
+pub(crate) mod mcp_cli;

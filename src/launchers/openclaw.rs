@@ -12,7 +12,7 @@ use crate::capabilities::{
     AgentModelBinding, ApiType, Binding, BindingType, McpBinding, ResolvedCapability,
 };
 use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
-use crate::launchers::shared::mcp_cli::mcp_binding_request;
+use crate::launchers::shared::mcp_cli::{STDIO_HTTP_AND_SSE, mcp_binding_request, transport_set};
 use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::resolve_shell_command;
 use crate::utils::ui::Ui;
@@ -25,13 +25,13 @@ use std::path::{Path, PathBuf};
 /*-- public --*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
-pub struct OpenClawLauncherConfig {
+pub(crate) struct OpenClawLauncherConfig {
     /// Override path to the `openclaw` binary for non-PATH installs.
     #[serde(default)]
-    pub command_path: Option<String>,
+    pub(crate) command_path: Option<String>,
 }
 
-pub struct OpenClawLauncher {
+pub(crate) struct OpenClawLauncher {
     instance_id: String,
     config: OpenClawLauncherConfig,
     bound_binding: Option<AgentModelBinding>,
@@ -63,10 +63,6 @@ impl crate::registry::Named for OpenClawLauncher {
 
 #[async_trait]
 impl Launcher for OpenClawLauncher {
-    fn name(&self) -> &str {
-        "OpenClaw CLI"
-    }
-
     fn command(&self) -> &str {
         self.config.command_path.as_deref().unwrap_or("openclaw")
     }
@@ -82,7 +78,9 @@ impl Launcher for OpenClawLauncher {
         }
 
         if capability_types.contains(&BindingType::Mcp) {
-            let binding = capability.bind(mcp_binding_request()).await?;
+            let binding = capability
+                .bind(mcp_binding_request(&Self::metadata().mcp_transports))
+                .await?;
             match binding {
                 Binding::Mcp(binding) => {
                     self.bound_mcp_bindings
@@ -174,6 +172,7 @@ impl HasOpenClawLauncherMetadata for OpenClawLauncher {
             description: "OpenClaw self-hosted AI agent launcher".to_string(),
             default_command: "openclaw".to_string(),
             supported_capabilities: HashSet::from([BindingType::AgentModel, BindingType::Mcp]),
+            mcp_transports: transport_set(STDIO_HTTP_AND_SSE),
             tags: vec!["openclaw".to_string(), "agent".to_string()],
         }
     }

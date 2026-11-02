@@ -151,15 +151,16 @@ To regenerate it after adding a launcher or capability, run `scripts/update-capa
 
 <!-- capability-table-start -->
 
-| Capability | Type | `claude` | `bob` | `pi` | `opencode` | `hermes` | `goose` | `openclaw` | `codex` |
-|---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `agent-model` | Agent Model Binding | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `speech-to-text` | Speech To Text | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| `vision-mcp` | Vision MCP Server | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `sub-agent` | Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
-| `sub-agent-code` | Code Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
-| `sub-agent-explore` | Explore Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
-| `sub-agent-plan` | Plan Sub-Agent | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Capability | Type | `claude` | `bob` | `bobide` | `pi` | `opencode` | `hermes` | `goose` | `openclaw` | `codex` |
+|---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `agent-model` | Agent Model Binding | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `speech-to-text` | Speech To Text | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
+| `vision-mcp` | Vision MCP Server | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `mcp-server` | MCP Server | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `sub-agent` | Sub-Agent | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| `sub-agent-code` | Code Sub-Agent | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| `sub-agent-explore` | Explore Sub-Agent | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| `sub-agent-plan` | Plan Sub-Agent | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
 
 **Capability descriptions:**
 
@@ -168,6 +169,7 @@ To regenerate it after adding a launcher or capability, run `scripts/update-capa
 | `agent-model` | Surfaces a configured model's connection details (base URL, model name, auth, TLS) to a launched agent. |
 | `speech-to-text` | Surfaces a transcription model's connection details to a launched agent's voice input mode. |
 | `vision-mcp` | Exposes a vision-language model as an MCP server (compare/analyze images) for a launched coding agent to call. |
+| `mcp-server` | Registers any MCP server (stdio, Streamable HTTP or SSE) with a launched coding agent. |
 | `sub-agent` | Defines a named sub-agent (prompt, tool allow-list, and model) that a launched coding agent can delegate to. |
 | `sub-agent-code` | Defines a named coding sub-agent (static prompt, fixed tools, and model) that a launched coding agent can delegate to. |
 | `sub-agent-explore` | Defines a named exploration sub-agent (static prompt, fixed tools, and model) that a launched coding agent can delegate to. |

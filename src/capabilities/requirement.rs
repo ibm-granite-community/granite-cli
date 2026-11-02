@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 /// What a capability needs from a `Model`. Every field is optional/empty by
 /// default (wildcard); non-default fields narrow the match with AND logic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ModelRequirement {
-    pub family: Option<String>,
-    pub model_type: Option<ModelType>,
-    pub min_context_length: Option<u64>,
-    pub min_size: Option<u64>,
-    pub tags: Vec<String>,
-    pub supported_functions: Vec<ModelFunction>,
+pub(crate) struct ModelRequirement {
+    pub(crate) family: Option<String>,
+    pub(crate) model_type: Option<ModelType>,
+    pub(crate) min_context_length: Option<u64>,
+    pub(crate) min_size: Option<u64>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) supported_functions: Vec<ModelFunction>,
 }
 
 impl ModelRequirement {
@@ -104,10 +104,10 @@ impl DependsOn<dyn Model> for ModelRequirement {
 /// support at least one, if non-empty); `functions`/`endpoints` are AND logic
 /// (must support/expose all listed).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProviderRequirement {
-    pub api_types: Vec<ApiType>,
-    pub functions: Vec<ModelFunction>,
-    pub endpoints: Vec<ApiEndpoint>,
+pub(crate) struct ProviderRequirement {
+    pub(crate) api_types: Vec<ApiType>,
+    pub(crate) functions: Vec<ModelFunction>,
+    pub(crate) endpoints: Vec<ApiEndpoint>,
 }
 
 impl ProviderRequirement {
@@ -170,16 +170,16 @@ impl DependsOn<dyn Provider> for ProviderRequirement {
 /// than a `Requirement<U: Catalogued>` impl -- `admits_type`/`admits_instance`
 /// would be vacuous with nothing to narrow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShellCommandRequirement {
-    pub command: String,
+pub(crate) struct ShellCommandRequirement {
+    pub(crate) command: String,
 }
 
 impl ShellCommandRequirement {
-    pub fn resolve(&self) -> anyhow::Result<std::path::PathBuf> {
+    pub(crate) fn resolve(&self) -> anyhow::Result<std::path::PathBuf> {
         crate::utils::resolve_shell_command(&None, &self.command)
     }
 
-    pub fn is_satisfied(&self) -> bool {
+    pub(crate) fn is_satisfied(&self) -> bool {
         self.resolve().is_ok()
     }
 }
@@ -329,7 +329,7 @@ mod tests {
             name: "Test Provider".to_string(),
             description: "test".to_string(),
             provider_type: crate::providers::ProviderType::Local,
-            default_endpoint: "http://localhost".to_string(),
+            default_base_urls: vec!["http://localhost".to_string()],
             supported_api_types: api_types,
             default_function_endpoints,
             supported_formats: vec![],

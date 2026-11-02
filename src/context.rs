@@ -9,9 +9,9 @@
 
 /*-- public --*/
 
-pub struct AppContext {
+pub(crate) struct AppContext {
     config: crate::config::Config,
-    pub ui: std::sync::Arc<dyn crate::utils::ui::Ui>,
+    pub(crate) ui: std::sync::Arc<dyn crate::utils::ui::Ui>,
     /// The sources built from `config`, built on the first ask and dropped
     /// whenever configuration is written. Behind a `Mutex` because commands
     /// ask for them through `&self` and hold what they get across await

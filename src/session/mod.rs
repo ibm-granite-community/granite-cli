@@ -21,23 +21,23 @@ use_channel!("SESS");
 /// Resolved from the capability's config to include explicit linkage to the
 /// model and provider it uses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionCapabilityMeta {
-    pub capability_id: String,
+pub(crate) struct SessionCapabilityMeta {
+    pub(crate) capability_id: String,
     #[serde(rename = "type")]
-    pub capability_type: String,
+    pub(crate) capability_type: String,
     /// Model slots from the capability config, keyed by their dependency
     /// `config_key`. E.g. `{ "model_id": "my-model" }`. Empty when the
     /// capability has no model dependencies (e.g. a tool-only capability).
-    pub models: HashMap<String, String>,
+    pub(crate) models: HashMap<String, String>,
     /// Resolved model type from the first (or sole) model in `models`.
     /// `None` when `models` is empty or has no matching entry.
-    pub model_type: Option<String>,
+    pub(crate) model_type: Option<String>,
     /// Resolved provider id from the first (or sole) model in `models`.
     /// `None` when `models` is empty or has no matching entry.
-    pub provider_id: Option<String>,
+    pub(crate) provider_id: Option<String>,
     /// Resolved provider type from the first (or sole) model in `models`.
     /// `None` when `models` is empty or has no matching entry.
-    pub provider_type: Option<String>,
+    pub(crate) provider_type: Option<String>,
 }
 
 /// Full metadata for one launch session, persisted as `{session_id}.yaml`
@@ -49,35 +49,35 @@ pub struct SessionCapabilityMeta {
 /// therefore reflects near-current totals throughout the session and survives
 /// even an abrupt termination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMeta {
+pub(crate) struct SessionMeta {
     /// Unique identifier for this session. Format:
     /// `{escaped_cwd}@{YYYYMMDDTHHMMSS}_{hex8}`
     /// where path separators in `cwd` are replaced with `"---"`.
-    pub session_id: String,
+    pub(crate) session_id: String,
     /// When the session was launched (`YYYYMMDDTHHMMSS` in UTC).
-    pub launched_at: String,
+    pub(crate) launched_at: String,
     /// When the session finished (`YYYYMMDDTHHMMSS` in UTC). `None` while the
     /// session is still running or if it was terminated abruptly.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<String>,
+    pub(crate) finished_at: Option<String>,
     /// When the session file was last written (`YYYYMMDDTHHMMSS` in UTC).
     /// Updated on every write (create, usage update, finish). Used to detect
     /// stale sessions that were never cleanly closed.
     #[serde(default)]
-    pub updated_at: String,
+    pub(crate) updated_at: String,
     /// The working directory at session start.
-    pub working_dir: String,
+    pub(crate) working_dir: String,
     /// The full CLI invocation that started this session.
-    pub full_command: Vec<String>,
+    pub(crate) full_command: Vec<String>,
     /// The launcher ID that was launched.
-    pub launcher_id: String,
+    pub(crate) launcher_id: String,
     /// The launcher type (e.g. `"claude"`, `"opencode"`).
-    pub launcher_type: String,
+    pub(crate) launcher_type: String,
     /// Capability metadata ordered to match the launcher's `enabled_capabilities`.
-    pub capabilities: Vec<SessionCapabilityMeta>,
+    pub(crate) capabilities: Vec<SessionCapabilityMeta>,
     /// Usage snapshot keyed by binding label (same keys as in `UsageTracker`).
     /// Populated after the first proxy response; empty until then.
-    pub usage: HashMap<String, UsageStats>,
+    pub(crate) usage: HashMap<String, UsageStats>,
 }
 
 /// Generate a unique session ID for this launch.
@@ -86,7 +86,7 @@ pub struct SessionMeta {
 /// where `escaped_cwd` has path separators and drive-letter colons replaced
 /// with `"---"`, and `hex8` is 8 hex characters derived from the current
 /// nanosecond timestamp, process ID, and a per-process monotonic counter.
-pub fn generate_session_id() -> String {
+pub(crate) fn generate_session_id() -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -115,7 +115,7 @@ pub fn generate_session_id() -> String {
 /// each resolved `ModelConfig` in `config.models` to obtain `model_type`
 /// and `provider_id`, and finally looks up the `ProviderConfig` to obtain
 /// `provider_type`. Any missing link is represented as `None`.
-pub fn build_capability_meta(
+fn build_capability_meta(
     cap_cfg: &config::CapabilityConfig,
     dependencies: &[Dependency],
     config: &Config,
@@ -151,7 +151,7 @@ pub fn build_capability_meta(
 /// `capabilities_with_deps` should be the ordered list of `(CapabilityConfig,
 /// Vec<Dependency>)` tuples corresponding to `launcher_config.enabled_capabilities`,
 /// where the dependencies come from `CAPABILITY_REGISTRY`.
-pub fn create_session_meta(
+pub(crate) fn create_session_meta(
     session_id: &str,
     config: &Config,
     launcher_config: &config::LauncherConfig,
@@ -189,7 +189,7 @@ pub fn create_session_meta(
 ///
 /// Best-effort: callers that don't want to fail the session on a write error
 /// should use `.ok()` on the return value.
-pub fn write_session_file(session_meta: &SessionMeta) -> anyhow::Result<()> {
+pub(crate) fn write_session_file(session_meta: &SessionMeta) -> anyhow::Result<()> {
     let sessions_dir = Config::sessions_dir()?;
     fs::create_dir_all(&sessions_dir)?;
     let path = sessions_dir.join(format!("{}.yaml", session_meta.session_id));
@@ -210,7 +210,7 @@ pub fn write_session_file(session_meta: &SessionMeta) -> anyhow::Result<()> {
 /// Reads the current file, replaces `usage` with the new snapshot, and
 /// writes it back. Best-effort: callers should use `.ok()` on the return
 /// value if a write failure must not interrupt the session.
-pub fn update_session_usage(
+pub(crate) fn update_session_usage(
     session_id: &str,
     usage: &HashMap<String, UsageStats>,
 ) -> anyhow::Result<()> {
@@ -221,7 +221,10 @@ pub fn update_session_usage(
 
 /// Set `finished_at` and write the final `usage` snapshot in a single file
 /// update. Called once at clean session teardown.
-pub fn finish_session(session_id: &str, usage: &HashMap<String, UsageStats>) -> anyhow::Result<()> {
+pub(crate) fn finish_session(
+    session_id: &str,
+    usage: &HashMap<String, UsageStats>,
+) -> anyhow::Result<()> {
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(format_utc_timestamp)
@@ -233,7 +236,7 @@ pub fn finish_session(session_id: &str, usage: &HashMap<String, UsageStats>) -> 
 }
 
 /// Read a session file by its ID.
-pub fn read_session_file(session_id: &str) -> anyhow::Result<SessionMeta> {
+pub(crate) fn read_session_file(session_id: &str) -> anyhow::Result<SessionMeta> {
     let sessions_dir = Config::sessions_dir()?;
     let path = sessions_dir.join(format!("{session_id}.yaml"));
     let content = fs::read_to_string(&path)

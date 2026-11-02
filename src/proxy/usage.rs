@@ -11,12 +11,12 @@ use serde::{Deserialize, Serialize};
 /// MCP server). Cache fields are populated on a best-effort basis -- not
 /// every `ApiType` exposes cache accounting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UsageStats {
-    pub requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
+pub(crate) struct UsageStats {
+    pub(crate) requests: u64,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_creation_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
 }
 
 impl UsageStats {
@@ -47,7 +47,7 @@ impl UsageStats {
 /// [`UsageTracker::set_notifier`]. When set, every call to [`record`] sends
 /// a non-blocking notification so a background writer task can react to new
 /// usage immediately
-pub struct UsageTracker {
+pub(crate) struct UsageTracker {
     stats: Mutex<HashMap<String, UsageStats>>,
     /// Fires `()` on every [`record`] call when set. The `watch` channel
     /// stores only the latest value, so rapid successive records coalesce into
@@ -67,19 +67,19 @@ impl Default for UsageTracker {
 }
 
 impl UsageTracker {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Attach a [`tokio::sync::watch::Sender`] that will be notified on
     /// every [`record`] call. Replaces any previously set notifier.
-    pub fn set_notifier(&self, sender: tokio::sync::watch::Sender<()>) {
+    pub(crate) fn set_notifier(&self, sender: tokio::sync::watch::Sender<()>) {
         *self.notifier.lock().unwrap() = Some(sender);
     }
 
     /// Fold `delta` into the running totals for `label`, plus one request.
     /// Fires the attached notifier (if any) after updating, without blocking.
-    pub fn record(&self, label: &str, delta: UsageStats) {
+    pub(crate) fn record(&self, label: &str, delta: UsageStats) {
         let mut stats = self.stats.lock().unwrap();
         let entry = stats.entry(label.to_string()).or_default();
         entry.add(&UsageStats {
@@ -99,7 +99,7 @@ impl UsageTracker {
     /// caller already has the authoritative absolute total, e.g. read from an
     /// external store like bob.db). Fires the attached notifier (if any) after
     /// updating, without blocking.
-    pub fn set(&self, label: &str, stats: UsageStats) {
+    pub(crate) fn set(&self, label: &str, stats: UsageStats) {
         self.stats.lock().unwrap().insert(label.to_string(), stats);
         if let Some(tx) = self.notifier.lock().unwrap().as_ref() {
             let _ = tx.send(());
@@ -107,7 +107,7 @@ impl UsageTracker {
     }
 
     /// A point-in-time copy of all recorded totals, keyed by label.
-    pub fn snapshot(&self) -> HashMap<String, UsageStats> {
+    pub(crate) fn snapshot(&self) -> HashMap<String, UsageStats> {
         self.stats.lock().unwrap().clone()
     }
 }
@@ -128,7 +128,7 @@ impl UsageTracker {
 ///   body.
 /// - Ollama: top-level `prompt_eval_count`/`eval_count`, present only on the
 ///   NDJSON line with `done: true`, or on a non-streaming body.
-pub fn parse_usage(value: &serde_json::Value) -> Option<UsageStats> {
+pub(crate) fn parse_usage(value: &serde_json::Value) -> Option<UsageStats> {
     let usage_obj = value
         .get("message")
         .and_then(|m| m.get("usage"))
@@ -395,5 +395,157 @@ mod tests {
         // Verify the notifier fires — changed() returns Ok(()) once a new
         // value has been sent since the receiver last consumed it.
         rx.changed().await.unwrap();
+    }
+
+    // ── parse_usage: OpenAI ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_usage_openai_without_cache_details() {
+        // OpenAI response with prompt_tokens and completion_tokens but no
+        // prompt_tokens_details field at all. The absent field must default
+        // to 0, not cause a panic or return None.
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 15
+            }
+        });
+        let usage = parse_usage(&body).unwrap();
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_openai_only_prompt_tokens() {
+        // OpenAI body that has prompt_tokens but no completion_tokens.
+        // The guard is (prompt.is_none() && completion.is_none()), so one
+        // key present is enough to proceed; the absent key defaults to 0.
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 20
+            }
+        });
+        let usage = parse_usage(&body).unwrap();
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_openai_only_completion_tokens() {
+        // Mirror of the above: completion_tokens present, prompt_tokens absent.
+        let body = json!({
+            "usage": {
+                "completion_tokens": 10
+            }
+        });
+        let usage = parse_usage(&body).unwrap();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 10);
+    }
+
+    // ── parse_usage: Anthropic ────────────────────────────────────────────
+
+    #[test]
+    fn parse_usage_anthropic_only_input_tokens() {
+        // The Anthropic guard is (input.is_none() && output.is_none()), so a
+        // body with only input_tokens must parse and default output to 0.
+        let body = json!({
+            "usage": {
+                "input_tokens": 50
+            }
+        });
+        let usage = parse_usage(&body).unwrap();
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 0);
+    }
+
+    // ── parse_usage: Ollama ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_usage_ollama_only_prompt_eval_count() {
+        // Body with prompt_eval_count but no eval_count. The guard is
+        // (prompt.is_none() && eval.is_none()), so one field is enough;
+        // the absent field defaults to 0.
+        let body = json!({
+            "prompt_eval_count": 12
+        });
+        let usage = parse_usage(&body).unwrap();
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_ollama_only_eval_count() {
+        // Mirror of the above: eval_count present, prompt_eval_count absent.
+        let body = json!({
+            "eval_count": 7
+        });
+        let usage = parse_usage(&body).unwrap();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 7);
+    }
+
+    // ── UsageTracker ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tracker_snapshot_is_empty_before_any_records() {
+        // A brand-new tracker must return an empty map — nothing recorded yet.
+        let tracker = UsageTracker::new();
+        assert!(tracker.snapshot().is_empty());
+    }
+
+    #[test]
+    fn tracker_record_fires_notifier() {
+        // record() must fire the notifier just like set() does.
+        // Attach a watch notifier, call record(), then confirm both that the
+        // stats were stored and that the notifier received a notification.
+        let tracker = UsageTracker::new();
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(());
+        tracker.set_notifier(watch_tx);
+        tracker.record(
+            "chat",
+            UsageStats {
+                input_tokens: 5,
+                ..Default::default()
+            },
+        );
+        let snapshot = tracker.snapshot();
+        let chat = snapshot.get("chat").unwrap();
+        assert_eq!(chat.requests, 1);
+        assert_eq!(chat.input_tokens, 5);
+        // has_changed() returns true when send() was called since the
+        // receiver last observed the value — i.e. the notifier fired.
+        assert!(watch_rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn merge_max_updates_cache_fields() {
+        // The existing merge_max test only exercises input_tokens and
+        // output_tokens. This test confirms cache_creation_tokens and
+        // cache_read_tokens are also updated by merge_max, and that
+        // requests is intentionally left untouched.
+        let mut running = UsageStats {
+            requests: 3,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_tokens: 2,
+            cache_read_tokens: 1,
+        };
+        running.merge_max(&UsageStats {
+            requests: 99,
+            input_tokens: 8,
+            output_tokens: 6,
+            cache_creation_tokens: 4,
+            cache_read_tokens: 0,
+        });
+        // max wins for token fields
+        assert_eq!(running.input_tokens, 10);
+        assert_eq!(running.output_tokens, 6);
+        assert_eq!(running.cache_creation_tokens, 4);
+        assert_eq!(running.cache_read_tokens, 1);
+        // requests is not touched by merge_max
+        assert_eq!(running.requests, 3);
     }
 }

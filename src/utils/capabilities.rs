@@ -9,7 +9,7 @@ use crate::config::CapabilityConfig;
 /// corresponding value in `cap_cfg.config` and returns the mapping.
 ///
 /// Returns an empty map when the capability has no model dependencies.
-pub fn capability_model_ids(
+pub(crate) fn capability_model_ids(
     cap_cfg: &CapabilityConfig,
     dependencies: &[Dependency],
 ) -> HashMap<String, String> {

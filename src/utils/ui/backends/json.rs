@@ -11,16 +11,18 @@ use crate::utils::ui::base::{self, HasUiMetadata, Ui, UiMetadata};
 /// The `buf` field is only `Some` in test builds (constructed via
 /// `Jsonbase::with_capture()`). In production the backend writes
 /// directly to stdout.
-pub struct JsonOutput {
+pub(crate) struct JsonOutput {
     writer: Mutex<Box<dyn Write + Send>>,
     /// Shared capture buffer — `Some` only when constructed via `with_capture`.
+    #[cfg_attr(not(test), allow(dead_code))]
     buf: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl JsonOutput {
     /// Construct a capturing instance whose output can be read back via
     /// `captured()`. Used in tests only.
-    pub fn with_capture() -> Self {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_capture() -> Self {
         let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let writer: Box<dyn Write + Send> = Box::new(SharedWriter(Arc::clone(&buf)));
         Self {
@@ -31,7 +33,8 @@ impl JsonOutput {
 
     /// Return all emitted JSON objects in emission order.
     /// Panics if called on a non-capturing instance.
-    pub fn captured(&self) -> Vec<serde_json::Value> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn captured(&self) -> Vec<serde_json::Value> {
         let buf = self
             .buf
             .as_ref()
@@ -53,6 +56,7 @@ impl JsonOutput {
 
 /// A `Write` impl backed by a shared `Arc<Mutex<Vec<u8>>>` so the buffer
 /// can be read back without downcasting.
+#[cfg_attr(not(test), allow(dead_code))]
 struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
 impl Write for SharedWriter {

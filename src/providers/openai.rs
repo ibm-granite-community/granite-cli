@@ -12,35 +12,39 @@ use std::time::{Duration, Instant};
 /*-- OpenAI Provider Configuration -------------------------------------------*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct OpenAIProviderConfig {
+pub(crate) struct OpenAIProviderConfig {
     /// Base URL for the OpenAI-compatible API
-    pub base_url: String,
+    pub(crate) base_url: String,
 
     /// API key for authentication (optional for local providers)
-    pub api_key: Option<Secret>,
+    pub(crate) api_key: Option<Secret>,
 
     /// Timeout for health checks in seconds
     #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
+    pub(crate) timeout_secs: u64,
 
     /// Whether to verify SSL certificates
     #[serde(default = "default_verify_ssl")]
-    pub verify_ssl: bool,
+    pub(crate) verify_ssl: bool,
 
     /// Endpoint to use for health checks
     #[serde(default = "default_health_endpoint")]
-    pub health_check_endpoint: String,
+    pub(crate) health_check_endpoint: String,
 
     /// Specific function-to-endpoint mappings this instance supports.
     /// If None, will use default OpenAI mappings.
-    pub function_endpoints: Option<HashMap<ModelFunction, Vec<ApiEndpoint>>>,
+    pub(crate) function_endpoints: Option<HashMap<ModelFunction, Vec<ApiEndpoint>>>,
 
     /// Custom HTTP headers to be sent with each API request.
     /// Keys are header names (strings) and values are secret tokens.
-    pub custom_headers: Option<HashMap<String, Secret>>,
+    pub(crate) custom_headers: Option<HashMap<String, Secret>>,
 
     /// Per-model alias mapping.
-    pub model_aliases: Option<HashMap<String, String>>,
+    model_aliases: Option<HashMap<String, String>>,
+}
+
+fn default_base_url() -> String {
+    "http://localhost:8000".to_string()
 }
 
 fn default_timeout() -> u64 {
@@ -58,11 +62,11 @@ fn default_health_endpoint() -> String {
 impl Default for OpenAIProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:8080".to_string(),
+            base_url: default_base_url(),
             api_key: None,
-            timeout_secs: 10,
-            verify_ssl: true,
-            health_check_endpoint: "/v1/models".to_string(),
+            timeout_secs: default_timeout(),
+            verify_ssl: default_verify_ssl(),
+            health_check_endpoint: default_health_endpoint(),
             function_endpoints: None,
             custom_headers: None,
             model_aliases: None,
@@ -72,7 +76,7 @@ impl Default for OpenAIProviderConfig {
 
 /*-- OpenAI Provider Implementation ------------------------------------------*/
 
-pub struct OpenAIProvider {
+pub(crate) struct OpenAIProvider {
     instance_id: String,
     config: OpenAIProviderConfig,
     client: reqwest::Client,
@@ -286,7 +290,7 @@ impl HasProviderMetadata for OpenAIProvider {
             name: "OpenAI Compatible Provider".to_string(),
             description: "Provider for OpenAI-compatible API endpoints supporting chat, embeddings, and audio transcription".to_string(),
             provider_type: ProviderType::Hosted,
-            default_endpoint: "http://localhost:8080".to_string(),
+            default_base_urls: vec![],
             supported_api_types: vec![ApiType::OpenAI],
             default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: vec![
@@ -315,7 +319,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = OpenAIProviderConfig::default();
-        assert_eq!(config.base_url, "http://localhost:8080");
+        assert_eq!(config.base_url, "http://localhost:8000");
         assert!(config.api_key.is_none());
         assert_eq!(config.timeout_secs, 10);
         assert!(config.verify_ssl);
@@ -360,6 +364,7 @@ mod tests {
     fn test_provider_metadata() {
         let meta = OpenAIProvider::metadata();
         assert_eq!(meta.name, "OpenAI Compatible Provider");
+        assert!(meta.default_base_urls.is_empty());
         assert!(meta.supported_api_types.contains(&ApiType::OpenAI));
         assert!(
             meta.default_function_endpoints
@@ -429,7 +434,7 @@ mod tests {
     fn test_provider_function_endpoints() {
         // base_url has no default: an openai-compatible provider is defined
         // by the endpoint it talks to, so the settings have to state one.
-        let cfg = serde_json::json!({ "base_url": "http://localhost:8080" });
+        let cfg = serde_json::json!({ "base_url": "http://localhost:8000" });
         let provider = OpenAIProvider::new("my-openai", &cfg).unwrap();
         let endpoints = provider.function_endpoints();
         assert!(endpoints.contains_key(&ModelFunction::Chat));

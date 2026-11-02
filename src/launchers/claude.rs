@@ -14,7 +14,7 @@ use crate::capabilities::{
 use crate::launchers::base::HasLauncherMetadata as HasClaudeLauncherMetadata;
 use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
 use crate::launchers::shared::mcp_cli::{
-    mcp_binding_request, register_mcp_server, remove_mcp_server,
+    STDIO_HTTP_AND_SSE, mcp_binding_request, register_mcp_server, remove_mcp_server, transport_set,
 };
 use crate::registry::{ConfigConstructable, ConstructError};
 use crate::utils::resolve_shell_command;
@@ -25,14 +25,14 @@ use_channel!("CLAUD");
 /*-- public --*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
-pub struct ClaudeLauncherConfig {
+pub(crate) struct ClaudeLauncherConfig {
     /// Override path to the `claude` binary for non-PATH installs.
     /// Leave unset to use PATH lookup.
     #[serde(default)]
-    pub command_path: Option<String>,
+    pub(crate) command_path: Option<String>,
 }
 
-pub struct ClaudeLauncher {
+pub(crate) struct ClaudeLauncher {
     instance_id: String,
     config: ClaudeLauncherConfig,
     bound_agent_model: Option<crate::capabilities::AgentModelBinding>,
@@ -74,10 +74,6 @@ impl crate::registry::Named for ClaudeLauncher {
 
 #[async_trait]
 impl Launcher for ClaudeLauncher {
-    fn name(&self) -> &str {
-        "Claude CLI"
-    }
-
     fn command(&self) -> &str {
         self.config.command_path.as_deref().unwrap_or("claude")
     }
@@ -93,7 +89,9 @@ impl Launcher for ClaudeLauncher {
         }
 
         if capability_types.contains(&BindingType::Mcp) {
-            let binding = capability.bind(mcp_binding_request()).await?;
+            let binding = capability
+                .bind(mcp_binding_request(&Self::metadata().mcp_transports))
+                .await?;
             match binding {
                 Binding::Mcp(binding) => {
                     self.bound_mcp_bindings
@@ -428,6 +426,7 @@ impl HasClaudeLauncherMetadata for ClaudeLauncher {
                 BindingType::Mcp,
                 BindingType::SubAgent,
             ]),
+            mcp_transports: transport_set(STDIO_HTTP_AND_SSE),
             tags: vec!["claude".to_string(), "anthropic".to_string()],
         }
     }
@@ -984,12 +983,6 @@ mod tests {
     }
 
     impl crate::capabilities::CapabilityInfo for FakeSubAgentCapability {
-        fn name(&self) -> &str {
-            "Fake Sub-Agent"
-        }
-        fn description(&self) -> &str {
-            "test double"
-        }
         fn binding_types(&self) -> HashSet<BindingType> {
             HashSet::from([BindingType::SubAgent])
         }

@@ -21,13 +21,13 @@ use crate::utils::ui::base::{PullHandle, Ui};
 
 /// A single line of non-interactive output emitted during setup.
 #[derive(Debug, Clone)]
-pub struct OutputLine {
-    pub level: OutputLevel,
-    pub text: String,
+pub(crate) struct OutputLine {
+    pub(crate) level: OutputLevel,
+    pub(crate) text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum OutputLevel {
+pub(crate) enum OutputLevel {
     Info,
     Warn,
     Error,
@@ -35,18 +35,18 @@ pub enum OutputLevel {
 
 /// Live state for one active or completed pull/download.
 #[derive(Debug, Clone)]
-pub struct PullState {
-    pub label: String,
+pub(crate) struct PullState {
+    pub(crate) label: String,
     /// `None` means total is not yet known (spinner mode).
-    pub total: Option<u64>,
-    pub downloaded: u64,
-    pub done: bool,
-    pub error: Option<String>,
+    pub(crate) total: Option<u64>,
+    pub(crate) downloaded: u64,
+    pub(crate) done: bool,
+    pub(crate) error: Option<String>,
 }
 
 /// A prompt the setup wizard needs answered.
 #[derive(Debug, Clone)]
-pub enum Prompt {
+pub(crate) enum Prompt {
     /// Pick one item from a list.  Returns the chosen index.
     Select {
         message: String,
@@ -73,28 +73,28 @@ pub enum Prompt {
 
 /// The answer the TUI sends back for one [`Prompt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Answer {
+pub(crate) enum Answer {
     Index(usize),
     Indices(Vec<usize>),
     Bool(bool),
     Text(String),
 }
 
-pub struct TuiUi {
+pub(crate) struct TuiUi {
     /// Prompts sent to the TUI render loop.
-    pub prompt_tx: std::sync::mpsc::SyncSender<Prompt>,
+    prompt_tx: std::sync::mpsc::SyncSender<Prompt>,
     /// Answers received from the TUI render loop.
     answer_rx: Mutex<std::sync::mpsc::Receiver<Answer>>,
     /// Lines of non-interactive output accumulated so far.
-    pub output: Arc<Mutex<Vec<OutputLine>>>,
+    pub(crate) output: Arc<Mutex<Vec<OutputLine>>>,
     /// Live pull/download states, keyed by handle id.
-    pub pulls: Arc<Mutex<HashMap<u64, PullState>>>,
+    pulls: Arc<Mutex<HashMap<u64, PullState>>>,
     /// Counter for allocating pull handles.
     next_handle: Mutex<u64>,
 }
 
 impl TuiUi {
-    pub fn new(
+    pub(crate) fn new(
         prompt_tx: std::sync::mpsc::SyncSender<Prompt>,
         answer_rx: std::sync::mpsc::Receiver<Answer>,
         output: Arc<Mutex<Vec<OutputLine>>>,

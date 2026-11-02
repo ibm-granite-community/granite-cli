@@ -2,7 +2,7 @@
 use crate::utils::hardware::detect_hardware;
 use anyhow::Result;
 
-pub struct HardwareCommands;
+pub(crate) struct HardwareCommands;
 
 /*-- public --*/
 
@@ -32,7 +32,7 @@ impl HardwareCommands {
         ]
     }
 
-    pub fn show(ctx: &crate::AppContext) -> Result<()> {
+    pub(crate) fn show(ctx: &crate::AppContext) -> Result<()> {
         ctx.ui.detail("Hardware Profile", &Self::hardware_fields());
         Ok(())
     }

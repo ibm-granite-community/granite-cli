@@ -12,7 +12,7 @@ use url::Url;
 /*-- Errors --------------------------------------------------------------------*/
 
 #[derive(Debug, thiserror::Error)]
-pub enum VlmError {
+pub(crate) enum VlmError {
     #[error("API error: {0}")]
     ApiError(String),
     #[error("Invalid image data: {0}")]
@@ -28,7 +28,7 @@ pub enum VlmError {
 /*-- Analysis Types --------------------------------------------------------------*/
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AnalysisType {
+pub(crate) enum AnalysisType {
     ObjectDetection,
     TextExtraction,
     SceneDescription,
@@ -51,14 +51,14 @@ impl fmt::Display for AnalysisType {
 /*-- Image Source ----------------------------------------------------------------*/
 
 #[derive(Debug, Clone)]
-pub enum ImageSource {
+pub(crate) enum ImageSource {
     Bytes { data: Vec<u8>, mime: String },
     File(PathBuf),
     Url(Url),
 }
 
 impl ImageSource {
-    pub fn mime(&self) -> &str {
+    fn mime(&self) -> &str {
         match self {
             ImageSource::Bytes { mime, .. } => mime.as_str(),
             ImageSource::File(path) => match path.extension().and_then(|e| e.to_str()) {
@@ -82,7 +82,7 @@ impl ImageSource {
     }
 
     /// Reads the image into memory, enforcing `limit` for every source kind
-    pub async fn to_bytes(&self, limit: u64) -> Result<(Vec<u8>, String), VlmError> {
+    async fn to_bytes(&self, limit: u64) -> Result<(Vec<u8>, String), VlmError> {
         match self {
             ImageSource::Bytes { data, mime } => {
                 if data.len() as u64 > limit {
@@ -123,7 +123,7 @@ impl ImageSource {
         }
     }
 
-    pub async fn to_data_uri(&self, limit: u64) -> Result<String, VlmError> {
+    async fn to_data_uri(&self, limit: u64) -> Result<String, VlmError> {
         let (data, mime) = self.to_bytes(limit).await?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
         Ok(format!("data:{mime};base64,{encoded}"))
@@ -133,7 +133,7 @@ impl ImageSource {
 /*-- VLM Backend Trait -------------------------------------------------------------*/
 
 #[async_trait]
-pub trait VlmBackend: Send + Sync + fmt::Debug {
+pub(crate) trait VlmBackend: Send + Sync + fmt::Debug {
     async fn compare_images(
         &self,
         images: Vec<ImageSource>,
@@ -204,7 +204,7 @@ struct ChatMessageResponse {
 /*-- OpenAiCompatibleVlm -----------------------------------------------------------*/
 
 #[derive(Debug)]
-pub struct OpenAiCompatibleVlm {
+pub(crate) struct OpenAiCompatibleVlm {
     client: reqwest::Client,
     endpoint: String,
     model: String,
@@ -214,7 +214,7 @@ pub struct OpenAiCompatibleVlm {
 }
 
 impl OpenAiCompatibleVlm {
-    pub fn new(
+    pub(crate) fn new(
         endpoint: String,
         model: String,
         api_key: String,

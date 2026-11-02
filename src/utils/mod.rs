@@ -1,15 +1,14 @@
-pub mod capabilities;
-pub mod hardware;
-pub mod shell;
-pub mod subserver;
-pub mod traits;
-pub mod ui;
+pub(crate) mod capabilities;
+pub(crate) mod hardware;
+pub(crate) mod shell;
+pub(crate) mod subserver;
+mod traits;
+pub(crate) mod ui;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use capabilities::capability_model_ids;
-pub use hardware::{HardwareProfile, detect_hardware};
-pub use shell::resolve_shell_command;
-pub use traits::Searchable;
-pub use ui::prompt_from_schema;
+pub(crate) use capabilities::capability_model_ids;
+pub(crate) use shell::resolve_shell_command;
+pub(crate) use traits::Searchable;
+pub(crate) use ui::prompt_from_schema;

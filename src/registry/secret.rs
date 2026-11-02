@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// matching involved.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Secret(pub String);
+pub(crate) struct Secret(pub(crate) String);
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

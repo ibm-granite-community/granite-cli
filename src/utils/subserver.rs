@@ -16,8 +16,8 @@ use tokio::sync::oneshot;
 use_channel!("SBSRV");
 
 /// A running background HTTP server bound to an ephemeral localhost port.
-pub struct SubServer {
-    pub local_addr: SocketAddr,
+pub(crate) struct SubServer {
+    pub(crate) local_addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: tokio::task::JoinHandle<()>,
 }
@@ -32,7 +32,7 @@ impl SubServer {
     /// as long as a runtime is already running somewhere up the call stack.
     ///
     /// `label` is used only for log messages if the server errors.
-    pub fn spawn(router: Router, label: &str) -> anyhow::Result<Self> {
+    pub(crate) fn spawn(router: Router, label: &str) -> anyhow::Result<Self> {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         std_listener.set_nonblocking(true)?;
         let local_addr = std_listener.local_addr()?;
@@ -59,7 +59,7 @@ impl SubServer {
 
     /// Signal the server to stop accepting new connections and wait for it
     /// to finish draining in-flight ones.
-    pub async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }

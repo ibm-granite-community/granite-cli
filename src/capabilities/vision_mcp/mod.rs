@@ -14,8 +14,8 @@
 mod backend;
 mod tools;
 
-pub use backend::OpenAiCompatibleVlm;
-pub use tools::VlmToolRegistry;
+pub(crate) use backend::OpenAiCompatibleVlm;
+pub(crate) use tools::VlmToolRegistry;
 
 use crate::capabilities::base::{
     Binding, BindingRequest, BindingType, Capability, CapabilityMetadata, Dependency,
@@ -38,22 +38,22 @@ use tokio::sync::Mutex;
 /*-- VisionMCPCapabilityConfig ----------------------------------------------------*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Validate)]
-pub struct VisionMCPCapabilityConfig {
+pub(crate) struct VisionMCPCapabilityConfig {
     /// Key into the configured models map (the user-chosen instance ID) for
     /// the vision-language model this capability serves.
     #[validate(min_length = 1, message = "no model is selected")]
-    pub model_id: String,
+    pub(crate) model_id: String,
     /// Request timeout in seconds for calls to the model's provider.
     #[serde(default = "default_timeout_seconds")]
-    pub timeout_seconds: u64,
+    timeout_seconds: u64,
     /// Maximum image size (bytes) accepted from any image source (file,
     /// inline base64, or fetched URL).
     #[serde(default = "default_max_image_bytes")]
-    pub max_image_bytes: u64,
+    max_image_bytes: u64,
     /// Extra headers sent with every request to the model's provider, on
     /// top of whatever auth the provider itself supplies.
     #[serde(default)]
-    pub extra_headers: HashMap<String, String>,
+    pub(crate) extra_headers: HashMap<String, String>,
 }
 
 fn default_timeout_seconds() -> u64 {
@@ -77,7 +77,7 @@ impl Default for VisionMCPCapabilityConfig {
 
 /*-- VisionMCPCapability -----------------------------------------------------------*/
 
-pub struct VisionMCPCapability {
+pub(crate) struct VisionMCPCapability {
     instance_id: String,
     config: VisionMCPCapabilityConfig,
 }
@@ -85,7 +85,7 @@ pub struct VisionMCPCapability {
 /// [`VisionMCPCapability`] with the model its `model_id` names. Built only by
 /// `resolve_refs`, so holding one is what says the name resolved and the
 /// model meets what this capability's metadata requires of it.
-pub struct ResolvedVisionMCPCapability {
+struct ResolvedVisionMCPCapability {
     inner: VisionMCPCapability,
     configured_model: ConfiguredModel,
     /// The in-process Streamable HTTP server started by `bind()`. `None`
@@ -127,30 +127,18 @@ impl crate::registry::Named for VisionMCPCapability {
 
 #[async_trait]
 impl crate::capabilities::CapabilityInfo for VisionMCPCapability {
-    fn name(&self) -> &str {
-        "Vision MCP Server"
-    }
-
-    fn description(&self) -> &str {
-        "Exposes a vision-language model as an MCP server (compare/analyze images) for a launched coding agent to call."
-    }
-
     fn binding_types(&self) -> HashSet<BindingType> {
         HashSet::from([BindingType::Mcp])
     }
 }
 
 impl crate::capabilities::CapabilityInfo for ResolvedVisionMCPCapability {
-    fn name(&self) -> &str {
-        crate::capabilities::CapabilityInfo::name(&self.inner)
-    }
-
-    fn description(&self) -> &str {
-        crate::capabilities::CapabilityInfo::description(&self.inner)
-    }
-
     fn binding_types(&self) -> HashSet<BindingType> {
         crate::capabilities::CapabilityInfo::binding_types(&self.inner)
+    }
+
+    fn mcp_transport(&self) -> Option<McpTransportKind> {
+        Some(McpTransportKind::Http)
     }
 }
 
@@ -256,6 +244,7 @@ impl HasCapabilityMetadata for VisionMCPCapability {
             }],
             tags: vec!["vision".to_string(), "mcp".to_string()],
             supported_binding_types: HashSet::from([BindingType::Mcp]),
+            auto_configurable: true,
         }
     }
 }
