@@ -106,13 +106,31 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PAT
     || warn "openssl headers missing at $OPENSSL_INCLUDE_DIR — build may fail."
 
 # --- C toolchain ------------------------------------------------------------
-# Point cc-rs at Termux's clang, and relax the C standard for crates whose
-# bundled C predates C23 and assumes glibc (sys-info being the usual culprit).
+CLANG_TARGET="$(clang -dumpmachine 2>/dev/null || true)"
+case "$CLANG_TARGET" in
+    *android[0-9]*) ;;
+    *) CLANG_TARGET="aarch64-linux-android24" ;;
+esac
 
-export CC=clang
+# Wrapper: force-include glibc-isms only for .c sources, never for .S/.s files.
+WRAPPER_DIR="${TMPDIR:-$PREFIX/tmp}/termux-cc"
+mkdir -p "$WRAPPER_DIR"
+cat > "$WRAPPER_DIR/clang-c" <<'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+extra=()
+for a in "$@"; do
+    case "$a" in
+        *.c) extra=(-include sys/sysinfo.h -include strings.h); break ;;
+    esac
+done
+exec clang "${extra[@]}" "$@"
+EOF
+chmod +x "$WRAPPER_DIR/clang-c"
+
+export CC="$WRAPPER_DIR/clang-c"
 export AR=llvm-ar
 export RANLIB=llvm-ranlib
-export CFLAGS="${CFLAGS:-} -std=gnu17 -Wno-implicit-function-declaration -include sys/sysinfo.h -include strings.h"
+export CFLAGS="${CFLAGS:-} --target=$CLANG_TARGET -std=gnu17 -Wno-implicit-function-declaration"
 
 if [ "$ENV_ONLY" -eq 1 ]; then
     log "Environment exported. (Only persists if you sourced this script.)"

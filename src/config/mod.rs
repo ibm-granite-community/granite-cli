@@ -64,7 +64,7 @@ pub(crate) struct Config {
     pub(crate) recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ModelConfig {
     /// Instance id -- the config/file key this model is stored under.
     /// Defaults to `model_type` (see `commands::ModelCommands::setup`), but

@@ -168,8 +168,8 @@ jobs:
       # Minimum line coverage, in percent, of the unit and end-to-end tests
       # combined: for the whole crate, and for the lines a pull request adds
       # or changes.
-      COVERAGE_MIN_TOTAL: "80"
-      COVERAGE_MIN_DIFF: "80"
+      COVERAGE_MIN_TOTAL: "81"
+      COVERAGE_MIN_DIFF: "81"
       DIFF_COVER_VERSION: "10.6.0"
 
     steps:

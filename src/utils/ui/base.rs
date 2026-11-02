@@ -324,9 +324,9 @@ pub(crate) mod tests {
         /// (prompt, default) for each confirm() call
         pub(crate) confirm_prompts: RefCell<Vec<(String, bool)>>,
         /// (prompt, default) for each text() call
-        text_prompts: RefCell<Vec<(String, String)>>,
+        pub(crate) text_prompts: RefCell<Vec<(String, String)>>,
         /// prompt for each password() call
-        password_prompts: RefCell<Vec<String>>,
+        pub(crate) password_prompts: RefCell<Vec<String>>,
 
         /// Canned answers consumed in order by select(); falls back to `default` when empty.
         pub(crate) select_answers: RefCell<VecDeque<usize>>,

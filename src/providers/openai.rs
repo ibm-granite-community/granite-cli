@@ -43,6 +43,10 @@ pub(crate) struct OpenAIProviderConfig {
     model_aliases: Option<HashMap<String, String>>,
 }
 
+fn default_base_url() -> String {
+    "http://localhost:8000".to_string()
+}
+
 fn default_timeout() -> u64 {
     10
 }
@@ -58,11 +62,11 @@ fn default_health_endpoint() -> String {
 impl Default for OpenAIProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:8080".to_string(),
+            base_url: default_base_url(),
             api_key: None,
-            timeout_secs: 10,
-            verify_ssl: true,
-            health_check_endpoint: "/v1/models".to_string(),
+            timeout_secs: default_timeout(),
+            verify_ssl: default_verify_ssl(),
+            health_check_endpoint: default_health_endpoint(),
             function_endpoints: None,
             custom_headers: None,
             model_aliases: None,
@@ -303,7 +307,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = OpenAIProviderConfig::default();
-        assert_eq!(config.base_url, "http://localhost:8080");
+        assert_eq!(config.base_url, "http://localhost:8000");
         assert!(config.api_key.is_none());
         assert_eq!(config.timeout_secs, 10);
         assert!(config.verify_ssl);
@@ -418,7 +422,7 @@ mod tests {
     fn test_provider_function_endpoints() {
         // base_url has no default: an openai-compatible provider is defined
         // by the endpoint it talks to, so the settings have to state one.
-        let cfg = serde_json::json!({ "base_url": "http://localhost:8080" });
+        let cfg = serde_json::json!({ "base_url": "http://localhost:8000" });
         let provider = OpenAIProvider::new("my-openai", &cfg).unwrap();
         let endpoints = provider.function_endpoints();
         assert!(endpoints.contains_key(&ModelFunction::Chat));
