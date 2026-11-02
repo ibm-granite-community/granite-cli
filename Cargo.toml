@@ -28,7 +28,7 @@ which = "8"
 schemars = "1.2.1"
 ratatui = "0.30.2"
 regex = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 crossterm = "0.29"
 openssl = { version = "0.10", features = ["vendored"] }
 nvml-wrapper = "0.13.0"
