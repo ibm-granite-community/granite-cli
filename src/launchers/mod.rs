@@ -19,6 +19,7 @@ pub(crate) static LAUNCHER_REGISTRY: LazyLock<base::LauncherFactory> = LazyLock:
     factory.register::<hermes::HermesLauncher>("hermes");
     factory.register::<goose::GooseLauncher>("goose");
     factory.register::<openclaw::OpenClawLauncher>("openclaw");
+    factory.register::<codex::CodexLauncher>("codex");
     factory
 });
 
@@ -112,6 +113,7 @@ mod base;
 pub(crate) mod bob;
 mod bobide;
 pub(crate) mod claude;
+pub(crate) mod codex;
 mod goose;
 pub(crate) mod hermes;
 mod openclaw;
@@ -156,6 +158,7 @@ mod tests {
         assert!(LAUNCHER_REGISTRY.get("hermes").is_some());
         assert!(LAUNCHER_REGISTRY.get("goose").is_some());
         assert!(LAUNCHER_REGISTRY.get("openclaw").is_some());
+        assert!(LAUNCHER_REGISTRY.get("codex").is_some());
         assert!(LAUNCHER_REGISTRY.get("nonexistent").is_none());
     }
 
@@ -204,6 +207,7 @@ mod tests {
         assert!(catalog.contains_key("hermes"));
         assert!(catalog.contains_key("goose"));
         assert!(catalog.contains_key("openclaw"));
+        assert!(catalog.contains_key("codex"));
     }
 
     #[test]
@@ -218,6 +222,7 @@ mod tests {
         assert!(source.config_schema("hermes").is_some());
         assert!(source.config_schema("goose").is_some());
         assert!(source.config_schema("openclaw").is_some());
+        assert!(source.config_schema("codex").is_some());
         assert!(source.config_schema("nonexistent").is_none());
     }
 }
