@@ -17,35 +17,35 @@ use crate::registry::{ConfigConstructable, ConstructError, Named};
 /// one, so `context_fit` degrades to `ContextFit::None` for custom models
 /// rather than prompting for a full per-layer memory shape.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
-pub struct CustomModelConfig {
-    pub family: String,
+pub(crate) struct CustomModelConfig {
+    pub(crate) family: String,
     #[serde(default)]
-    pub version: String,
+    pub(crate) version: String,
     #[serde(default)]
-    pub size: u64,
+    pub(crate) size: u64,
     #[serde(default)]
-    pub context_length: u64,
+    pub(crate) context_length: u64,
     #[serde(default)]
-    pub model_type: ModelType,
+    pub(crate) model_type: ModelType,
     #[serde(default)]
-    pub huggingface_repo: String,
+    pub(crate) huggingface_repo: String,
     #[serde(default)]
-    pub native_dtype: String,
+    pub(crate) native_dtype: String,
     /// Pullable artifact variants, if any. Most custom models describe an
     /// endpoint that's already running somewhere rather than something
     /// `granite-cli` would download -- leave this empty and `model setup`
     /// skips variant selection, letting any configured provider serve it.
     #[serde(default)]
-    pub variants: Vec<ModelVariant>,
+    pub(crate) variants: Vec<ModelVariant>,
     #[serde(default)]
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     #[serde(default)]
-    pub tags: Vec<String>,
+    pub(crate) tags: Vec<String>,
     #[serde(default)]
-    pub supported_functions: Vec<ModelFunction>,
+    pub(crate) supported_functions: Vec<ModelFunction>,
     /// `reasoning_effort` values the model's chat template understands.
     #[serde(default)]
-    pub supported_reasoning_efforts: Vec<ReasoningEffort>,
+    pub(crate) supported_reasoning_efforts: Vec<ReasoningEffort>,
 }
 
 fn empty_architecture() -> ModelArchitecture {
@@ -68,7 +68,7 @@ fn empty_architecture() -> ModelArchitecture {
 /// exist once it's been constructed from a user's `CustomModelConfig` --
 /// `HasModelMetadata::metadata()` below returns a placeholder used only for
 /// catalog browsing before that.
-pub struct CustomModel {
+pub(crate) struct CustomModel {
     instance_id: String,
     config: CustomModelConfig,
 }
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn new_populates_fields_from_config() {
+    fn new_populates_all_fields() {
         let cfg = serde_json::json!({
             "family": "My Local Model",
             "version": "1.0",

@@ -17,15 +17,15 @@ use std::collections::HashSet;
 /*-- AgentModelCapabilityConfig ---------------------------------------------------*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
-pub struct AgentModelCapabilityConfig {
+pub(crate) struct AgentModelCapabilityConfig {
     /// Key into the configured models map (the user-chosen instance ID).
     #[validate(min_length = 1, message = "no model is selected")]
-    pub model_id: String,
+    pub(crate) model_id: String,
 }
 
 /*-- AgentModelCapability ---------------------------------------------------------*/
 
-pub struct AgentModelCapability {
+pub(crate) struct AgentModelCapability {
     instance_id: String,
     config: AgentModelCapabilityConfig,
 }
@@ -33,7 +33,7 @@ pub struct AgentModelCapability {
 /// [`AgentModelCapability`] with the model its `model_id` names. Built only
 /// by `resolve_refs`, so holding one is what says the name resolved and the
 /// model meets what this capability's metadata requires of it.
-pub struct ResolvedAgentModelCapability {
+struct ResolvedAgentModelCapability {
     inner: AgentModelCapability,
     configured_model: ConfiguredModel,
 }
@@ -69,35 +69,13 @@ impl crate::registry::Named for ResolvedAgentModelCapability {
     }
 }
 
-impl AgentModelCapability {
-    pub fn configured_model_id(&self) -> &str {
-        &self.config.model_id
-    }
-}
-
 impl crate::capabilities::CapabilityInfo for AgentModelCapability {
-    fn name(&self) -> &str {
-        "Agent Model Binding"
-    }
-
-    fn description(&self) -> &str {
-        "Surfaces a configured model's connection details (base URL, model name, auth, TLS) to a launched agent."
-    }
-
     fn binding_types(&self) -> HashSet<BindingType> {
         HashSet::from([BindingType::AgentModel])
     }
 }
 
 impl crate::capabilities::CapabilityInfo for ResolvedAgentModelCapability {
-    fn name(&self) -> &str {
-        crate::capabilities::CapabilityInfo::name(&self.inner)
-    }
-
-    fn description(&self) -> &str {
-        crate::capabilities::CapabilityInfo::description(&self.inner)
-    }
-
     fn binding_types(&self) -> HashSet<BindingType> {
         crate::capabilities::CapabilityInfo::binding_types(&self.inner)
     }
@@ -174,6 +152,7 @@ impl HasCapabilityMetadata for AgentModelCapability {
             }],
             tags: vec!["agent".to_string(), "model".to_string()],
             supported_binding_types: HashSet::from([BindingType::AgentModel]),
+            auto_configurable: true,
         }
     }
 }

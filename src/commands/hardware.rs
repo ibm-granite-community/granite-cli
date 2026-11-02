@@ -8,7 +8,7 @@ use crate::utils::hardware::{HardwareProfile, MachineInfo, Memory, MemoryKind, d
 use crate::utils::hardware_catalog::{self, CatalogEntry, HARDWARE_CATALOG};
 use anyhow::{Result, anyhow, bail};
 
-pub struct HardwareCommands;
+pub(crate) struct HardwareCommands;
 
 /*-- public --*/
 
@@ -70,14 +70,14 @@ impl HardwareCommands {
 
     /// `granite-cli hardware` with no subcommand: the local hardware profile
     /// and its mode.
-    pub fn show(ctx: &mut AppContext) -> Result<()> {
+    pub(crate) fn show(ctx: &mut AppContext) -> Result<()> {
         let can_prompt = can_prompt(ctx);
         Self::show_with(ctx, detect_hardware, can_prompt)
     }
 
     /// `hardware catalog`: the built-in devices and their sizes, grouped by
     /// family in catalog order, or one family with `--family`.
-    pub fn catalog(ctx: &AppContext, family: Option<&str>) -> Result<()> {
+    pub(crate) fn catalog(ctx: &AppContext, family: Option<&str>) -> Result<()> {
         let family = family.map(find_family).transpose()?;
         let rows: Vec<Vec<String>> = HARDWARE_CATALOG
             .iter()
@@ -103,14 +103,14 @@ impl HardwareCommands {
     }
 
     /// `hardware list`: the configured hardware profiles, `local` first.
-    pub fn list(ctx: &mut AppContext) -> Result<()> {
+    pub(crate) fn list(ctx: &mut AppContext) -> Result<()> {
         let unused = Self::compare_local(ctx, detect_hardware, can_prompt(ctx))?;
         Self::list_table(ctx, unused.as_ref());
         Ok(())
     }
 
     /// `hardware info <id>`: one configured hardware profile.
-    pub fn info(ctx: &mut AppContext, id: &str) -> Result<()> {
+    pub(crate) fn info(ctx: &mut AppContext, id: &str) -> Result<()> {
         let unused = Self::compare_local(ctx, detect_hardware, can_prompt(ctx))?;
         Self::info_detail(ctx, id, unused.as_ref())
     }
@@ -125,7 +125,7 @@ impl HardwareCommands {
     }
 
     /// `hardware remove <id>`. `local` cannot be removed.
-    pub fn remove(ctx: &mut AppContext, id: &str) -> Result<()> {
+    pub(crate) fn remove(ctx: &mut AppContext, id: &str) -> Result<()> {
         Self::check_local(ctx, detect_hardware, can_prompt(ctx))?;
         if ctx.config().get_hardware(id).is_none() {
             return Err(not_configured(ctx, id));

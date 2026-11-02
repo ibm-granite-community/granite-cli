@@ -5,13 +5,13 @@
 //! `docs/specs/0021-sub-agent-capability.md`.
 
 mod model_wrapper;
-pub use model_wrapper::ProxiedProvider;
+pub(crate) use model_wrapper::ProxiedProvider;
 
 mod server;
-pub use server::{ProxyHandle, ProxyServer, UpstreamAuth, UpstreamTarget};
+pub(crate) use server::{ProxyHandle, ProxyServer, UpstreamAuth, UpstreamTarget};
 
 mod routes;
 pub(crate) use routes::register_proxy_routes;
 
 mod usage;
-pub use usage::{UsageStats, UsageTracker};
+pub(crate) use usage::{UsageStats, UsageTracker};

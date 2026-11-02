@@ -2,16 +2,14 @@
 use serde::{Deserialize, Serialize};
 
 // Local
-use crate::models::context_fit::{self, ContextFit};
 use crate::registry::ConfigConstructable;
 use crate::utils::Searchable;
-use crate::utils::hardware::HardwareProfile;
 
 /*-- ModelFunction Enum ------------------------------------------------------*/
 
 /// Functional capabilities that models can provide
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-pub enum ModelFunction {
+pub(crate) enum ModelFunction {
     /*-- Chat Functions --*/
     /// Text-based conversational interaction
     Chat,
@@ -67,7 +65,7 @@ impl std::fmt::Display for ModelFunction {
 /// model's chat template may understand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
+pub(crate) enum ReasoningEffort {
     None,
     Minimal,
     Low,
@@ -79,7 +77,7 @@ pub enum ReasoningEffort {
 
 impl ReasoningEffort {
     /// The wire value sent as `reasoning_effort`.
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             ReasoningEffort::None => "none",
             ReasoningEffort::Minimal => "minimal",
@@ -98,7 +96,7 @@ impl ReasoningEffort {
 /// counts per kind rather than one entry per layer, since no known
 /// architecture mixes different shapes within the same kind.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LayerKind {
+pub(crate) enum LayerKind {
     FullAttention,
     SlidingAttention { window: u64 },
     Recurrent(MambaShape),
@@ -106,18 +104,18 @@ pub enum LayerKind {
 
 /// Shape parameters for a Mamba/SSM recurrent layer's fixed-size state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MambaShape {
-    pub d_conv: u64,
-    pub d_state: u64,
-    pub d_inner: u64,
-    pub n_groups: u64,
+pub(crate) struct MambaShape {
+    pub(crate) d_conv: u64,
+    pub(crate) d_state: u64,
+    pub(crate) d_inner: u64,
+    pub(crate) n_groups: u64,
 }
 
 /// A count of layers sharing one `LayerKind`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LayerTypeCount {
-    pub kind: LayerKind,
-    pub count: u64,
+pub(crate) struct LayerTypeCount {
+    pub(crate) kind: LayerKind,
+    pub(crate) count: u64,
 }
 
 /// The architectural shape of a model, as derived from its config.json.
@@ -125,20 +123,20 @@ pub struct LayerTypeCount {
 /// routing fields are intentionally not represented here, since they affect
 /// compute, not memory footprint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelArchitecture {
-    pub num_hidden_layers: u64,
-    pub hidden_size: u64,
-    pub num_attention_heads: u64,
-    pub num_key_value_heads: u64,
-    pub head_dim: u64,
-    pub layer_types: Vec<LayerTypeCount>,
+pub(crate) struct ModelArchitecture {
+    pub(crate) num_hidden_layers: u64,
+    pub(crate) hidden_size: u64,
+    pub(crate) num_attention_heads: u64,
+    pub(crate) num_key_value_heads: u64,
+    pub(crate) head_dim: u64,
+    pub(crate) layer_types: Vec<LayerTypeCount>,
 }
 
 /*-- Model Trait -------------------------------------------------------------*/
 
 /// Core trait for model implementations.
 /// All models must implement this trait along with ConfigConstructable.
-pub trait Model: crate::registry::Named + Send + Sync {
+pub(crate) trait Model: crate::registry::Named + Send + Sync {
     /// Get the model family name
     fn family(&self) -> &str;
 
@@ -184,21 +182,6 @@ pub trait Model: crate::registry::Named + Send + Sync {
         &[]
     }
 
-    /// Estimate whether `variant` will run on `hardware` at its full
-    /// configured context length, at a reduced context length, or not at
-    /// all. Derives KV-cache/recurrent-state memory from the model's actual
-    /// per-layer-kind architecture rather than a flat per-parameter
-    /// heuristic.
-    fn context_fit(&self, variant: &ModelVariant, hardware: &HardwareProfile) -> ContextFit {
-        context_fit::estimate(
-            self.context_length(),
-            self.architecture(),
-            self.native_dtype(),
-            variant,
-            hardware,
-        )
-    }
-
     /// Snapshot this instance's data into a `ModelMetadata` value, using the
     /// same accessors the registry uses to describe a catalog entry. Lets
     /// command code display a model uniformly whether it came from a static
@@ -229,7 +212,7 @@ pub trait Model: crate::registry::Named + Send + Sync {
 /// it. `ModelSource` is the production implementation; a capability sees only
 /// this, so it can be resolved against a collection built for one launch
 /// without knowing how that collection was built.
-pub trait ModelLookup: Sync {
+pub(crate) trait ModelLookup: Sync {
     /// The model configured under `model_id`, or an error naming what did not
     /// resolve. `requirement`, when given, is what the caller declared it
     /// needs of the model, and a model that does not satisfy it is an error
@@ -248,11 +231,11 @@ pub trait ModelLookup: Sync {
 /// model-backed `Capability::bind()` needs -- shared by `AgentModelCapability`,
 /// `VisionMCPCapability`, and `SubAgentCapability` so each doesn't
 /// reimplement the same `ModelSource`/variant-resolution logic.
-pub struct ConfiguredModel {
-    pub model: std::sync::Arc<dyn Model>,
+pub(crate) struct ConfiguredModel {
+    pub(crate) model: std::sync::Arc<dyn Model>,
     /// The provider `ModelConfig.provider_id` names, resolved alongside the
     /// model rather than rebuilt on each call.
-    pub provider: std::sync::Arc<dyn crate::providers::Provider>,
+    pub(crate) provider: std::sync::Arc<dyn crate::providers::Provider>,
     /// The raw `"format/precision"` string from `ModelConfig.variant`, if the
     /// user configured a specific variant. Used at bind time to resolve the
     /// provider-specific model alias.
@@ -279,7 +262,7 @@ pub(crate) fn find_variant<'a>(
 impl ConfiguredModel {
     /// The model, the provider it names, and the variant it was pinned to,
     /// assembled by the collection that owns all three.
-    pub fn new(
+    pub(crate) fn new(
         model: std::sync::Arc<dyn Model>,
         provider: std::sync::Arc<dyn crate::providers::Provider>,
         configured_variant: Option<String>,
@@ -309,7 +292,7 @@ impl ConfiguredModel {
     /// Resolves `configured_variant` (stored as `"format/precision"`) to the
     /// matching `ModelVariant` in the model's catalog variants, using the
     /// same case-insensitive lookup as the pull command.
-    pub fn resolve_variant(&self) -> Option<&ModelVariant> {
+    fn resolve_variant(&self) -> Option<&ModelVariant> {
         find_variant(self.model.variants(), self.configured_variant.as_deref())
     }
 
@@ -326,7 +309,7 @@ impl ConfiguredModel {
     /// stating what the model must support -- `VisionMCPCapability` requires
     /// `ImageUnderstanding` of its model but looks the endpoint up via
     /// `Chat`, since that's the endpoint that actually serves vision requests.
-    pub fn resolve_provider_endpoint(
+    pub(crate) fn resolve_provider_endpoint(
         &self,
         model_id: &str,
         api_type: crate::providers::ApiType,
@@ -362,25 +345,25 @@ impl ConfiguredModel {
 /// Metadata describing a model implementation.
 /// This is what the factory returns when querying model information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelMetadata {
-    pub family: String,
-    pub version: String,
-    pub size: u64,
-    pub context_length: u64,
-    pub model_type: ModelType,
-    pub huggingface_repo: String,
-    pub native_dtype: String,
-    pub architecture: ModelArchitecture,
-    pub variants: Vec<ModelVariant>,
-    pub description: Option<String>,
-    pub tags: Vec<String>,
-    pub supported_functions: Vec<ModelFunction>,
+pub(crate) struct ModelMetadata {
+    pub(crate) family: String,
+    pub(crate) version: String,
+    pub(crate) size: u64,
+    pub(crate) context_length: u64,
+    pub(crate) model_type: ModelType,
+    pub(crate) huggingface_repo: String,
+    pub(crate) native_dtype: String,
+    pub(crate) architecture: ModelArchitecture,
+    pub(crate) variants: Vec<ModelVariant>,
+    pub(crate) description: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) supported_functions: Vec<ModelFunction>,
 }
 
 impl ModelMetadata {
     /// Format the parameter count as a human-readable string.
     /// Uses `M` (millions) for sub-billion models, `B` (billions) otherwise.
-    pub fn format_size(&self) -> String {
+    pub(crate) fn format_size(&self) -> String {
         if self.size >= 1_000_000_000 {
             format!("{}B", self.size / 1_000_000_000)
         } else {
@@ -418,7 +401,7 @@ impl Searchable for ModelMetadata {
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema, clap::ValueEnum,
 )]
-pub enum ModelType {
+pub(crate) enum ModelType {
     #[default]
     Text,
     Vision,
@@ -438,11 +421,11 @@ impl std::fmt::Display for ModelType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ModelVariant {
-    pub format: String,
-    pub precision: String,
-    pub size_gb: Option<f64>,
-    pub url: String,
+pub(crate) struct ModelVariant {
+    pub(crate) format: String,
+    pub(crate) precision: String,
+    pub(crate) size_gb: Option<f64>,
+    pub(crate) url: String,
 }
 
 /*-- Factory Definition ------------------------------------------------------*/

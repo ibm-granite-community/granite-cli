@@ -22,7 +22,7 @@ use std::collections::HashMap;
 /// Binds a trait hierarchy to the metadata type its factory catalogs
 /// implementations with. Implemented automatically by `define_factory!` for
 /// every `$trait` it defines, via `impl Catalogued for dyn $trait`.
-pub trait Catalogued {
+pub(crate) trait Catalogued {
     type Metadata;
 }
 
@@ -34,7 +34,7 @@ pub trait Catalogued {
 /// can't drift apart: `admits_type` exists only to narrow the catalog before
 /// anything is constructed, and should never accept a metadata entry whose
 /// instances could never pass `admits_instance`.
-pub trait Requirement<U: Catalogued + ?Sized> {
+pub(crate) trait Requirement<U: Catalogued + ?Sized> {
     /// Type-level (catalog) check: could an instance built from this catalog
     /// entry possibly satisfy the requirement?
     fn admits_type(&self, metadata: &U::Metadata) -> bool;
@@ -53,7 +53,7 @@ pub trait Requirement<U: Catalogued + ?Sized> {
 /// captures the in-progress choice driving the requirement -- the
 /// requirement often depends on runtime state the catalog metadata alone
 /// doesn't carry (e.g. which variant of a model was picked).
-pub trait DependsOn<U: Catalogued + ?Sized> {
+pub(crate) trait DependsOn<U: Catalogued + ?Sized> {
     type Requirement: Requirement<U>;
 
     fn requirement(&self) -> Self::Requirement;
@@ -64,7 +64,7 @@ pub trait DependsOn<U: Catalogued + ?Sized> {
 /// Adapts a dependency's world -- its already-configured instances, and its
 /// type-level catalog -- so the generic resolver can search both without
 /// knowing anything about `U`'s concrete storage or construction.
-pub trait Configured<U: Catalogued + ?Sized> {
+pub(crate) trait Configured<U: Catalogued + ?Sized> {
     /// Already-configured instances, keyed by their configured id.
     fn instances(&self) -> Vec<(String, std::sync::Arc<U>)>;
 
@@ -75,6 +75,7 @@ pub trait Configured<U: Catalogued + ?Sized> {
     /// constructed with. Callers use this to drive the next round of
     /// configuration for one of a `Resolution`'s `configurable_types`,
     /// without knowing anything about that type's concrete config struct.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn config_schema(&self, type_name: &str) -> Option<schemars::Schema>;
 }
 
@@ -88,18 +89,18 @@ pub trait Configured<U: Catalogued + ?Sized> {
 /// option backed by `configurable_types` when it's non-empty. The dependency
 /// is unresolvable only when both are empty.
 #[derive(Debug)]
-pub struct Resolution {
+pub(crate) struct Resolution {
     /// Already-configured instances that satisfy the requirement, keyed by
     /// their configured id.
-    pub existing_instances: Vec<String>,
+    pub(crate) existing_instances: Vec<String>,
     /// Catalog type names that could satisfy the requirement if configured.
-    pub configurable_types: Vec<&'static str>,
+    pub(crate) configurable_types: Vec<&'static str>,
 }
 
 impl Resolution {
     /// True when nothing configured satisfies the requirement, and nothing in
     /// the catalog could ever be configured to satisfy it either.
-    pub fn is_unsatisfiable(&self) -> bool {
+    pub(crate) fn is_unsatisfiable(&self) -> bool {
         self.existing_instances.is_empty() && self.configurable_types.is_empty()
     }
 }
@@ -110,7 +111,7 @@ impl Resolution {
 /// `Resolution` into behavior: auto-select a single existing match, prompt
 /// among several, or drive the setup flow for one of the configurable types
 /// (which may itself recurse into further unresolved dependencies).
-pub fn resolve<T, U>(dependent: &T, source: &impl Configured<U>) -> Resolution
+pub(crate) fn resolve<T, U>(dependent: &T, source: &impl Configured<U>) -> Resolution
 where
     U: Catalogued + ?Sized,
     T: DependsOn<U>,

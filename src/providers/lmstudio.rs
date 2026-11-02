@@ -46,28 +46,28 @@ struct LMStudioJobStatus {
 /*-- LM Studio Provider Configuration ----------------------------------------*/
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct LMStudioProviderConfig {
+pub(crate) struct LMStudioProviderConfig {
     /// Base URL for the LM Studio server
-    #[serde(default = "default_lmstudio_url")]
-    pub base_url: String,
+    #[serde(default = "default_base_url")]
+    pub(crate) base_url: String,
 
     /// API key for authentication (optional)
-    pub api_key: Option<Secret>,
+    pub(crate) api_key: Option<Secret>,
 
     /// Timeout for health checks in seconds
     #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
+    timeout_secs: u64,
 
     /// Whether to verify SSL certificates
     #[serde(default = "default_verify_ssl")]
-    pub verify_ssl: bool,
+    pub(crate) verify_ssl: bool,
 
     /// Endpoint to use for health checks
     #[serde(default = "default_lmstudio_health_endpoint")]
-    pub health_check_endpoint: String,
+    health_check_endpoint: String,
 }
 
-fn default_lmstudio_url() -> String {
+fn default_base_url() -> String {
     "http://localhost:1234".to_string()
 }
 
@@ -86,7 +86,7 @@ fn default_lmstudio_health_endpoint() -> String {
 impl Default for LMStudioProviderConfig {
     fn default() -> Self {
         Self {
-            base_url: default_lmstudio_url(),
+            base_url: default_base_url(),
             api_key: None,
             timeout_secs: default_timeout(),
             verify_ssl: default_verify_ssl(),
@@ -97,7 +97,7 @@ impl Default for LMStudioProviderConfig {
 
 /*-- LM Studio Provider Implementation ---------------------------------------*/
 
-pub struct LMStudioProvider {
+pub(crate) struct LMStudioProvider {
     instance_id: String,
     config: LMStudioProviderConfig,
     client: reqwest::Client,
@@ -343,7 +343,7 @@ impl HasProviderMetadata for LMStudioProvider {
                 "User-friendly local inference server with GUI, supporting GGUF and MLX models"
                     .to_string(),
             provider_type: ProviderType::Local,
-            default_endpoint: "http://localhost:1234".to_string(),
+            default_base_urls: vec!["http://localhost:1234".to_string()],
             supported_api_types: vec![ApiType::OpenAI, ApiType::Anthropic],
             default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: formats,

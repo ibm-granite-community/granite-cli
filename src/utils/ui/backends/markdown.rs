@@ -5,7 +5,7 @@ use crate::utils::ui::base::{self, HasUiMetadata, Ui, UiMetadata};
 
 /// GFM (GitHub Flavoured Markdown) output backend.
 /// Renders tables as pipe tables and detail as a two-column key/value table.
-pub struct MarkdownOutput;
+pub(crate) struct MarkdownOutput;
 
 impl ConfigConstructable for MarkdownOutput {
     type Config = NoConfig;

@@ -107,7 +107,7 @@ pub(crate) struct MachineInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "StoredProfile")]
-pub struct HardwareProfile {
+pub(crate) struct HardwareProfile {
     #[serde(flatten)]
     pub(crate) memory: Memory,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,7 +132,7 @@ impl HardwareProfile {
         }
     }
 
-    pub fn detect() -> Self {
+    pub(crate) fn detect() -> Self {
         Self::from_findings(Findings {
             os: std::env::consts::OS.to_string(),
             cpu_cores: num_cpus::get() as u32,
@@ -154,7 +154,7 @@ impl HardwareProfile {
 
     /// Memory budget available for model weights and KV cache: the figure
     /// the kind names, divided by the headroom factor.
-    pub fn usable_memory_gb(&self) -> f64 {
+    pub(crate) fn usable_memory_gb(&self) -> f64 {
         self.memory.model_memory_gb() / self.headroom()
     }
 
@@ -195,7 +195,7 @@ impl HardwareProfile {
     }
 }
 
-pub fn detect_hardware() -> HardwareProfile {
+pub(crate) fn detect_hardware() -> HardwareProfile {
     HardwareProfile::detect()
 }
 
@@ -367,7 +367,7 @@ fn bytes_to_gb(bytes: u64) -> f64 {
 mod gpu {
     use super::{GpuFinding, GpuMemory};
 
-    pub fn detect_nvidia() -> Option<GpuFinding> {
+    pub(crate) fn detect_nvidia() -> Option<GpuFinding> {
         use nvml_wrapper::error::NvmlError;
 
         let nvml = nvml_wrapper::Nvml::init().ok()?;
@@ -387,7 +387,7 @@ mod gpu {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn detect_apple() -> Option<GpuFinding> {
+    pub(crate) fn detect_apple() -> Option<GpuFinding> {
         // MTLCreateSystemDefaultDevice requires CoreGraphics to be linked.
         #[link(name = "CoreGraphics", kind = "framework")]
         unsafe extern "C" {}
@@ -402,7 +402,7 @@ mod gpu {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn detect_amd_linux() -> Option<GpuFinding> {
+    pub(crate) fn detect_amd_linux() -> Option<GpuFinding> {
         const AMD_VENDOR_ID: &str = "0x1002";
 
         let drm_dir = std::fs::read_dir("/sys/class/drm").ok()?;
@@ -434,7 +434,7 @@ mod gpu {
     }
 
     #[cfg(target_os = "windows")]
-    pub fn detect_dxgi() -> Option<GpuFinding> {
+    pub(crate) fn detect_dxgi() -> Option<GpuFinding> {
         use windows::Win32::Graphics::Dxgi::{
             CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
         };

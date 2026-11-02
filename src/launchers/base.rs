@@ -21,12 +21,11 @@ use_channel!("LNCHR");
 /// Core trait for launcher implementations.
 /// All launchers must implement this trait along with ConfigConstructable.
 #[async_trait]
-pub trait Launcher: crate::registry::Named + Send + Sync {
-    fn name(&self) -> &str;
-
+pub(crate) trait Launcher: crate::registry::Named + Send + Sync {
     /// The binary/command this instance will exec.
     /// Returns the full command string — either a bare binary name for PATH
     /// lookup (e.g. `"claude"`) or an absolute path set by the user in config.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn command(&self) -> &str;
 
     /// Bind a capability to this launcher instance.
@@ -265,6 +264,10 @@ pub(crate) async fn run_command(
 ///
 /// Returns `(exit_status, stdout, stderr)`. A non-success exit status is
 /// returned as `Ok` -- the caller decides what a bad code means.
+///
+/// Only reached from [`run_command_captured_killable`]'s Windows branch, which
+/// needs this path's WSL/PE-compatibility fallbacks.
+#[cfg(windows)]
 pub(crate) async fn run_command_captured(
     binary: PathBuf,
     overlay: &[EnvBinding],
@@ -272,27 +275,7 @@ pub(crate) async fn run_command_captured(
     ctx: &LaunchContext,
 ) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
     if ctx.dry_run {
-        // Return a dummy success status so callers don't need to special-case
-        // dry_run.  The exit status and captured strings are meaningless in this
-        // mode anyway.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            return Ok((
-                std::process::ExitStatus::from_raw(0),
-                String::new(),
-                String::new(),
-            ));
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::ExitStatusExt;
-            return Ok((
-                std::process::ExitStatus::from_raw(0),
-                String::new(),
-                String::new(),
-            ));
-        }
+        return Ok((dry_run_success_status(), String::new(), String::new()));
     }
 
     // Translate WSL paths in env vars when spawning a native Windows binary.
@@ -392,16 +375,104 @@ pub(crate) async fn run_command_captured(
     .await?
 }
 
+/// Like [`run_command_captured`], but the child is killed if the returned
+/// future is dropped before it completes -- which is how a cancelled
+/// delegated sub-agent stops burning the model behind it. On Unix the child
+/// leads its own process group and the whole group is killed, so anything it
+/// spawned (e.g. `pi`'s `bash` tool) goes with it.
+///
+/// On Windows this defers to [`run_command_captured`], whose
+/// WSL/PE-compatibility fallbacks this path does not replicate; there, dropping
+/// the future does not stop the child.
+pub(crate) async fn run_command_captured_killable(
+    binary: PathBuf,
+    overlay: &[EnvBinding],
+    args: &[String],
+    ctx: &LaunchContext,
+) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    if ctx.dry_run {
+        return Ok((dry_run_success_status(), String::new(), String::new()));
+    }
+
+    #[cfg(windows)]
+    return run_command_captured(binary, overlay, args, ctx).await;
+
+    #[cfg(not(windows))]
+    {
+        let mut cmd = tokio::process::Command::new(&binary);
+        cmd.args(args)
+            .current_dir(&ctx.working_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        for binding in overlay {
+            cmd.env(&binding.key, &binding.value);
+        }
+
+        let child = cmd.spawn()?;
+        let mut group = ProcessGroupKillGuard(child.id());
+        let output = child.wait_with_output().await?;
+        // The child has exited and been reaped; its pid may be reused, so the
+        // guard must not signal it any more.
+        group.0 = None;
+        Ok((
+            output.status,
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+}
+
+/// Kills the process group led by the held pid when dropped while still armed.
+/// `kill_on_drop` only signals the direct child; this reaches its descendants.
+#[cfg(not(windows))]
+struct ProcessGroupKillGuard(Option<u32>);
+
+#[cfg(not(windows))]
+impl Drop for ProcessGroupKillGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = std::process::Command::new("kill")
+                .args(["-s", "KILL", "--", &format!("-{pid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// A successful exit status with no output, returned by the captured runners
+/// in dry-run mode so callers don't need to special-case it.
+fn dry_run_success_status() -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+}
+
 /// Metadata describing a launcher implementation (type-level, catalog entry).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LauncherMetadata {
-    pub name: String,
-    pub description: String,
+pub(crate) struct LauncherMetadata {
+    pub(crate) name: String,
+    pub(crate) description: String,
     /// The default binary name used for PATH lookup (e.g. `"claude"`, `"bob"`).
-    pub default_command: String,
+    pub(crate) default_command: String,
     /// Binding surfaces this launcher type can make use of.
-    pub supported_capabilities: HashSet<BindingType>,
-    pub tags: Vec<String>,
+    pub(crate) supported_capabilities: HashSet<BindingType>,
+    /// MCP transports this launcher can register with its downstream tool.
+    /// Empty for launchers that do not support `BindingType::Mcp`. Its
+    /// `bind_capability` builds the MCP binding request from this field, and
+    /// enable-time validation reads it, so the two cannot disagree.
+    pub(crate) mcp_transports: HashSet<crate::capabilities::McpTransportKind>,
+    pub(crate) tags: Vec<String>,
 }
 
 impl std::fmt::Display for LauncherMetadata {
@@ -423,33 +494,76 @@ impl Searchable for LauncherMetadata {
 }
 
 /// Runtime context passed through the launch lifecycle.
-pub struct LaunchContext {
-    pub launcher_id: String,
+pub(crate) struct LaunchContext {
+    pub(crate) launcher_id: String,
     /// The working directory for the spawned subprocess (i.e. the CWD the
     /// tool process will see). Typically set to the user's current directory.
-    pub working_dir: PathBuf,
+    pub(crate) working_dir: PathBuf,
     /// Env vars already resolved (e.g. provider URL, model ID) before any
     /// capability bindings are merged on top.
-    pub base_env: HashMap<String, String>,
+    pub(crate) base_env: HashMap<String, String>,
     /// If true, only display what would be launched without executing.
-    pub dry_run: bool,
+    pub(crate) dry_run: bool,
     /// Shared usage tracker for the session's proxy, if one is running. Lets a
     /// launcher submit self-reported usage that never passes through the proxy
     /// (e.g. Bob, which has no model-configuration capability and so never makes
     /// a request the proxy could intercept).
-    pub usage_tracker: Option<std::sync::Arc<crate::proxy::UsageTracker>>,
+    pub(crate) usage_tracker: Option<std::sync::Arc<crate::proxy::UsageTracker>>,
     /// The session proxy for this launch, when one was started.
-    pub model_proxy: Option<crate::proxy::ProxyHandle>,
+    pub(crate) model_proxy: Option<crate::proxy::ProxyHandle>,
 }
 
 /// A single environment variable binding contributed to the subprocess overlay.
 #[derive(Debug, Clone)]
-pub struct EnvBinding {
-    pub key: String,
-    pub value: String,
+pub(crate) struct EnvBinding {
+    pub(crate) key: String,
+    pub(crate) value: String,
 }
 
 /*-- resolve, then bind -------------------------------------------------------*/
+
+/// Why a launcher of this type cannot carry `capability`'s MCP server, or
+/// `None` when it can (or when the capability does not fix a transport, or
+/// the launcher takes no MCP bindings at all, which binding types already
+/// cover). Both enable-time listing and config validation call this, and
+/// `bind_capability` builds its request from the same `mcp_transports`, so
+/// what is accepted here is what binds.
+pub(crate) fn mcp_transport_conflict<C>(
+    launcher: &LauncherMetadata,
+    capability: &C,
+) -> Option<McpTransportConflict>
+where
+    C: crate::capabilities::CapabilityInfo + ?Sized,
+{
+    if !launcher
+        .supported_capabilities
+        .contains(&crate::capabilities::BindingType::Mcp)
+    {
+        return None;
+    }
+    let transport = capability.mcp_transport()?;
+    if launcher.mcp_transports.contains(&transport) {
+        return None;
+    }
+    let mut offered: Vec<String> = launcher
+        .mcp_transports
+        .iter()
+        .map(|t| format!("{t:?}"))
+        .collect();
+    offered.sort();
+    Some(McpTransportConflict {
+        transport: format!("{transport:?}"),
+        offered,
+    })
+}
+
+/// A capability's MCP transport that a launcher type cannot register.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpTransportConflict {
+    pub(crate) transport: String,
+    /// What the launcher can register, sorted.
+    pub(crate) offered: Vec<String>,
+}
 
 /// Resolves every capability a launcher enables, and only then binds them.
 ///
@@ -494,7 +608,7 @@ pub(crate) mod tests {
     use crate::registry::{ConfigConstructable, ConstructError};
 
     /// Minimal Launcher implementation used only in tests.
-    pub(crate) struct FakeLauncher {
+    struct FakeLauncher {
         instance_id: String,
         /// When `Some`, `validate_command` resolves to this path directly.
         command_path: Option<PathBuf>,
@@ -533,10 +647,6 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl Launcher for FakeLauncher {
-        fn name(&self) -> &str {
-            "Fake Launcher"
-        }
-
         fn command(&self) -> &str {
             &self.command_name
         }
@@ -570,6 +680,7 @@ pub(crate) mod tests {
                 description: "Test double".to_string(),
                 default_command: "fake-binary-that-does-not-exist".to_string(),
                 supported_capabilities: HashSet::new(),
+                mcp_transports: HashSet::new(),
                 tags: vec![],
             }
         }
@@ -667,6 +778,7 @@ pub(crate) mod tests {
             description: "A test launcher".to_string(),
             default_command: "test".to_string(),
             supported_capabilities: HashSet::new(),
+            mcp_transports: HashSet::new(),
             tags: vec![],
         };
         assert_eq!(meta.to_string(), "A test launcher");
@@ -679,6 +791,7 @@ pub(crate) mod tests {
             description: "Anthropic's Claude Code CLI".to_string(),
             default_command: "claude".to_string(),
             supported_capabilities: HashSet::new(),
+            mcp_transports: HashSet::new(),
             tags: vec!["claude".to_string(), "anthropic".to_string()],
         };
         let fields = meta.search_fields();
@@ -736,6 +849,111 @@ pub(crate) mod tests {
         assert!(status.success());
     }
 
+    #[cfg(unix)]
+    fn live_ctx() -> LaunchContext {
+        LaunchContext {
+            launcher_id: "test".to_string(),
+            working_dir: std::env::temp_dir(),
+            base_env: HashMap::new(),
+            dry_run: false,
+            usage_tracker: None,
+            model_proxy: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killable_runner_captures_output_and_status() {
+        let (status, stdout, _) = run_command_captured_killable(
+            PathBuf::from("/bin/sh"),
+            &[],
+            &["-c".to_string(), "echo hello".to_string()],
+            &live_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(stdout.trim(), "hello");
+    }
+
+    #[test]
+    fn dry_run_killable_runner_returns_success_without_spawning() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ctx = LaunchContext {
+            launcher_id: "test".to_string(),
+            working_dir: PathBuf::from("/nonexistent"),
+            base_env: HashMap::new(),
+            dry_run: true,
+            usage_tracker: None,
+            model_proxy: None,
+        };
+        let (status, stdout, stderr) = rt
+            .block_on(run_command_captured_killable(
+                PathBuf::from("/nonexistent/binary"),
+                &[],
+                &[],
+                &ctx,
+            ))
+            .unwrap();
+        assert!(status.success());
+        assert!(stdout.is_empty() && stderr.is_empty());
+    }
+
+    /// Dropping the future must kill the child *and* its descendants: the
+    /// shell below backgrounds a grandchild and reports its pid.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_killable_runner_kills_the_child_and_its_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pid_file.display());
+        let args = ["-c".to_string(), script];
+        let ctx = live_ctx();
+        let run = run_command_captured_killable(PathBuf::from("/bin/sh"), &[], &args, &ctx);
+
+        // Let the shell start and record its grandchild, then abandon the run.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::pin!(run);
+            loop {
+                tokio::select! {
+                    _ = &mut run => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                        if pid_file.exists()
+                            && !std::fs::read_to_string(&pid_file).unwrap_or_default().trim().is_empty()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the shell should have recorded its background child")
+            .trim()
+            .parse()
+            .unwrap();
+
+        // `run` was dropped when the block above ended. Give the kill a moment.
+        let mut dead = false;
+        for _ in 0..100 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(dead, "descendant process {pid} survived the drop");
+    }
+
     /// Two capabilities against one configured model, the second of which
     /// names a model that is not configured when `broken` is true.
     fn capabilities(broken: bool) -> crate::capabilities::CapabilitySource {
@@ -780,7 +998,12 @@ pub(crate) mod tests {
                 },
             );
         }
-        crate::capabilities::CapabilitySource::from_config(&config)
+        let providers =
+            std::sync::Arc::new(crate::providers::ProviderSource::with_proxy(&config, None));
+        let models = std::sync::Arc::new(crate::models::ModelSource::with_providers(
+            &config, providers,
+        ));
+        crate::capabilities::CapabilitySource::with_models(&config, models)
     }
 
     #[tokio::test]
@@ -811,5 +1034,90 @@ pub(crate) mod tests {
 
         assert_eq!(resolved.len(), 2);
         assert_eq!(*launcher.bound.lock().unwrap(), enabled);
+    }
+
+    // -- mcp_transport_conflict ---------------------------------------------
+
+    use crate::capabilities::{BindingType, CapabilityInfo, McpTransportKind};
+
+    struct FixedTransport(Option<McpTransportKind>);
+
+    impl crate::registry::Named for FixedTransport {
+        fn instance_id(&self) -> &str {
+            "fixed"
+        }
+    }
+
+    impl CapabilityInfo for FixedTransport {
+        fn binding_types(&self) -> HashSet<BindingType> {
+            HashSet::from([BindingType::Mcp])
+        }
+        fn mcp_transport(&self) -> Option<McpTransportKind> {
+            self.0
+        }
+    }
+
+    fn launcher_meta(
+        binding_types: &[BindingType],
+        transports: &[McpTransportKind],
+    ) -> LauncherMetadata {
+        LauncherMetadata {
+            name: "t".to_string(),
+            description: "t".to_string(),
+            default_command: "t".to_string(),
+            supported_capabilities: binding_types.iter().copied().collect(),
+            mcp_transports: transports.iter().copied().collect(),
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn conflict_names_the_transport_and_what_the_launcher_offers() {
+        let launcher = launcher_meta(
+            &[BindingType::Mcp],
+            &[McpTransportKind::Stdio, McpTransportKind::Http],
+        );
+        let conflict =
+            mcp_transport_conflict(&launcher, &FixedTransport(Some(McpTransportKind::Sse)))
+                .expect("SSE is not offered");
+        assert_eq!(conflict.transport, "Sse");
+        assert_eq!(conflict.offered, ["Http", "Stdio"]);
+    }
+
+    #[test]
+    fn no_conflict_when_the_transport_is_offered() {
+        let launcher = launcher_meta(&[BindingType::Mcp], &[McpTransportKind::Sse]);
+        assert!(
+            mcp_transport_conflict(&launcher, &FixedTransport(Some(McpTransportKind::Sse)))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_conflict_when_the_capability_fixes_no_transport() {
+        let launcher = launcher_meta(&[BindingType::Mcp], &[McpTransportKind::Http]);
+        assert!(mcp_transport_conflict(&launcher, &FixedTransport(None)).is_none());
+    }
+
+    #[test]
+    fn no_conflict_when_the_launcher_takes_no_mcp_bindings() {
+        // Binding types already exclude it; this check must not add a second,
+        // misleading reason.
+        let launcher = launcher_meta(&[BindingType::AgentModel], &[]);
+        assert!(
+            mcp_transport_conflict(&launcher, &FixedTransport(Some(McpTransportKind::Sse)))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn every_launcher_declares_transports_exactly_when_it_supports_mcp() {
+        for (name, meta) in crate::launchers::LAUNCHER_REGISTRY.entries() {
+            assert_eq!(
+                meta.supported_capabilities.contains(&BindingType::Mcp),
+                !meta.mcp_transports.is_empty(),
+                "launcher '{name}': mcp_transports must be non-empty iff it supports Mcp"
+            );
+        }
     }
 }

@@ -42,14 +42,14 @@ use_channel!("BOB");
 
 /// Returned by a successful `register_or_fail` call: everything the caller
 /// needs to wait for the capture and clean up afterward.
-pub struct HookRegistration {
-    pub capture_path: PathBuf,
+pub(crate) struct HookRegistration {
+    pub(crate) capture_path: PathBuf,
     /// Path to the PID lockfile.  The launcher doesn't read this directly
     /// (lock checking is internal to `register_or_fail`), but it's exposed
     /// so callers can manually clean it up if needed.
     #[allow(dead_code)]
-    pub lock_path: PathBuf,
-    pub marker_command: String,
+    lock_path: PathBuf,
+    pub(crate) marker_command: String,
 }
 
 /*-- helpers --*/
@@ -102,7 +102,7 @@ fn lock_path(launcher_id: &str, workspace: &Path) -> anyhow::Result<PathBuf> {
 /// Platform-correct shell quoting for embedding a path in a shell command
 /// string. On Unix, uses single-quote escaping; on Windows, uses
 /// double-quote escaping per `cmd.exe` conventions.
-pub fn shell_quote(s: &str) -> String {
+fn shell_quote(s: &str) -> String {
     #[cfg(unix)]
     return shell_quote_unix(s);
 
@@ -148,7 +148,7 @@ fn shell_quote_windows(s: &str) -> String {
 ///
 /// This is a thin wrapper around `build_marker_command_with_exe` that
 /// calls `std::env::current_exe()` to get the real binary path.
-pub fn build_marker_command(capture_path: &Path, lock_path: &Path) -> anyhow::Result<String> {
+fn build_marker_command(capture_path: &Path, lock_path: &Path) -> anyhow::Result<String> {
     let exe = std::env::current_exe()?;
     Ok(build_marker_command_with_exe(&exe, capture_path, lock_path))
 }
@@ -160,7 +160,7 @@ pub fn build_marker_command(capture_path: &Path, lock_path: &Path) -> anyhow::Re
 /// passed through to the marker string (as `--ancestor-lock`) so the
 /// `bob-hook-capture` subcommand can perform ancestry gating at hook-fire
 /// time without baking a process-specific PID into the deterministic string.
-pub fn build_marker_command_with_exe(exe: &Path, capture_path: &Path, lock_path: &Path) -> String {
+fn build_marker_command_with_exe(exe: &Path, capture_path: &Path, lock_path: &Path) -> String {
     let exe_q = shell_quote(exe.to_string_lossy().as_ref());
     let cap_q = shell_quote(capture_path.to_string_lossy().as_ref());
     let lock_q = shell_quote(lock_path.to_string_lossy().as_ref());
@@ -169,7 +169,7 @@ pub fn build_marker_command_with_exe(exe: &Path, capture_path: &Path, lock_path:
 
 /// Read `<workspace>/.bob/settings.json` if it exists and parse as JSON;
 /// returns `{}` if the file is absent, empty, or fails to parse.
-pub fn read_settings(workspace: &Path) -> serde_json::Value {
+fn read_settings(workspace: &Path) -> serde_json::Value {
     let settings_file = bob_dir(workspace).join("settings.json");
     match std::fs::read_to_string(&settings_file) {
         Ok(content) => match content.trim().is_empty() {
@@ -200,7 +200,7 @@ pub fn read_settings(workspace: &Path) -> serde_json::Value {
 ///
 /// This function CAN return an error (registration should fail loudly if we
 /// can't even write the file).
-pub fn write_settings(workspace: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
+fn write_settings(workspace: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
     let bob_dir_path = bob_dir(workspace);
     let settings_file = bob_dir_path.join("settings.json");
     let serialized = serde_json::to_string_pretty(value)?;
@@ -213,7 +213,7 @@ pub fn write_settings(workspace: &Path, value: &serde_json::Value) -> anyhow::Re
 ///
 /// Handles every shape gracefully — missing `hooks` key, `SessionStart` not
 /// an array, etc. always means "not found".
-pub fn hooks_session_start_contains(settings: &serde_json::Value, marker_command: &str) -> bool {
+fn hooks_session_start_contains(settings: &serde_json::Value, marker_command: &str) -> bool {
     let session_start = settings
         .get("hooks")
         .and_then(|h| h.get("SessionStart"))
@@ -238,7 +238,7 @@ pub fn hooks_session_start_contains(settings: &serde_json::Value, marker_command
 /// Pushes one new group `{"hooks": [{"type": "command", "command":
 /// marker_command, "timeout": 5}]}` into `settings["hooks"]["SessionStart"]`,
 /// creating the `hooks`/`SessionStart` objects/arrays as needed if missing.
-pub fn add_marker(settings: &mut serde_json::Value, marker_command: &str) {
+fn add_marker(settings: &mut serde_json::Value, marker_command: &str) {
     // Defensive: a `.bob/settings.json` could contain syntactically valid
     // but non-object JSON (e.g. `[1,2,3]`) if it's corrupted or hand-edited.
     // Treat that the same as an empty settings file rather than panicking --
@@ -274,7 +274,7 @@ pub fn add_marker(settings: &mut serde_json::Value, marker_command: &str) {
 /// `SessionStart` group; if a group's `hooks` array becomes empty after
 /// removal, remove that whole group too. Leaves everything else in settings
 /// untouched.
-pub fn remove_marker(settings: &mut serde_json::Value, marker_command: &str) {
+fn remove_marker(settings: &mut serde_json::Value, marker_command: &str) {
     let hooks = match settings.get_mut("hooks") {
         Some(hooks) => hooks,
         None => return,
@@ -321,7 +321,7 @@ pub fn remove_marker(settings: &mut serde_json::Value, marker_command: &str) {
 /// `#[cfg(unix)]`: uses `kill -0 <pid>` via `std::process::Command`.
 /// `#[cfg(windows)]`: uses `tasklist /FI "PID eq <pid>" /NH` and checks
 /// whether its stdout contains the pid string.
-pub fn is_pid_alive(pid: u32) -> bool {
+fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         Command::new("kill")
@@ -436,7 +436,10 @@ pub(crate) fn is_process_ancestor(expected_pid: u32, max_depth: usize) -> Option
 /// Returns `Err` if another live `granite-cli` process already owns the hook
 /// for this workspace (collision). Returns `Ok` on success — the caller must
 /// proceed with the launch, then call `unregister` when done.
-pub fn register_or_fail(launcher_id: &str, workspace: &Path) -> anyhow::Result<HookRegistration> {
+pub(crate) fn register_or_fail(
+    launcher_id: &str,
+    workspace: &Path,
+) -> anyhow::Result<HookRegistration> {
     let cp = capture_path(launcher_id, workspace)?;
     let lp = lock_path(launcher_id, workspace)?;
 
@@ -504,7 +507,7 @@ fn remove_marker_from_file(workspace: &Path, marker_command: &str) {
 ///
 /// Never errors — if the launcher state dir or lock file can't be resolved,
 /// just log at debug and return.
-pub fn unregister(launcher_id: &str, workspace: &Path, marker_command: &str) {
+pub(crate) fn unregister(launcher_id: &str, workspace: &Path, marker_command: &str) {
     let mut settings = read_settings(workspace);
     remove_marker(&mut settings, marker_command);
     let _ = write_settings(workspace, &settings);
@@ -527,7 +530,7 @@ pub fn unregister(launcher_id: &str, workspace: &Path, marker_command: &str) {
 /// Returns `Some(session_id)` if the file exists and contains a valid
 /// `{"session_id": "<id>"}` object. "hook_event_name" is ignored since it may
 /// or may not stay valid due to conflicting field name in documentation.
-pub fn try_read_capture(capture_path: &Path) -> Option<String> {
+pub(crate) fn try_read_capture(capture_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(capture_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
     value.get("session_id")?.as_str().map(String::from)

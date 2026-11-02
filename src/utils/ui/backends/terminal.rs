@@ -19,7 +19,7 @@ use crate::utils::ui::base::{HasUiMetadata, PullHandle, Ui, UiMetadata};
 ///
 /// If stdout is not a tty (pipe, file redirect, CI — detected via
 /// `crossterm::terminal::size()`) every method delegates to `PlainOutput`.
-pub struct TerminalOutput {
+pub(crate) struct TerminalOutput {
     is_tty: bool,
     terminal_width: Option<u16>,
     next_pull_handle: AtomicU64,

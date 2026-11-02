@@ -15,19 +15,19 @@ use crate::providers::base::{
 use crate::registry::{ConfigConstructable, ConstructError, Secret};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct OpenRouterProviderConfig {
+pub(crate) struct OpenRouterProviderConfig {
     /// OpenRouter is one hosted service, so this has a default rather than
     /// being asked for: an instance that does not say otherwise talks to
     /// `https://openrouter.ai/api`.
     #[serde(default = "default_base_url")]
-    pub base_url: String,
-    pub api_key: Option<Secret>,
+    pub(crate) base_url: String,
+    pub(crate) api_key: Option<Secret>,
     #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
+    pub(crate) timeout_secs: u64,
     #[serde(default = "default_verify_ssl")]
-    pub verify_ssl: bool,
+    pub(crate) verify_ssl: bool,
     #[serde(default = "default_health_endpoint")]
-    pub health_check_endpoint: String,
+    pub(crate) health_check_endpoint: String,
 }
 
 fn default_timeout() -> u64 {
@@ -51,14 +51,14 @@ impl Default for OpenRouterProviderConfig {
         Self {
             base_url: default_base_url(),
             api_key: None,
-            timeout_secs: 10,
-            verify_ssl: true,
+            timeout_secs: default_timeout(),
+            verify_ssl: default_verify_ssl(),
             health_check_endpoint: default_health_endpoint(),
         }
     }
 }
 
-pub struct OpenRouterProvider {
+pub(crate) struct OpenRouterProvider {
     instance_id: String,
     config: OpenRouterProviderConfig,
     client: reqwest::Client,
@@ -166,7 +166,7 @@ impl HasProviderMetadata for OpenRouterProvider {
             description: "Hosted provider for accessing multiple AI models via the OpenRouter API"
                 .to_string(),
             provider_type: ProviderType::Hosted,
-            default_endpoint: "https://openrouter.ai/api".to_string(),
+            default_base_urls: vec!["https://openrouter.ai/api".to_string()],
             supported_api_types: vec![ApiType::OpenAI],
             default_function_endpoints: Self::default_function_endpoints(),
             supported_formats: vec![ModelFormat::OpenRouter],

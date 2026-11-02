@@ -13,11 +13,11 @@ use_channel!("LNCHR");
 
 /*-- public --*/
 
-pub struct LauncherCommands;
+pub(crate) struct LauncherCommands;
 
 impl LauncherCommands {
     /// Show all launcher types registered in the catalog.
-    pub fn catalog(ctx: &crate::AppContext) -> Result<()> {
+    pub(crate) fn catalog(ctx: &crate::AppContext) -> Result<()> {
         let launchers = LAUNCHER_REGISTRY.entries();
 
         let mut rows: Vec<Vec<String>> = launchers
@@ -35,7 +35,7 @@ impl LauncherCommands {
     }
 
     /// List all configured launcher instances.
-    pub fn list(ctx: &crate::AppContext) -> Result<()> {
+    pub(crate) fn list(ctx: &crate::AppContext) -> Result<()> {
         let notes = crate::commands::shared::remediation::dangling_notes(ctx, RefKind::Launcher);
         let mut rows: Vec<Vec<String>> = ctx
             .config()
@@ -72,7 +72,7 @@ impl LauncherCommands {
         Ok(())
     }
 
-    pub fn info(ctx: &crate::AppContext, id: &str) -> Result<()> {
+    pub(crate) fn info(ctx: &crate::AppContext, id: &str) -> Result<()> {
         let configured = ctx.config().get_launcher(id);
 
         let metadata = configured
@@ -113,11 +113,9 @@ impl LauncherCommands {
                             .push(("Enabled Capabilities", cfg.enabled_capabilities.join(", ")));
                     }
 
-                    if let Some(obj) = cfg.config.as_object() {
-                        for (k, v) in obj {
-                            instance_fields.push(("Config", format!("{k} = {v}")))
-                        }
-                    }
+                    let config_fields = crate::commands::shared::config_fields(&cfg.config);
+                    instance_fields
+                        .extend(config_fields.iter().map(|(k, v)| (k.as_str(), v.clone())));
 
                     ctx.ui.detail(id, &instance_fields);
                 }
@@ -163,7 +161,7 @@ impl LauncherCommands {
     /// accidentally creating duplicate configs for the same tool.
     /// `force_overwrite` skips the "already configured, overwrite?" prompt,
     /// for callers that have already obtained confirmation (e.g. remediation).
-    pub async fn setup(
+    pub(crate) async fn setup(
         ctx: &mut crate::AppContext,
         launcher_type: &str,
         instance_id: Option<&str>,
@@ -262,8 +260,7 @@ impl LauncherCommands {
             .config()
             .get_launcher(&instance_id)
             .map(|lc| lc.config.clone())
-            .or_else(|| LAUNCHER_REGISTRY.default_config(launcher_type))
-            .unwrap_or_else(|| serde_json::json!({}));
+            .unwrap_or_else(|| LAUNCHER_REGISTRY.default_config(launcher_type));
         alog_channel!(MessageLevel::Debug3, "Defaults: {:#?}", defaults);
 
         let config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
@@ -328,7 +325,7 @@ impl LauncherCommands {
     /// that cannot bind would fail later during the launch itself. This runs
     /// before anything about the environment, so a configuration problem is
     /// reported before a missing binary is.
-    pub async fn prelaunch(ctx: &mut crate::AppContext, launcher_id: &str) -> Result<()> {
+    pub(crate) async fn prelaunch(ctx: &mut crate::AppContext, launcher_id: &str) -> Result<()> {
         let outcome = crate::commands::shared::remediation::remediate(
             ctx,
             RefKind::Launcher,
@@ -356,7 +353,7 @@ impl LauncherCommands {
     /// `policy` controls what happens to dependents: `Cascade` removes them
     /// too, `Refuse` aborts, `Leave` strands them. `None` asks interactively
     /// or leaves in non-interactive sessions.
-    pub fn remove(
+    pub(crate) fn remove(
         ctx: &mut crate::AppContext,
         launcher_id: &str,
         policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
@@ -430,6 +427,8 @@ async fn select_capabilities(
                 cap.binding_types()
                     .iter()
                     .any(|bt| launcher_def.supported_capabilities.contains(bt))
+                    && crate::launchers::mcp_transport_conflict(launcher_def, cap.as_ref())
+                        .is_none()
             })
             .map(|(id, _)| id)
             .collect();
@@ -447,8 +446,9 @@ async fn select_capabilities(
             .collect();
         if !carried.is_empty() && !announced {
             ctx.ui.warn(&format!(
-                "Left enabled but not listed below: {}. Each one is missing or \
-                 has a reference that does not resolve.",
+                "Left enabled but not listed below: {}. Each one is missing, has a \
+                 reference that does not resolve, or uses an MCP transport this \
+                 launcher cannot register.",
                 carried.join(", ")
             ));
             announced = true;
@@ -530,6 +530,21 @@ async fn select_capabilities(
 
         crate::commands::CapabilityCommands::setup(ctx, cap_type, Some(&nickname), false).await?;
 
+        // The transport is only known once the capability is configured, so
+        // this is the first point the new instance can be checked.
+        if let Ok(configured) = ctx.sources().capabilities().get(&nickname)
+            && let Some(conflict) =
+                crate::launchers::mcp_transport_conflict(launcher_def, configured.as_ref())
+        {
+            ctx.ui.warn(&format!(
+                "'{nickname}' uses the {} MCP transport, which this launcher cannot \
+                 register (it supports: {}). It was configured but will not be enabled here.",
+                conflict.transport,
+                conflict.offered.join(", ")
+            ));
+            continue;
+        }
+
         // Pre-select the new capability on the next iteration.
         enabled.push(nickname.clone());
         result.push(nickname);
@@ -551,6 +566,7 @@ mod tests {
         crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()))
     }
 
+    #[cfg(unix)]
     fn capture(ctx: &crate::AppContext) -> &CaptureUi {
         (&*ctx.ui as &dyn std::any::Any)
             .downcast_ref::<CaptureUi>()
@@ -916,13 +932,14 @@ mod tests {
     fn no_capabilities_launcher_def() -> crate::launchers::LauncherMetadata {
         crate::launchers::LauncherMetadata {
             supported_capabilities: std::collections::HashSet::new(),
+            mcp_transports: std::collections::HashSet::new(),
             ..bob_launcher_def()
         }
     }
 
     // Helper: insert a minimal agent-model capability config into ctx.
-    // Also adds the model to config.models so CapabilitySource::from_config
-    // can construct the underlying AgentModelCapability.
+    // Also adds the model to config.models so the shared source set can
+    // construct the underlying AgentModelCapability.
     fn add_capability(ctx: &mut crate::AppContext, cap_id: &str, model_id: &str) {
         // The model needs a provider to bind, so a capability is only
         // constructible, and so only listed, with one configured.

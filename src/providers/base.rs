@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// API protocol families that providers can implement
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ApiType {
+pub(crate) enum ApiType {
     /// OpenAI-compatible API protocol
     OpenAI,
     /// Ollama API protocol
@@ -36,7 +36,7 @@ impl std::fmt::Display for ApiType {
 
 /// Specific API endpoints within an API family
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-pub enum ApiEndpoint {
+pub(crate) enum ApiEndpoint {
     /// /v1/chat/completions
     OpenAIChat,
     /// /v1/embeddings
@@ -55,7 +55,7 @@ pub enum ApiEndpoint {
 
 impl ApiEndpoint {
     /// Returns the API type this endpoint belongs to
-    pub fn api_type(&self) -> ApiType {
+    pub(crate) fn api_type(&self) -> ApiType {
         match self {
             ApiEndpoint::OpenAIChat
             | ApiEndpoint::OpenAIEmbeddings
@@ -69,7 +69,7 @@ impl ApiEndpoint {
     }
 
     /// Returns the endpoint path
-    pub fn path(&self) -> &'static str {
+    pub(crate) fn path(&self) -> &'static str {
         match self {
             ApiEndpoint::OpenAIChat => "/v1/chat/completions",
             ApiEndpoint::OpenAIEmbeddings => "/v1/embeddings",
@@ -82,7 +82,7 @@ impl ApiEndpoint {
     }
 
     /// Returns the model functions this endpoint provides
-    pub fn provides_functions(&self) -> Vec<ModelFunction> {
+    fn provides_functions(&self) -> Vec<ModelFunction> {
         match self {
             ApiEndpoint::OpenAIChat | ApiEndpoint::OllamaChat | ApiEndpoint::AnthropicMessages => {
                 vec![
@@ -131,7 +131,7 @@ impl std::fmt::Display for ApiEndpoint {
 /// Core trait for provider implementations.
 /// All providers must implement this trait along with ConfigConstructable.
 #[async_trait]
-pub trait Provider: crate::registry::Named + Send + Sync {
+pub(crate) trait Provider: crate::registry::Named + Send + Sync {
     fn name(&self) -> &str;
 
     /// Returns the mapping of model functions to API endpoints this provider instance supports.
@@ -158,6 +158,7 @@ pub trait Provider: crate::registry::Named + Send + Sync {
     fn verify_ssl(&self) -> bool;
 
     // Model support
+    #[cfg_attr(not(test), allow(dead_code))]
     fn supported_formats(&self) -> Vec<ModelFormat>;
     fn can_run_model(&self, _variant_format: &str, _variant_precision: &str) -> bool {
         true
@@ -209,7 +210,7 @@ pub trait Provider: crate::registry::Named + Send + Sync {
 
 /// Result of a `Provider::pull_model` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PullResult {
+pub(crate) enum PullResult {
     /// Pull was attempted and completed successfully.
     Success,
     /// Pull is not needed for this provider (e.g. hosted or auto-available models).
@@ -223,20 +224,30 @@ pub enum PullResult {
 /// Metadata describing a provider implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderMetadata {
-    pub name: String,
-    pub description: String,
-    pub provider_type: ProviderType,
-    pub default_endpoint: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) provider_type: ProviderType,
+    pub(crate) default_base_urls: Vec<String>,
 
     /// API types this provider implementation supports (AND logic)
-    pub supported_api_types: Vec<ApiType>,
+    pub(crate) supported_api_types: Vec<ApiType>,
 
     /// Default function-to-endpoint mappings for this provider type
-    pub default_function_endpoints: HashMap<ModelFunction, Vec<ApiEndpoint>>,
+    pub(crate) default_function_endpoints: HashMap<ModelFunction, Vec<ApiEndpoint>>,
 
-    pub supported_formats: Vec<ModelFormat>,
-    pub authentication: Vec<AuthType>,
-    pub tags: Vec<String>,
+    pub(crate) supported_formats: Vec<ModelFormat>,
+    pub(crate) authentication: Vec<AuthType>,
+    pub(crate) tags: Vec<String>,
+}
+
+impl ProviderMetadata {
+    pub(crate) fn formatted_default_base_urls(&self) -> String {
+        if self.default_base_urls.is_empty() {
+            "-".to_string()
+        } else {
+            self.default_base_urls.join(", ")
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderMetadata {
@@ -260,7 +271,7 @@ impl Searchable for ProviderMetadata {
 /*-- Shared Helpers ----------------------------------------------------------*/
 
 /// Shared HTTP health check implementation for providers.
-pub async fn http_health_check(
+pub(crate) async fn http_health_check(
     client: &reqwest::Client,
     base_url: &str,
     health_endpoint: &str,
@@ -314,8 +325,8 @@ pub async fn http_health_check(
 
 /// Model formats that providers can serve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(non_camel_case_types)]
-pub enum ModelFormat {
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+pub(crate) enum ModelFormat {
     Safetensors,
     GGUF,
     ONNX,
@@ -341,7 +352,7 @@ impl std::fmt::Display for ModelFormat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderType {
+pub(crate) enum ProviderType {
     Hosted,
     Local,
 }
@@ -356,7 +367,7 @@ impl std::fmt::Display for ProviderType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AuthType {
+pub(crate) enum AuthType {
     ApiKey,
     BearerToken,
     None,
@@ -374,26 +385,17 @@ impl std::fmt::Display for AuthType {
 
 /// Health status from a provider health check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthStatus {
-    pub healthy: bool,
-    pub latency: Duration,
-    pub error: Option<String>,
+pub(crate) struct HealthStatus {
+    pub(crate) healthy: bool,
+    pub(crate) latency: Duration,
+    pub(crate) error: Option<String>,
 }
 
 /// Errors specific to provider operations.
 #[derive(Debug, thiserror::Error)]
-pub enum ProviderError {
+pub(crate) enum ProviderError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-
-    #[error("Authentication failed: {0}")]
-    Auth(String),
-
-    #[error("Rate limited: {0}")]
-    RateLimited(String),
-
-    #[error("Model not found: {0}")]
-    ModelNotFound(String),
 
     #[error("Provider error: {0}")]
     Other(String),
@@ -487,7 +489,7 @@ mod tests {
             name: "Ollama".to_string(),
             description: "Local Ollama server".to_string(),
             provider_type: ProviderType::Local,
-            default_endpoint: "http://localhost:11434".to_string(),
+            default_base_urls: vec!["http://localhost:11434".to_string()],
             supported_api_types: vec![ApiType::Ollama],
             default_function_endpoints: HashMap::new(),
             supported_formats: vec![],

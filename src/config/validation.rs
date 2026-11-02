@@ -60,6 +60,12 @@ pub(crate) enum Problem {
     /// type reads an id from a different setting than its dependency
     /// metadata declares.
     Unresolved { detail: String },
+    /// The capability builds, but its MCP server uses a transport the
+    /// launcher that enables it cannot register.
+    IncompatibleTransport {
+        transport: String,
+        offered: Vec<String>,
+    },
 }
 
 impl From<crate::registry::ConstructError> for Problem {
@@ -240,6 +246,12 @@ impl std::fmt::Display for ValidationError {
                 )
             }
             Problem::Unresolved { detail } => write!(f, "does not resolve: {detail}"),
+            Problem::IncompatibleTransport { transport, offered } => write!(
+                f,
+                "uses the {transport} MCP transport, which this launcher cannot register \
+                 (it supports: {})",
+                offered.join(", ")
+            ),
         }
     }
 }
@@ -342,7 +354,40 @@ fn validate(
         validate(target_kind, target_id, config, sources, Some((kind, id)))?;
     }
 
-    resolves(kind, id, sources).map_err(|problem| err(kind, id, problem, referrer))
+    resolves(kind, id, sources).map_err(|problem| err(kind, id, problem, referrer))?;
+
+    // A capability reached through a launcher must also be one that launcher
+    // can carry. The transport is a property of the capability's own
+    // settings, so only a built instance can say.
+    if let (RefKind::Capability, Some((RefKind::Launcher, launcher_id))) = (kind, referrer)
+        && let Some(conflict) = transport_conflict(launcher_id, id, config, sources)
+    {
+        return Err(err(
+            kind,
+            id,
+            Problem::IncompatibleTransport {
+                transport: conflict.transport,
+                offered: conflict.offered,
+            },
+            referrer,
+        ));
+    }
+    Ok(())
+}
+
+/// The MCP transport conflict between launcher `launcher_id`'s type and
+/// capability `capability_id`, if there is one. `None` also when either side
+/// cannot be looked up: those are other problems, reported by the walk.
+fn transport_conflict(
+    launcher_id: &str,
+    capability_id: &str,
+    config: &Config,
+    sources: &Sources,
+) -> Option<crate::launchers::McpTransportConflict> {
+    let launcher_type = &config.get_launcher(launcher_id)?.launcher_type;
+    let metadata = crate::launchers::LAUNCHER_REGISTRY.get(launcher_type)?;
+    let capability = sources.capabilities().build(capability_id).ok()?;
+    crate::launchers::mcp_transport_conflict(&metadata, capability.as_ref())
 }
 
 /// What the source that owns `kind` says about the entry under `id`: whether
@@ -559,6 +604,89 @@ mod tests {
             .launchers
             .insert("claude".into(), launcher("claude", "claude", &["chat"]));
         config
+    }
+
+    fn mcp_server(id: &str, config: serde_json::Value) -> CapabilityConfig {
+        CapabilityConfig {
+            capability_id: id.to_string(),
+            capability_type: "mcp-server".to_string(),
+            config,
+        }
+    }
+
+    /// One `mcp-server` capability enabled by one launcher of the given type.
+    fn with_mcp_server(launcher_type: &str, server: serde_json::Value) -> Config {
+        let mut config = Config::default();
+        config
+            .capabilities
+            .insert("srv".into(), mcp_server("srv", server));
+        config
+            .launchers
+            .insert("l".into(), launcher("l", launcher_type, &["srv"]));
+        config
+    }
+
+    #[test]
+    fn an_sse_server_is_refused_by_a_launcher_that_cannot_register_it() {
+        let sse = serde_json::json!({"type": "sse", "url": "http://localhost:1/sse"});
+        for launcher_type in ["hermes", "goose", "bob", "bobide"] {
+            let config = with_mcp_server(launcher_type, sse.clone());
+            let err = check(RefKind::Launcher, "l", &config)
+                .expect_err(&format!("{launcher_type} must refuse an SSE server"));
+            assert_eq!(err.target, (RefKind::Capability, "srv".to_string()));
+            assert_eq!(err.referrer, Some((RefKind::Launcher, "l".to_string())));
+            assert_eq!(
+                err.problem,
+                Problem::IncompatibleTransport {
+                    transport: "Sse".to_string(),
+                    offered: vec!["Http".to_string(), "Stdio".to_string()],
+                },
+                "{launcher_type}"
+            );
+            assert!(err.to_string().contains("Sse"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_sse_server_is_accepted_by_launchers_that_register_it() {
+        let sse = serde_json::json!({"type": "sse", "url": "http://localhost:1/sse"});
+        for launcher_type in ["claude", "opencode", "openclaw"] {
+            let config = with_mcp_server(launcher_type, sse.clone());
+            assert!(
+                check(RefKind::Launcher, "l", &config).is_ok(),
+                "{launcher_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn stdio_and_http_servers_are_accepted_by_every_mcp_launcher() {
+        let servers = [
+            serde_json::json!({"type": "stdio", "command": "npx"}),
+            serde_json::json!({"type": "http", "url": "https://x.example/mcp"}),
+        ];
+        for launcher_type in [
+            "claude", "hermes", "goose", "bob", "bobide", "opencode", "openclaw",
+        ] {
+            for server in &servers {
+                let config = with_mcp_server(launcher_type, server.clone());
+                assert!(
+                    check(RefKind::Launcher, "l", &config).is_ok(),
+                    "{launcher_type} / {server}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_transport_check_applies_only_when_reached_through_a_launcher() {
+        // Checked on its own, the capability is fine: whether it can be
+        // carried depends on which launcher enables it.
+        let config = with_mcp_server(
+            "hermes",
+            serde_json::json!({"type": "sse", "url": "http://localhost:1/sse"}),
+        );
+        assert!(check(RefKind::Capability, "srv", &config).is_ok());
     }
 
     #[test]
@@ -780,9 +908,8 @@ mod tests {
                     } => config_key,
                     _ => continue,
                 };
-                let mut settings = crate::capabilities::CAPABILITY_REGISTRY
-                    .default_config(type_name)
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let mut settings =
+                    crate::capabilities::CAPABILITY_REGISTRY.default_config(type_name);
                 settings[config_key.as_str()] = serde_json::json!("");
 
                 let err = crate::capabilities::CAPABILITY_REGISTRY

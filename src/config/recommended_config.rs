@@ -21,7 +21,7 @@ include!(concat!(
 /// Built-in recommended configurations parsed from the YAML files embedded
 /// by `build.rs`.  Each file becomes one entry; parse errors are logged and
 /// the offending file is skipped.
-pub static BUILTIN_RECOMMENDED_CONFIGS: std::sync::LazyLock<Vec<RecommendedConfiguration>> =
+pub(crate) static BUILTIN_RECOMMENDED_CONFIGS: std::sync::LazyLock<Vec<RecommendedConfiguration>> =
     std::sync::LazyLock::new(|| {
         RECOMMENDED_CONFIG_SOURCES
             .iter()
@@ -49,38 +49,38 @@ pub static BUILTIN_RECOMMENDED_CONFIGS: std::sync::LazyLock<Vec<RecommendedConfi
 /// applied to any launcher without its own specific entry.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct RecommendedConfiguration {
-    pub launcher: String,
-    pub capabilities: Vec<RecommendedCapability>,
+pub(crate) struct RecommendedConfiguration {
+    pub(crate) launcher: String,
+    pub(crate) capabilities: Vec<RecommendedCapability>,
 }
 
 /// One capability a launcher can auto-enable, and how to fill each of its
 /// model dependency slots.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct RecommendedCapability {
+pub(crate) struct RecommendedCapability {
     /// CAPABILITY_REGISTRY key (e.g. "agent-model").
-    pub capability: String,
+    pub(crate) capability: String,
     /// Keyed by the capability's own `Dependency::Model.config_key` (e.g.
     /// "model_id") -- a capability may have more than one model dependency
     /// slot, each independently recommended.
-    pub models: HashMap<String, RecommendedModelSet>,
+    pub(crate) models: HashMap<String, RecommendedModelSet>,
 }
 
 /// A slot's requirements plus its ordered list of admissible candidates.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct RecommendedModelSet {
+pub(crate) struct RecommendedModelSet {
     /// Minimum useful *achieved* context length for this slot, independent
     /// of which candidate is chosen (e.g. a coding-agent capability
     /// inherently needs more headroom than a lightweight one). Meant to be
     /// checked by callers against the *effective* context after hardware
     /// fit, not a model's native max -- that's the caller's job, not this
     /// module's; this module just carries the number.
-    pub min_context_length: Option<u64>,
+    pub(crate) min_context_length: Option<u64>,
     /// Ordered by preference; callers should try candidates in order and
     /// take the first that resolves.
-    pub models: Vec<RecommendedModel>,
+    pub(crate) models: Vec<RecommendedModel>,
 }
 
 /// One candidate model and which of its variants are acceptable.
@@ -95,19 +95,19 @@ pub struct RecommendedModelSet {
 /// this composes for free rather than needing a third list here.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct RecommendedModel {
-    pub model: StringMatch,
+pub(crate) struct RecommendedModel {
+    pub(crate) model: StringMatch,
     /// Per-model format allow-list (e.g. "GGUF", "Ollama", "OpenRouter");
     /// empty means any format is acceptable. Lets a config say "just use
     /// the Ollama-served build" (`variant_formats: [Ollama]`, no precision
     /// constraint) or restrict a hosted/API provider format that has no
     /// quantization precision to speak of at all.
     #[serde(default)]
-    pub variant_formats: Vec<StringMatch>,
+    pub(crate) variant_formats: Vec<StringMatch>,
     /// Per-model precision allow-list (e.g. "Q4_K_M", "IQ4_XS"); empty means
     /// any variant is acceptable.
     #[serde(default)]
-    pub variant_precisions: Vec<StringMatch>,
+    pub(crate) variant_precisions: Vec<StringMatch>,
 }
 
 // -- StringMatch ----------------------------------------------------------------
@@ -118,7 +118,7 @@ pub struct RecommendedModel {
 /// `{regex: "..."}` deserializes to `Regex`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
-pub enum StringMatch {
+pub(crate) enum StringMatch {
     Exact(String),
     Regex { regex: String },
 }
@@ -126,7 +126,7 @@ pub enum StringMatch {
 impl StringMatch {
     /// Whether `s` matches. An invalid regex pattern never matches (rather
     /// than panicking) -- log a warning via this crate's `alog` logging.
-    pub fn matches(&self, s: &str) -> bool {
+    pub(crate) fn matches(&self, s: &str) -> bool {
         match self {
             StringMatch::Exact(pattern) => s == pattern,
             StringMatch::Regex { regex: pattern } => match regex::Regex::new(pattern) {
@@ -170,7 +170,7 @@ fn resolve_entry<'a>(
 /// for the main agent," not "fall back to whatever the wildcard says."
 /// Blending the two would silently reintroduce exactly that kind of
 /// unwanted recommendation.
-pub fn effective_capabilities(
+pub(crate) fn effective_capabilities(
     launcher_type: &str,
     builtin: &[RecommendedConfiguration],
     user: &HashMap<String, RecommendedConfiguration>,

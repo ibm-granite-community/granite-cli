@@ -101,7 +101,7 @@ fn search_match_reason(id: &str, m: &ModelMetadata, q: &str) -> Option<String> {
     None
 }
 
-pub struct ModelCommands;
+pub(crate) struct ModelCommands;
 
 /// Whether every provider type that runs variants of `format` is hosted.
 /// Such a variant states no size because the hosted provider does not
@@ -183,7 +183,7 @@ impl DependsOn<dyn Provider> for AnyProviderRequirement {
 impl ModelCommands {
     /// Rows for the model search table: [id, family, size, context, type].
     /// Shared by the CLI command and the TUI.
-    pub(crate) fn search_rows(query: &str) -> Vec<Vec<String>> {
+    fn search_rows(query: &str) -> Vec<Vec<String>> {
         Self::search_rows_in(
             MODEL_REGISTRY
                 .entries()
@@ -227,7 +227,7 @@ impl ModelCommands {
         rows.into_iter().map(|(row, _)| row).collect()
     }
 
-    pub fn search(ctx: &crate::AppContext, query: &str) -> Result<()> {
+    pub(crate) fn search(ctx: &crate::AppContext, query: &str) -> Result<()> {
         let rows = Self::search_rows(query);
         if rows.is_empty() {
             ctx.ui.info(&format!("No models found matching '{query}'."));
@@ -350,7 +350,7 @@ impl ModelCommands {
             })
             .collect();
 
-        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        sort_recommend_rows(&mut rows);
         rows.into_iter().map(|(_, row)| row).collect()
     }
 
@@ -405,7 +405,7 @@ impl ModelCommands {
     ///   check entirely (`None`).
     /// - otherwise: restrict to the named provider ids, erroring if any is
     ///   not a configured+enabled provider.
-    pub fn recommend(
+    pub(crate) fn recommend(
         ctx: &crate::AppContext,
         filter_type: Option<ModelType>,
         providers_arg: &[String],
@@ -538,7 +538,7 @@ impl ModelCommands {
 
     /// Rows for the model catalog table: [id, family, size, context, type].
     /// Shared by the CLI command and the TUI.
-    pub(crate) fn catalog_rows(filter_type: Option<&ModelType>) -> Vec<Vec<String>> {
+    fn catalog_rows(filter_type: Option<&ModelType>) -> Vec<Vec<String>> {
         let models = MODEL_REGISTRY.entries();
         let mut rows: Vec<(Vec<String>, ModelMetadata)> = models
             .iter()
@@ -558,7 +558,7 @@ impl ModelCommands {
         rows.into_iter().map(|(row, _)| row).collect()
     }
 
-    pub fn catalog(ctx: &crate::AppContext, filter_type: Option<ModelType>) -> Result<()> {
+    pub(crate) fn catalog(ctx: &crate::AppContext, filter_type: Option<ModelType>) -> Result<()> {
         let rows = Self::catalog_rows(filter_type.as_ref());
         if rows.is_empty() {
             ctx.ui.info(&format!(
@@ -578,7 +578,7 @@ impl ModelCommands {
         Ok(())
     }
 
-    pub fn list(ctx: &crate::AppContext, filter_type: Option<ModelType>) -> Result<()> {
+    pub(crate) fn list(ctx: &crate::AppContext, filter_type: Option<ModelType>) -> Result<()> {
         let notes = crate::commands::shared::remediation::dangling_notes(ctx, RefKind::Model);
         let source = ctx.sources().models();
         let mut enriched: Vec<(Vec<String>, ModelMetadata)> = Vec::new();
@@ -690,13 +690,13 @@ impl ModelCommands {
     /// registry key is not in the registry. Shared by the CLI command and
     /// the TUI, which only ever browses the catalog, never a configured
     /// instance's live values.
-    pub(crate) fn info_fields(model_type: &str) -> Option<Vec<(&'static str, String)>> {
+    fn info_fields(model_type: &str) -> Option<Vec<(&'static str, String)>> {
         MODEL_REGISTRY
             .get(model_type)
             .map(|m| Self::metadata_fields(&m))
     }
 
-    pub async fn info(ctx: &mut crate::AppContext, id: &str) -> Result<()> {
+    pub(crate) async fn info(ctx: &mut crate::AppContext, id: &str) -> Result<()> {
         // Only a configured instance can have a broken reference. An id that
         // names a catalog type is being browsed, not diagnosed.
         if ctx.config().get_model(id).is_some() {
@@ -727,13 +727,11 @@ impl ModelCommands {
 
                 ctx.ui.detail("Type Metadata", &type_fields);
 
-                let mut instance_fields: Vec<(&str, String)> = Vec::new();
-                instance_fields.push(("Config: Type", model_config.model_type.clone()));
-                instance_fields.push((
-                    "Config: Provider",
-                    format!("{:?}", model_config.provider_id),
-                ));
-                instance_fields.push(("Config: Variant", format!("{:?}", model_config.variant)));
+                let instance_fields: Vec<(&str, String)> = vec![
+                    ("Config: Type", model_config.model_type.clone()),
+                    ("Config: Provider", model_config.provider_id.clone()),
+                    ("Config: Variant", variant_field(&model_config.variant)),
+                ];
                 ctx.ui.detail(id, &instance_fields);
                 return Ok(());
             }
@@ -744,10 +742,10 @@ impl ModelCommands {
                 ctx.ui.detail("Type Metadata", &type_fields);
 
                 if let Some(configured) = ctx.config().get_model(id) {
-                    let mut instance_fields: Vec<(&str, String)> = Vec::new();
-                    instance_fields
-                        .push(("Config: Provider", format!("{:?}", configured.provider_id)));
-                    instance_fields.push(("Config: Variant", format!("{:?}", configured.variant)));
+                    let instance_fields: Vec<(&str, String)> = vec![
+                        ("Config: Provider", configured.provider_id.clone()),
+                        ("Config: Variant", variant_field(&configured.variant)),
+                    ];
 
                     ctx.ui.detail(id, &instance_fields);
                 }
@@ -777,7 +775,7 @@ impl ModelCommands {
     /// models).
     /// `force_overwrite` skips the "already configured, overwrite?" prompt,
     /// for callers that have already obtained confirmation (e.g. remediation).
-    pub async fn setup(
+    pub(crate) async fn setup(
         ctx: &mut crate::AppContext,
         model_type: &str,
         instance_id: Option<&str>,
@@ -835,8 +833,7 @@ impl ModelCommands {
         let defaults = existing_config
             .as_ref()
             .map(|c| c.config.clone())
-            .or_else(|| MODEL_REGISTRY.default_config(model_type))
-            .unwrap_or_else(|| serde_json::json!({}));
+            .unwrap_or_else(|| MODEL_REGISTRY.default_config(model_type));
         let model_specific_cfg = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
 
         // Construct a live, provider-less instance now -- this replaces the
@@ -952,7 +949,7 @@ impl ModelCommands {
         Ok(())
     }
 
-    pub async fn pull(ctx: &mut crate::AppContext, model_id: &str) -> Result<()> {
+    pub(crate) async fn pull(ctx: &mut crate::AppContext, model_id: &str) -> Result<()> {
         let configured = ctx.config().get_model(model_id);
         if configured.is_none() && MODEL_REGISTRY.get(model_id).is_none() {
             ctx.ui
@@ -1038,7 +1035,7 @@ impl ModelCommands {
     /// `policy` controls what happens to dependents: `Cascade` removes them
     /// too, `Refuse` aborts, `Leave` strands them. `None` asks interactively
     /// or leaves in non-interactive sessions.
-    pub fn remove(
+    pub(crate) fn remove(
         ctx: &mut crate::AppContext,
         model_id: &str,
         policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
@@ -1148,13 +1145,27 @@ impl ModelCommands {
 /// reporting progress through `ui`. Separated from `ModelCommands::pull` so
 /// a future `launch` pre-launch step can call it directly without going
 /// through config lookup or CLI-specific error messages.
-pub async fn ensure_model_pulled(
+async fn ensure_model_pulled(
     provider: &dyn Provider,
     model: &ModelMetadata,
     variant: &ModelVariant,
     ui: &dyn Ui,
 ) -> Result<PullResult, crate::providers::ProviderError> {
     provider.pull_model(model, variant, ui).await
+}
+
+/*-- private ---------------------------------------------------------------------*/
+
+/// Orders `recommend` rows, each paired with its variant size in GB, by
+/// size, largest first. MODEL_REGISTRY.entries() comes in no fixed order, so
+/// rows with the same size are ordered by model id, the first column.
+fn sort_recommend_rows(rows: &mut [(f64, Vec<String>)]) {
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1[0].cmp(&b.1[0])));
+}
+
+/// The `Config: Variant` value `model info` shows for a configured model.
+fn variant_field(variant: &Option<String>) -> String {
+    variant.clone().unwrap_or_else(|| "(not set)".to_string())
 }
 
 /*-- tests -----------------------------------------------------------------------*/
@@ -1462,7 +1473,7 @@ mod tests {
             name: "Test Provider".to_string(),
             description: "".to_string(),
             provider_type: ProviderType::Local,
-            default_endpoint: "http://localhost".to_string(),
+            default_base_urls: vec!["http://localhost".to_string()],
             supported_api_types: vec![],
             default_function_endpoints: std::collections::HashMap::new(),
             supported_formats: formats,
@@ -1901,6 +1912,32 @@ mod tests {
     }
 
     #[test]
+    fn recommend_rows_with_the_same_variant_size_are_ordered_by_id() {
+        let row = |size: f64, id: &str| (size, vec![id.to_string()]);
+        let mut rows = vec![
+            row(4.9, "granite-speech-3.2-8b"),
+            row(6.7, "granite-guardian-3.3-8b"),
+            row(4.9, "granite-3.0-8b-instruct"),
+            row(f64::MAX, "no-size"),
+            row(4.9, "granite-3.2-8b-instruct"),
+        ];
+
+        sort_recommend_rows(&mut rows);
+
+        let ids: Vec<&str> = rows.iter().map(|(_, r)| r[0].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "no-size",
+                "granite-guardian-3.3-8b",
+                "granite-3.0-8b-instruct",
+                "granite-3.2-8b-instruct",
+                "granite-speech-3.2-8b",
+            ]
+        );
+    }
+
+    #[test]
     fn recommend_default_with_gguf_only_provider_excludes_non_gguf_models() {
         let with_all = ctx_with_config(Config::default());
         ModelCommands::recommend(
@@ -2249,6 +2286,43 @@ mod tests {
             fields2
                 .iter()
                 .any(|(k, v)| k == "Config: Type" && v == "custom")
+        );
+        assert!(
+            fields2
+                .iter()
+                .any(|(k, v)| k == "Config: Provider" && v == "ollama"),
+            "{fields2:?}"
+        );
+        assert!(
+            fields2
+                .iter()
+                .any(|(k, v)| k == "Config: Variant" && v == "(not set)"),
+            "{fields2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn info_shows_the_configured_variant_as_written() {
+        let mut ctx = ctx_with_custom_model(
+            "my-custom",
+            serde_json::json!({ "family": "My Local Model" }),
+            None,
+        );
+        ctx.config_mut()
+            .models
+            .get_mut("my-custom")
+            .unwrap()
+            .variant = Some("GGUF/Q8_0".to_string());
+
+        ModelCommands::info(&mut ctx, "my-custom").await.unwrap();
+
+        let details = details!(ctx);
+        let (_, fields) = &details[1];
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| k == "Config: Variant" && v == "GGUF/Q8_0"),
+            "{fields:?}"
         );
     }
 

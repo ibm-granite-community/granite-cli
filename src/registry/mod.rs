@@ -1,12 +1,12 @@
 mod secret;
-pub use secret::Secret;
+pub(crate) use secret::Secret;
 
 /*-- Generic Factory Infrastructure ------------------------------------------*/
 
 /// Unit struct for types that have no structured config.
 /// Used by test doubles and impls that genuinely have no config to declare.
 #[derive(schemars::JsonSchema, serde::Serialize, serde::Deserialize, Default)]
-pub struct NoConfig {}
+pub(crate) struct NoConfig {}
 
 /// Why a factory could not produce an instance.
 ///
@@ -14,7 +14,7 @@ pub struct NoConfig {}
 /// the message: an unregistered type name is a different problem, with a
 /// different repair, from settings that cannot be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConstructError {
+pub(crate) enum ConstructError {
     /// The name given is not a key in this kind's registry.
     UnknownType { type_name: String },
     /// The settings blob does not produce an instance of this type, because
@@ -27,7 +27,7 @@ impl ConstructError {
     /// Report settings that cannot be read. `detail` is whatever the
     /// deserialiser or the builder said; the caller that names the instance
     /// adds the rest.
-    pub fn settings(detail: impl std::fmt::Display) -> Self {
+    pub(crate) fn settings(detail: impl std::fmt::Display) -> Self {
         Self::Settings {
             detail: detail.to_string(),
         }
@@ -47,7 +47,7 @@ impl std::error::Error for ConstructError {}
 
 /// Core trait that all factory-managed types must implement.
 /// Provides construction from a configuration object.
-pub trait ConfigConstructable {
+pub(crate) trait ConfigConstructable {
     /// The structured config type for this implementation.
     /// Must implement `JsonSchema + Serialize + Default`.
     type Config: schemars::JsonSchema + serde::Serialize + Default;
@@ -72,6 +72,11 @@ pub trait ConfigConstructable {
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError>
     where
         Self: Sized;
+
+    /// Return the serialized default configuration for this implementation.
+    fn default_config() -> serde_json::Value {
+        serde_json::to_value(Self::Config::default()).unwrap_or_default()
+    }
 }
 
 /// Lets a factory-constructed instance report the configured name it was built
@@ -82,7 +87,7 @@ pub trait ConfigConstructable {
 /// The value is whatever `instance_id` was passed to
 /// [`ConfigConstructable::new`], so it round-trips the config key that produced
 /// the instance.
-pub trait Named {
+pub(crate) trait Named {
     fn instance_id(&self) -> &str;
 }
 
@@ -165,7 +170,7 @@ macro_rules! define_factory {
 
             /// Trait that implementations must provide to supply metadata.
             /// This is the public interface for implementations to describe themselves.
-            pub trait [<Has $trait Metadata>] {
+            pub(crate) trait [<Has $trait Metadata>] {
                 /// Return metadata describing this implementation
                 fn metadata() -> $metadata;
             }
@@ -198,8 +203,7 @@ macro_rules! define_factory {
                 }
 
                 fn default_config(&self) -> serde_json::Value {
-                    serde_json::to_value(<T as ConfigConstructable>::Config::default())
-                        .unwrap_or_default()
+                    T::default_config()
                 }
             }
 
@@ -211,7 +215,7 @@ macro_rules! define_factory {
             /// - Construct instances by name
             /// - Query metadata
             /// - List all registered implementations
-            pub struct $factory {
+            pub(crate) struct $factory {
                 registry: std::collections::HashMap<&'static str, Box<dyn [<$trait Metadata_>]>>,
             }
 
@@ -333,19 +337,18 @@ macro_rules! define_factory {
                     self.registry.get(name).map(|x| x.config_schema())
                 }
 
-                /// Get the default config value for a specific implementation by name.
+                /// Returns the default config for the named registration, or an
+                /// empty object if the name is not registered.
                 ///
                 /// # Arguments
                 ///
                 /// * `name` - The name of the implementation
-                ///
-                /// # Returns
-                ///
-                /// * `Some(value)` - Default config value, if found
-                /// * `None` - If name not registered
                 #[allow(unused)]
-                pub(crate) fn default_config(&self, name: &str) -> Option<serde_json::Value> {
-                    self.registry.get(name).map(|x| x.default_config())
+                pub(crate) fn default_config(&self, name: &str) -> serde_json::Value {
+                    self.registry
+                        .get(name)
+                        .map(|x| x.default_config())
+                        .unwrap_or_else(|| serde_json::json!({}))
                 }
             }
         }
@@ -647,7 +650,7 @@ mod tests {
         factory.register::<TestImpl1>("impl1");
 
         // TestImpl1 uses NoConfig, which serializes to an empty object.
-        let value = factory.default_config("impl1").unwrap();
+        let value = factory.default_config("impl1");
         assert_eq!(value, serde_json::json!({}));
     }
 
@@ -656,13 +659,13 @@ mod tests {
         let mut factory = TestTraitFactory::new();
         factory.register::<TestImpl2>("impl2");
 
-        let value = factory.default_config("impl2").unwrap();
+        let value = factory.default_config("impl2");
         assert_eq!(value, serde_json::json!({ "value": 0 }));
     }
 
     #[test]
     fn test_default_config_unknown() {
         let factory = TestTraitFactory::new();
-        assert!(factory.default_config("unknown").is_none());
+        assert_eq!(factory.default_config("unknown"), serde_json::json!({}));
     }
 }
