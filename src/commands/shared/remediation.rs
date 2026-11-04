@@ -156,7 +156,7 @@ pub(crate) fn confirm_removal(
         Some(DependentsPolicy::Refuse) | None if !ctx.ui.is_interactive() => {
             anyhow::bail!(
                 "Cannot remove {kind} '{id}' because other configured instances depend on it. \
-                 Pass --dependents cascade, --dependents discovered, --dependents leave, or \
+                 Pass --dependents cascade, --dependents leave, or \
                  --dependents refuse."
             );
         }
