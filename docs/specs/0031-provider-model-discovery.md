@@ -67,9 +67,6 @@ may remove anything.
    convention is brittle: users can type the same id, and catalog models can
    have provider aliases that do not look like their instance id.
 
-6. **Still no registered Anthropic provider.** `src/providers/anthropic.rs` is
-   untracked and not compiled. Anthropic discovery is out of scope.
-
 ## Configuration
 
 Each supporting provider's config struct gains a field (default `true` for
