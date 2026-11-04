@@ -496,7 +496,7 @@ impl ModelCommands {
             let provider_id = if model_config.discovered.is_some() {
                 format!(
                     "({}) {}",
-                    crate::utils::ui::DISCOVERED_MARK,
+                    ctx.ui.warn_mark(crate::utils::ui::DISCOVERED_MARK),
                     model_config.provider_id
                 )
             } else {
