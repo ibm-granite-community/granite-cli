@@ -585,6 +585,13 @@ path benefits most from parallel listing.
   `SOURCE` column (`catalog` / `custom` / `discovered`) from
   `ModelConfig.discovered`.
 - `model info`: `Config: Discovered from`, `Config: Wire name`.
+- Discovered vs configured models use one marker, `⌕` (U+2315, magnifying
+  glass), defined once as `DISCOVERED_MARK`:
+  - `model list` table: the `PROVIDER` cell of a discovered model is
+    prefixed, e.g. `(⌕) llama-cpp-pgx`; a configured model shows just
+    `llama-cpp-pgx`.
+  - TUI Models view: the marker column shows a magenta `⌕` for discovered
+    models instead of the green `✓` used for other configured models.
 
 ### Read-only inspection
 
