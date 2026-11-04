@@ -492,12 +492,16 @@ impl ModelCommands {
             {
                 continue;
             }
-            let provider_id = ctx
-                .config()
-                .get_model(&instance_id)
-                .unwrap()
-                .provider_id
-                .clone();
+            let model_config = ctx.config().get_model(&instance_id).unwrap();
+            let provider_id = if model_config.discovered.is_some() {
+                format!(
+                    "({}) {}",
+                    crate::utils::ui::DISCOVERED_MARK,
+                    model_config.provider_id
+                )
+            } else {
+                model_config.provider_id.clone()
+            };
             let row = vec![
                 instance_id.clone(),
                 md.family.clone(),
