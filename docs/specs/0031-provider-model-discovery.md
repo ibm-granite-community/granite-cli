@@ -36,21 +36,6 @@ What "true" means:
 A failed or partial listing changes nothing. Only a complete, parsed response
 may remove anything.
 
-## What changed from the previous draft
-
-- The flag moved from `ProviderConfig` to each provider type's config struct.
-  No `ProviderConfig` literal churn; defaults are per type and schema-prompted.
-- No `ProviderMetadata.supports_model_discovery` and no
-  `DiscoveryUnsupported` validation problem: a type that does not have the
-  field cannot sync.
-- No tombstones, no `discover_ignore`, no `missing` marker. A successful
-  listing is trusted; absent means removed.
-- v1 is three local providers with provider-specific parsers. No shared
-  OpenAI-shape parser and no `models_endpoint` setting.
-- `model remove` refuses discovery-managed models while discovery is on, so
-  removal has exactly one owner.
-- `ModelConfig.discovered` is the only provenance mechanism (unchanged).
-
 ## Constraints found in the code
 
 1. **Config loading is synchronous and offline.** `Config::new()`
