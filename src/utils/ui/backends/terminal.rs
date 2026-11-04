@@ -362,70 +362,95 @@ fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Split a cell string into (prefix_ansi, content, suffix_ansi).
-/// Example: "\x1b[33m\x1b[1mPartial\x1b[0m" → ("\x1b[33m\x1b[1m", "Partial", "\x1b[0m")
-/// Plain text: "hello" → ("", "hello", "")
-fn split_cell_ansi(s: &str) -> (&str, &str, &str) {
-    let bytes = s.as_bytes();
-    let mut prefix_end = 0;
-
-    // Collect CSI sequences at the start
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            i += 1; // skip ESC
-            if i < bytes.len() {
-                i += 1; // skip introducer
+/// Split a styled string into its visible text and, for each character, the
+/// escape sequences active at that character. A reset (`ESC[0m`) clears the
+/// active style; any other escape sequence adds to it. Escape sequences have
+/// no width, so the text can be measured and wrapped as plain text.
+fn parse_styled(s: &str) -> (String, Vec<String>) {
+    let mut text = String::new();
+    let mut styles = Vec::new();
+    let mut active = String::new();
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if c == '\x1b' {
+            // ESC + introducer (e.g. '[') + args + final letter
+            let mut end = 1;
+            let mut chars = rest[1..].chars();
+            if let Some(intro) = chars.next() {
+                end += intro.len_utf8();
             }
-            while i < bytes.len() {
-                let b = bytes[i];
-                if (0x41..=0x5A).contains(&b) || (0x61..=0x7A).contains(&b) {
-                    i += 1;
+            for ch in chars {
+                end += ch.len_utf8();
+                if ch.is_ascii_alphabetic() {
                     break;
                 }
-                i += 1;
             }
-            prefix_end = i;
+            let seq = &rest[..end];
+            if seq == "\x1b[0m" {
+                active.clear();
+            } else {
+                active.push_str(seq);
+            }
+            rest = &rest[end..];
         } else {
-            break;
+            text.push(c);
+            styles.push(active.clone());
+            rest = &rest[c.len_utf8()..];
         }
     }
-
-    // Check for trailing reset sequence
-    let mut suffix_start = s.len();
-    if suffix_start > prefix_end && s[prefix_end..].ends_with("\x1b[0m") {
-        suffix_start = prefix_end + s[prefix_end..].len() - 4;
-    }
-
-    (
-        &s[..prefix_end],
-        &s[prefix_end..suffix_start],
-        &s[suffix_start..],
-    )
+    (text, styles)
 }
 
 /// Wrap a cell string with ANSI awareness, optionally applying grey row styling.
+///
+/// The cell is wrapped as plain text, then each line is rebuilt with the
+/// styles its characters had, so a style may begin and end anywhere in the
+/// cell, including across a line break. Grey is re-applied after every reset.
 fn wrap_ansi_cell(s: &str, max_width: usize, is_grey_row: bool) -> Vec<String> {
-    let (prefix, content, suffix) = split_cell_ansi(s);
-    let lines = wrap_text(content, max_width);
+    let (text, styles) = parse_styled(s);
+    let grey = if is_grey_row {
+        SetForegroundColor(Color::Grey).to_string()
+    } else {
+        String::new()
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut pos = 0;
 
-    lines
+    wrap_text(&text, max_width)
         .into_iter()
         .map(|line| {
-            let padding = max_width.saturating_sub(char_len(&line));
-            let padded = format!("{}{}", line, " ".repeat(padding));
-            if is_grey_row {
-                format!(
-                    "{}{}{}{}{}",
-                    SetForegroundColor(Color::Grey),
-                    prefix,
-                    padded,
-                    suffix,
-                    ResetColor
-                )
-            } else {
-                format!("{prefix}{padded}{suffix}")
+            // The wrap drops the whitespace it breaks at; skip it here too.
+            // A line that starts with whitespace kept it (a cell that fits
+            // is returned as is), so there is nothing to skip.
+            if !line.starts_with(char::is_whitespace) {
+                while pos < chars.len() && chars[pos].is_whitespace() {
+                    pos += 1;
+                }
             }
+            let len = char_len(&line);
+            let mut out = grey.clone();
+            let mut current = "";
+            for i in pos..(pos + len).min(chars.len()) {
+                if styles[i] != current {
+                    if !current.is_empty() {
+                        out.push_str(&format!("{ResetColor}"));
+                        out.push_str(&grey);
+                    }
+                    current = &styles[i];
+                    out.push_str(current);
+                }
+                out.push(chars[i]);
+            }
+            pos += len;
+            if !current.is_empty() {
+                out.push_str(&format!("{ResetColor}"));
+                out.push_str(&grey);
+            }
+            out.push_str(&" ".repeat(max_width.saturating_sub(len)));
+            if is_grey_row {
+                out.push_str(&format!("{ResetColor}"));
+            }
+            out
         })
         .collect()
 }
@@ -476,10 +501,13 @@ fn fit_widths(
     }
 
     // columns[c][r] is the text of row r in column c, without its styling.
-    let columns: Vec<Vec<&str>> = (0..col_count)
+    let columns: Vec<Vec<String>> = (0..col_count)
         .map(|c| {
             rows.iter()
-                .map(|row| row.get(c).map_or("", |cell| split_cell_ansi(cell).1))
+                .map(|row| {
+                    row.get(c)
+                        .map_or_else(String::new, |cell| parse_styled(cell).0)
+                })
                 .collect()
         })
         .collect();
@@ -759,6 +787,54 @@ mod tests {
             vec!["⚠ local (not set)"]
         );
         assert_eq!(wrap_text("⚠⚠⚠⚠⚠⚠", 4), vec!["⚠⚠⚠⚠", "⚠⚠"]);
+    }
+
+    #[test]
+    fn wrap_ansi_cell_keeps_whitespace_in_a_cell_that_fits() {
+        assert_eq!(wrap_ansi_cell(" ", 4, false), vec!["    "]);
+        assert_eq!(wrap_ansi_cell(" a", 4, false), vec![" a  "]);
+        assert_eq!(wrap_ansi_cell("", 4, false), vec!["    "]);
+    }
+
+    #[test]
+    fn wrap_ansi_cell_handles_style_in_the_middle() {
+        let cell = "(\x1b[35m⌕\x1b[0m) name";
+        // Fits: one line, styled icon kept, padded to the column width.
+        let lines = wrap_ansi_cell(cell, 12, false);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "(\x1b[35m⌕\x1b[0m) name    ");
+        assert_eq!(visible_len(&lines[0]), 12);
+    }
+
+    #[test]
+    fn wrap_ansi_cell_keeps_style_across_a_line_break() {
+        let cell = "\x1b[35mone two\x1b[0m three";
+        let lines = wrap_ansi_cell(cell, 5, false);
+        assert_eq!(
+            lines,
+            vec!["\x1b[35mone\x1b[0m  ", "\x1b[35mtwo\x1b[0m  ", "three"]
+        );
+    }
+
+    #[test]
+    fn wrap_ansi_cell_reapplies_grey_after_a_reset() {
+        let grey = SetForegroundColor(Color::Grey).to_string();
+        let cell = "a\x1b[35mb\x1b[0mc";
+        let lines = wrap_ansi_cell(cell, 3, true);
+        assert_eq!(
+            lines,
+            vec![format!("{grey}a\x1b[35mb{ResetColor}{grey}c{ResetColor}")]
+        );
+    }
+
+    #[test]
+    fn fit_widths_ignores_styles_in_the_middle_of_a_cell() {
+        let styled = cells(&[&["(\x1b[35m⌕\x1b[0m) abc", "x"]]);
+        let plain = cells(&[&["(⌕) abc", "x"]]);
+        assert_eq!(
+            fit_widths(vec![7, 1], &["A", "B"], &styled, 8),
+            fit_widths(vec![7, 1], &["A", "B"], &plain, 8)
+        );
     }
 
     #[test]
