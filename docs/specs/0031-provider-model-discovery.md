@@ -86,6 +86,15 @@ fn default_discover_models() -> bool { true }
 `OpenAIProviderConfig`, `OpenRouterProviderConfig`, and any future Anthropic
 provider do not have it in v1. When OpenRouter is added, default `false`.
 
+The default is a **setup-time** default only. It applies when a config is first
+written (`provider setup`, `--auto`, via `Default`/`default_config`). On read,
+a stored config with no `discover_models` predates the field and means
+**`false`**, whatever the type's setup default is. Otherwise upgrading would
+silently turn on a full mirror (and config writes) for providers the user
+configured before discovery existed. So the serde field uses plain
+`#[serde(default)]` (false), `discovery_enabled(config)` does not consult the
+type default, and reconfiguring pre-fills an absent value as `false` too.
+
 Consequences of putting it in the type config:
 
 - `prompt_from_schema` asks it during `provider setup`, using the existing
@@ -414,6 +423,18 @@ Empty successful list: every managed model is removed. That is correct for a
 local server with nothing installed, and follows from trusting a successful
 call. The response shape must be the expected one (`data`/`models` array); a
 malformed or failed call is not empty.
+
+### Disabling discovery removes discovered models
+
+Sync of a provider with discovery off is a no-op, so on its own it would leave
+previously discovered models behind with no way to clear them. When the user
+explicitly reconfigures a provider (`provider setup`) with `discover_models`
+false, setup removes **every** model whose `discovered.provider_id` is that
+provider, without contacting the provider (it may be down, and a listing is not
+needed to know what to remove). Catalog and hand-made models are untouched.
+Dependents are warned about and not cascaded, as in Removals above. Later
+syncs (`provider health --sync`, launch) still skip providers with discovery
+off and never remove anything themselves.
 
 ### `model remove` and discovered models
 
@@ -746,3 +767,7 @@ Sync/command tests (local server + temp home):
 7. **`model remove` escape hatch.** Refuse while the flag is on, with advice to
    disable discovery first. If the provider is missing or cannot be built,
    removal is allowed because no sync can re-add the model.
+8. **Absent means off on read.** `discover_models` defaults to `true` only at
+   setup; a stored config without it reads as `false`.
+9. **Explicit opt-out cleans up.** Reconfiguring with `discover_models: false`
+   removes all models discovered for that provider, offline.
