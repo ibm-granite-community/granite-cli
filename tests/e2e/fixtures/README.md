@@ -30,3 +30,15 @@ them in `NOTES` and exits 0.
 | model | `unknown-type` | `model_type: no-such-type`, not in the catalog |
 | capability | `sub-agent-explore` | `model_id: missing-model`, not configured |
 | launcher | `opencode` | enables `agent-model`, not configured |
+
+## hardware
+
+Hardware profiles and nothing else. `local` is in manual mode with no
+recorded detection, so commands use its figures and never compare them with
+this machine: no result depends on the machine the test runs on.
+
+| Id | Type | Memory |
+|---|---|---|
+| `local` | `local`, manual | system 32.0 GB |
+| `box` | `custom` | discrete 24.0 GB |
+| `spark` | `dgx-spark` (catalog) | 128.0 GB |
