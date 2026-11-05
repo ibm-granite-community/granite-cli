@@ -151,22 +151,15 @@ impl crate::dependency::Configured<dyn Provider> for ProviderSource {
 
 /*-- Model discovery ---------------------------------------------------------*/
 
-/// Whether a provider instance's type config has discovery on, applying the
-/// type's default when the field is absent. Reads configuration only, so a
-/// provider whose discovery is off is never constructed (and no TLS client is
-/// built for a hosted type that does not support discovery).
-///
-/// `provider_type` is the registry key, not the instance id.
-pub(crate) fn discovery_enabled(provider_type: &str, config: &serde_json::Value) -> bool {
+/// Whether a provider instance's stored config has discovery on. An absent
+/// field means off: the type's setup default applies only when a config is
+/// first written, never to a config that predates the field. Reads
+/// configuration only, so a provider whose discovery is off is never
+/// constructed.
+pub(crate) fn discovery_enabled(config: &serde_json::Value) -> bool {
     config
         .get("discover_models")
         .and_then(|value| value.as_bool())
-        .or_else(|| {
-            PROVIDER_REGISTRY
-                .default_config(provider_type)
-                .get("discover_models")
-                .and_then(|value| value.as_bool())
-        })
         .unwrap_or(false)
 }
 
@@ -303,25 +296,22 @@ mod tests {
     }
 
     #[test]
-    fn discovery_enabled_uses_the_type_default_when_the_field_is_absent() {
-        // An Ollama config written before the field existed still gets the
-        // local default (on), while types without the field stay off.
-        assert!(discovery_enabled(
-            "ollama",
-            &serde_json::json!({ "base_url": "http://localhost:11434" })
-        ));
-        assert!(!discovery_enabled(
-            "openai-compatible",
-            &serde_json::json!({ "base_url": "http://localhost:8000" })
-        ));
-        assert!(!discovery_enabled("openrouter", &serde_json::json!({})));
+    fn discovery_enabled_is_off_when_the_field_is_absent() {
+        // A stored config that predates the field stays off, whatever the
+        // type's setup default is.
+        assert!(!discovery_enabled(&serde_json::json!({
+            "base_url": "http://localhost:11434"
+        })));
+        assert!(!discovery_enabled(&serde_json::json!({})));
     }
 
     #[test]
     fn discovery_enabled_honours_an_explicit_false() {
-        assert!(!discovery_enabled(
-            "ollama",
-            &serde_json::json!({ "discover_models": false })
-        ));
+        assert!(!discovery_enabled(&serde_json::json!({
+            "discover_models": false
+        })));
+        assert!(discovery_enabled(&serde_json::json!({
+            "discover_models": true
+        })));
     }
 }

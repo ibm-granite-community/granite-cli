@@ -106,6 +106,58 @@ pub(crate) async fn sync_providers(
     reports
 }
 
+/// Removes every model discovery created for the provider, without asking it
+/// anything. Used when the user explicitly turns discovery off, so nothing the
+/// provider once reported lingers. Models not marked `discovered` are kept.
+pub(crate) fn remove_discovered(ctx: &mut crate::AppContext, provider_id: &str) -> SyncReport {
+    let mut report = SyncReport {
+        provider_id: provider_id.to_string(),
+        status: SyncStatus::Skipped,
+        added: Vec::new(),
+        removed: Vec::new(),
+        present: 0,
+        conflicts: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let mut removals: Vec<String> = ctx
+        .config()
+        .models
+        .iter()
+        .filter(|(_, model)| {
+            model
+                .discovered
+                .as_ref()
+                .is_some_and(|d| d.provider_id == provider_id)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    removals.sort();
+    if removals.is_empty() {
+        return report;
+    }
+    for removed in &removals {
+        let refs = dependents(RefKind::Model, removed, ctx.config());
+        if !refs.is_empty() {
+            let names = refs
+                .iter()
+                .map(|(kind, id)| format!("{kind} '{id}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            report
+                .warnings
+                .push(format!("removed '{removed}', still referenced by {names}"));
+        }
+    }
+    if let Err(error) = ctx.config_mut().apply_model_changes(Vec::new(), &removals) {
+        report.warnings.push(format!(
+            "failed to save removal of discovered models: {error}"
+        ));
+    }
+    report.status = SyncStatus::Synced;
+    report.removed = removals;
+    report
+}
+
 /// The providers whose models the launcher's enabled capabilities name.
 /// Sorted and deduped. Used to keep launch-time sync bounded to what the
 /// launch will actually use.
@@ -204,10 +256,7 @@ async fn prepare_one(ctx: &crate::AppContext, provider_id: &str) -> PreparedSync
             plan_input: None,
         };
     };
-    let discover_on = crate::providers::discovery_enabled(
-        &provider_config.provider_type,
-        &provider_config.config,
-    );
+    let discover_on = crate::providers::discovery_enabled(&provider_config.config);
     if !discover_on {
         return PreparedSync {
             report,
@@ -672,6 +721,34 @@ mod tests {
         let reloaded = Config::new().unwrap();
         assert!(reloaded.get_model("granite:8b").is_some());
         assert!(reloaded.get_model("llama3:8b").is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_discovered_drops_only_that_providers_discovered_models() {
+        let _home = crate::config::TestConfigHome::new();
+        let state = std::sync::Arc::new(TestState {
+            tags: std::sync::Mutex::new(serde_json::json!({
+                "models": [
+                    { "name": "granite:8b", "model": "granite:8b", "size": 1u64, "details": { "parameter_size": "8.0B" } }
+                ]
+            })),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let base_url = discovery_server(state.clone()).await;
+        let mut ctx = crate::AppContext::new(
+            config_with_ollama("p", &base_url, true),
+            Arc::new(CaptureUi::default()),
+        );
+        sync_providers(&mut ctx, &["p".to_string()]).await;
+        assert!(ctx.config().get_model("granite:8b").is_some());
+
+        let report = remove_discovered(&mut ctx, "p");
+        assert_eq!(report.removed, vec!["granite:8b".to_string()]);
+        assert!(ctx.config().get_model("granite:8b").is_none());
+        assert!(Config::new().unwrap().get_model("granite:8b").is_none());
+        // The listing was never requested again.
+        assert_eq!(state.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

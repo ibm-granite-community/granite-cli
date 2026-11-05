@@ -37,7 +37,10 @@ pub(crate) struct OllamaProviderConfig {
     pub(crate) health_check_endpoint: String,
 
     /// Mirror the models this server reports into configured models.
-    #[serde(default = "default_discover_models")]
+    ///
+    /// A stored config without the field predates discovery and stays off;
+    /// only a fresh setup (see `Default`) starts with it on.
+    #[serde(default)]
     pub(crate) discover_models: bool,
 }
 

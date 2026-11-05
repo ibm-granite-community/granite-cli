@@ -89,8 +89,7 @@ impl ProviderCommands {
                     .and_then(|v| v.as_str())
                     .unwrap_or("-")
                     .to_string();
-                let discovery =
-                    crate::providers::discovery_enabled(&cfg.provider_type, &cfg.config);
+                let discovery = crate::providers::discovery_enabled(&cfg.config);
                 vec![
                     id.clone(),
                     cfg.provider_type.clone(),
@@ -311,11 +310,20 @@ impl ProviderCommands {
         ));
         // The schema prompt already asked whether to discover models; honour
         // it now that the provider is saved and reachable.
-        let reports = crate::commands::shared::discovery::sync_providers(
-            ctx,
-            std::slice::from_ref(&instance_id),
-        )
-        .await;
+        // An explicit opt-out also removes what discovery created before.
+        let reports =
+            if crate::providers::discovery_enabled(&ctx.config().providers[&instance_id].config) {
+                crate::commands::shared::discovery::sync_providers(
+                    ctx,
+                    std::slice::from_ref(&instance_id),
+                )
+                .await
+            } else {
+                vec![crate::commands::shared::discovery::remove_discovered(
+                    ctx,
+                    &instance_id,
+                )]
+            };
         for report in reports {
             match &report.status {
                 crate::commands::shared::discovery::SyncStatus::Synced => {
@@ -468,8 +476,9 @@ impl ProviderCommands {
 /*-- private -------------------------------------------------------------------*/
 
 /// The values to pre-fill the config prompt with. The type's defaults fill in
-/// fields an older config does not have yet (notably `discover_models`), so
-/// reconfiguring does not silently invert a default the runtime still uses.
+/// fields an older config does not have yet, except `discover_models`: a stored
+/// config without it has discovery off, so the prompt shows that rather than
+/// the type's setup default.
 fn prompt_defaults(
     provider_type: &str,
     existing: Option<&crate::config::ProviderConfig>,
@@ -483,6 +492,9 @@ fn prompt_defaults(
     {
         for (key, value) in existing {
             defaults.insert(key.clone(), value.clone());
+        }
+        if defaults.contains_key("discover_models") && !existing.contains_key("discover_models") {
+            defaults.insert("discover_models".to_string(), false.into());
         }
     }
     defaults
@@ -652,7 +664,10 @@ mod tests {
             ProviderConfig {
                 provider_id: "local-ollama".to_string(),
                 provider_type: "ollama".to_string(),
-                config: serde_json::json!({ "base_url": "http://localhost:11434" }),
+                config: serde_json::json!({
+                    "base_url": "http://localhost:11434",
+                    "discover_models": true
+                }),
             },
         );
         ctx.config_mut().providers.insert(
@@ -827,7 +842,7 @@ mod tests {
     // -- setup -----------------------------------------------------------------
 
     #[test]
-    fn setup_defaults_fill_a_missing_discover_models_from_the_type_default() {
+    fn setup_defaults_treat_a_missing_discover_models_as_off() {
         let existing = ProviderConfig {
             provider_id: "old-ollama".to_string(),
             provider_type: "ollama".to_string(),
@@ -835,7 +850,7 @@ mod tests {
         };
         let defaults = prompt_defaults("ollama", Some(&existing));
         assert_eq!(defaults["base_url"], "http://old:11434");
-        assert_eq!(defaults["discover_models"], true);
+        assert_eq!(defaults["discover_models"], false);
     }
 
     #[test]
