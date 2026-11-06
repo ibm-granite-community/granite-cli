@@ -1,5 +1,6 @@
 pub(crate) mod capabilities;
 pub(crate) mod hardware;
+pub(crate) mod hardware_catalog;
 pub(crate) mod shell;
 pub(crate) mod subserver;
 mod traits;
