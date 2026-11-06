@@ -90,6 +90,16 @@ impl Provider for ProxiedProvider {
     ) -> Result<PullResult, ProviderError> {
         self.inner.pull_model(model, variant, ui).await
     }
+
+    fn discover_models(&self) -> bool {
+        self.inner.discover_models()
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ProviderModel>, ProviderError> {
+        // Reads the real upstream through `inner`'s own base URL, not the
+        // session proxy this wrapper points at.
+        self.inner.list_models().await
+    }
 }
 
 /*-- tests --*/

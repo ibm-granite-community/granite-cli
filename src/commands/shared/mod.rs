@@ -1,6 +1,7 @@
 //! Behaviour shared by several command modules, for what is not itself a
 //! top-level sub-command.
 
+pub(crate) mod discovery;
 pub(crate) mod remediation;
 
 /*-- public --------------------------------------------------------------------*/
