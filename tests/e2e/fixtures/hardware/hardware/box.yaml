@@ -1,0 +1,5 @@
+hardware_id: box
+type: custom
+config:
+  memory_kind: discrete
+  vram_gb: 24.0

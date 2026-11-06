@@ -179,6 +179,7 @@ mod tests {
 
     fn openai_provider_config(id: &str, base_url: &str) -> ProviderConfig {
         ProviderConfig {
+            hardware: Default::default(),
             provider_id: id.to_string(),
             provider_type: "openai-compatible".to_string(),
             config: serde_json::json!({ "base_url": base_url }),
@@ -210,6 +211,7 @@ mod tests {
         config.providers.insert(
             "ollama".to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({ "timeout_secs": "ten" }),
@@ -230,6 +232,7 @@ mod tests {
         config.providers.insert(
             "mystery".to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "mystery".to_string(),
                 provider_type: "not-a-provider-type".to_string(),
                 config: serde_json::json!({}),
