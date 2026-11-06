@@ -20,6 +20,7 @@ use crate::dependency::Configured;
 use crate::models::{MODEL_REGISTRY, ModelMetadata};
 use crate::providers::PROVIDER_REGISTRY;
 use crate::utils::Searchable;
+use crate::utils::ui::DISCOVERED_MARK;
 use crate::utils::ui::hints::{Hint, render_hints};
 use crate::utils::ui::setup_pane::SetupPane;
 use crate::utils::ui::tui::{restore_terminal, setup_terminal};
@@ -1150,6 +1151,15 @@ impl App {
                     .map(|k| k.as_str())
                     .collect();
 
+                let discovered_ids: std::collections::HashSet<&str> = self
+                    .ctx
+                    .config()
+                    .models
+                    .iter()
+                    .filter(|(_, m)| m.discovered.is_some())
+                    .map(|(k, _)| k.as_str())
+                    .collect();
+
                 // When a search is active, use search_rows (shows MATCHED ON,
                 // sorted by match priority).  Without a query, use catalog_rows
                 // filtered by filtered_ids (respects configured_only).
@@ -1192,7 +1202,9 @@ impl App {
                         } else {
                             Style::default().bg(Color::Rgb(20, 20, 20))
                         };
-                        let marker = if configured_ids.contains(r[0].as_str()) {
+                        let marker = if discovered_ids.contains(r[0].as_str()) {
+                            Cell::from(DISCOVERED_MARK).style(Style::default().fg(Color::Magenta))
+                        } else if configured_ids.contains(r[0].as_str()) {
                             Cell::from("✓").style(Style::default().fg(Color::Green))
                         } else {
                             Cell::from("")
@@ -2776,6 +2788,7 @@ mod tests {
         config.models.insert(
             "my-local-model".to_string(),
             crate::config::ModelConfig {
+                discovered: None,
                 model_id: "my-local-model".to_string(),
                 model_type: "custom".to_string(),
                 provider_id: "local-openai".to_string(),
