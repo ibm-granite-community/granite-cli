@@ -622,9 +622,9 @@ classDiagram
 Solid arrows are references stored in configuration or in the catalog. The
 dashed arrow is a read at run time.
 
-The catalog is plain data: `build.rs` embeds `resources/hardware.yaml` and
-checks that it parses, and the binary parses it once, as it does for
-recommended configurations. A configured hardware profile has the same shape
+The catalog is plain data: `build.rs` reads `resources/hardware.yaml` and
+generates a static list of entries, as it does for the model catalog, so a
+malformed file fails the build and nothing is parsed at run time. A configured hardware profile has the same shape
 as a configured model: an id, a type, a selector (`memory`, where a model has
 `variant`) and a `config` blob, which holds the figures for custom and local
 profiles and the mode for `local`. The optional `headroom` sits next to
@@ -835,9 +835,9 @@ Ship a catalog of known devices in the binary.
 `resources/hardware.yaml` lists devices as plain data, each with its family,
 the memory sizes it is sold in and, for unified memory, the GPU-addressable
 figure for each size. Apple sizes other than 64 GB use the measured 81%
-ratio, and the file says which figures were measured. `build.rs` embeds the
-file and fails the build if it does not parse or an entry names no family.
-The binary parses it once, on first use.
+ratio, and the file says which figures were measured. `build.rs` generates the
+catalog from the file as a static list, and fails the build if the file does
+not parse or an entry names no family.
 
 Tests cover: every entry declaring at least one size, each with `memory_gb`
 above 0, and naming a family; unique ids; one entry
@@ -846,8 +846,8 @@ giving the same usable memory as a detected profile with the measured working
 set.
 
 **Relevant Context**
-- `build.rs` (how `resources/recommended_configs` is embedded)
-- `src/config/recommended_config.rs` (`BUILTIN_RECOMMENDED_CONFIGS`)
+- `build.rs` (`generate_models_code`: how `resources/models.yaml` becomes code)
+- `src/models/mod.rs` (the `include!` of the generated models)
 
 **Status** — `[x]` done
 

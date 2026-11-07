@@ -1,35 +1,27 @@
 //! The built-in hardware catalog: known devices and the memory sizes they are
-//! sold in, read from `resources/hardware.yaml`. `build.rs` and the tests check
-//! that the file parses.
-
-use serde::Deserialize;
+//! sold in. `build.rs` generates `HARDWARE_CATALOG` from
+//! `resources/hardware.yaml`, so a malformed file fails the build.
 
 use crate::utils::hardware::{HardwareProfile, Memory, MemoryKind};
 
 /*-- public --*/
 
-/// The catalog, parsed once on first use.
-pub(crate) static HARDWARE_CATALOG: std::sync::LazyLock<Vec<CatalogEntry>> =
-    std::sync::LazyLock::new(|| parse(CATALOG_YAML));
-
 /// One device in the catalog.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct CatalogEntry {
-    pub(crate) id: String,
-    pub(crate) name: String,
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
     /// The group the catalog is ordered and filtered by, such as "Apple
     /// Silicon".
-    pub(crate) family: String,
-    pub(crate) vendor: Option<String>,
+    pub(crate) family: &'static str,
+    pub(crate) vendor: Option<&'static str>,
     pub(crate) memory_kind: MemoryKind,
-    pub(crate) sizes: Vec<CatalogSize>,
+    pub(crate) sizes: &'static [CatalogSize],
 }
 
 /// One memory size a device is sold in, in GiB.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub(crate) struct CatalogSize {
     /// VRAM for discrete memory, the whole pool for unified memory, system
     /// RAM for system memory.
@@ -67,7 +59,7 @@ impl CatalogEntry {
     /// vendor. The OS and CPU are not known for a catalog device.
     pub(crate) fn profile(&self, size: &CatalogSize) -> HardwareProfile {
         let mut profile = HardwareProfile::with_memory(self.memory(size));
-        profile.gpu_vendor = self.vendor.clone();
+        profile.gpu_vendor = self.vendor.map(String::from);
         profile
     }
 
@@ -84,16 +76,9 @@ pub(crate) fn find(id: &str) -> Option<&'static CatalogEntry> {
     HARDWARE_CATALOG.iter().find(|e| e.id == id)
 }
 
-/*-- private --*/
-
-const CATALOG_YAML: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/resources/hardware.yaml"
-));
-
-fn parse(yaml: &str) -> Vec<CatalogEntry> {
-    serde_yaml::from_str(yaml).expect("resources/hardware.yaml is checked by build.rs")
-}
+// Defines `pub(crate) static HARDWARE_CATALOG: &[CatalogEntry]`, every entry of
+// `resources/hardware.yaml` in file order.
+include!(concat!(env!("OUT_DIR"), "/generated_hardware_catalog.rs"));
 
 /*-- tests --*/
 
@@ -110,7 +95,7 @@ mod tests {
     fn every_entry_declares_at_least_one_size_above_zero() {
         for e in HARDWARE_CATALOG.iter() {
             assert!(!e.sizes.is_empty(), "'{}' has no sizes", e.id);
-            for s in &e.sizes {
+            for s in e.sizes {
                 assert!(
                     s.memory_gb > 0.0,
                     "'{}' has a size of {} GiB",
@@ -132,8 +117,8 @@ mod tests {
     fn the_families_are_the_six_the_spec_names_in_order() {
         let mut families: Vec<&str> = vec![];
         for e in HARDWARE_CATALOG.iter() {
-            if families.last() != Some(&e.family.as_str()) {
-                families.push(&e.family);
+            if families.last() != Some(&e.family) {
+                families.push(e.family);
             }
         }
         assert_eq!(
@@ -157,12 +142,12 @@ mod tests {
             if e.family != current {
                 finished.insert(current);
                 assert!(
-                    !finished.contains(e.family.as_str()),
+                    !finished.contains(e.family),
                     "'{}' is apart from the rest of family '{}'",
                     e.id,
                     e.family
                 );
-                current = &e.family;
+                current = e.family;
             }
         }
     }
@@ -192,7 +177,7 @@ mod tests {
     #[test]
     fn only_unified_sizes_state_an_addressable_figure() {
         for e in HARDWARE_CATALOG.iter() {
-            for s in &e.sizes {
+            for s in e.sizes {
                 let unified = e.memory_kind == MemoryKind::Unified;
                 assert_eq!(
                     s.addressable_gb.is_some(),
