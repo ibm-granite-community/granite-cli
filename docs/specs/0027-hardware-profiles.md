@@ -674,8 +674,13 @@ Launch, validation, capabilities and launchers never read fit.
   small: `can_run_model` reads the provider's hardware profile. It changes the
   provider interface and every implementation, and is tracked as a follow-up
   (#225).
-- Estimating how a model splits across several GPUs. A hardware profile states
-  their total memory.
+- Machines with several GPUs. A hardware profile describes one machine with
+  one memory figure: a catalog profile is one device, and detection reads the
+  first GPU only. A custom profile can state the total memory of several
+  GPUs, but the estimate then counts the per-GPU overhead once and does not
+  check that the model can be split across them, so it can report a fit that
+  does not hold. Support for several devices per profile, in detection, the
+  catalog and the fit estimate, is left to a separate spec.
 - Changing the estimator's formula or its default headroom factors. A
   hardware profile can set its own factor (see "Overriding the headroom");
   granite-cli does not detect a factor or probe a machine for
