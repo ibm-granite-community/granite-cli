@@ -429,6 +429,10 @@ mod tests {
                 None,
             ))
         }
+
+        fn configured_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[test]
