@@ -8,10 +8,12 @@
 //! through from the user's directory -- and points the child process at it with
 //! `PI_CODING_AGENT_DIR`.
 
-use crate::capabilities::{AgentModelBinding, BindingType, ResolvedCapability, ToolName};
+use crate::capabilities::{
+    AgentModelBinding, BindingType, ModelProviderEntry, ResolvedCapability, ToolName,
+};
 use crate::launchers::base::{
-    EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command,
-    run_command_captured_killable,
+    EnvBinding, LaunchContext, Launcher, LauncherMetadata, base_url_for_endpoint, proxied_base_url,
+    run_command, run_command_captured_killable,
 };
 use crate::providers::ApiType;
 use crate::registry::{ConfigConstructable, ConstructError};
@@ -38,9 +40,11 @@ pub(crate) struct PiLauncherConfig {
     pub(crate) command_path: Option<String>,
 
     /// Extra keys merged (shallow, last-write-wins) into the generated Pi
-    /// provider entry -- e.g. `compat` flags or other provider-level
-    /// configuration a particular server needs. Necessary because the entry
-    /// is regenerated on every launch.
+    /// provider entries -- e.g. `compat` flags or other provider-level
+    /// configuration a particular server needs. Necessary because the
+    /// entries are regenerated on every launch. Applied uniformly to the
+    /// `agent-model` entry and every entry a `model-provider` capability
+    /// contributes.
     #[serde(default)]
     pub(crate) provider_overrides: Option<serde_json::Value>,
 }
@@ -49,6 +53,10 @@ pub(crate) struct PiLauncher {
     instance_id: String,
     config: PiLauncherConfig,
     bound_binding: Option<AgentModelBinding>,
+    /// One entry per API dialect a bound `ModelProviderCapability` exposes.
+    /// Each points at the session proxy and lists every model that dialect
+    /// can reach, so Pi's model picker shows them all.
+    bound_model_providers: Vec<ModelProviderEntry>,
 }
 
 impl ConfigConstructable for PiLauncher {
@@ -61,6 +69,7 @@ impl ConfigConstructable for PiLauncher {
             instance_id: instance_id.to_string(),
             config,
             bound_binding: None,
+            bound_model_providers: vec![],
         })
     }
 }
@@ -85,6 +94,28 @@ impl Launcher for PiLauncher {
                 "capability supports {:?} which this launcher does not support",
                 capability_types.difference(&supported).collect::<Vec<_>>()
             );
+        }
+
+        // Pi's `models.json` can declare the OpenAI and Anthropic dialects.
+        // Ordering is preference: a model its provider can serve both ways
+        // appears once, under OpenAI.
+        if capability_types.contains(&BindingType::ModelProvider) {
+            let request = crate::capabilities::BindingRequest::ModelProvider(
+                crate::capabilities::ModelProviderBindingRequest {
+                    supported_api_types: vec![ApiType::OpenAI, ApiType::Anthropic],
+                },
+            );
+            let binding = capability.bind(request).await?;
+            match binding {
+                crate::capabilities::Binding::ModelProvider(binding) => {
+                    self.bound_model_providers.extend(binding.providers);
+                }
+                other => anyhow::bail!(
+                    "expected a ModelProvider binding, got {:?}",
+                    other.binding_type()
+                ),
+            }
+            return Ok(());
         }
 
         // Pi speaks several API dialects, but `openai-completions` is the one
@@ -122,12 +153,13 @@ impl Launcher for PiLauncher {
     /// selectable once *some* credential resolves, so providers with no key get a
     /// placeholder -- local servers ignore it.
     async fn env_overlay(&self, ctx: &LaunchContext) -> anyhow::Result<Vec<EnvBinding>> {
-        let Some(binding) = &self.bound_binding else {
+        if self.bound_binding.is_none() && self.bound_model_providers.is_empty() {
             return Ok(vec![]);
-        };
-        let api_key_val = binding
-            .api_key
+        }
+        let api_key_val = self
+            .bound_binding
             .as_ref()
+            .and_then(|binding| binding.api_key.as_ref())
             .map(|api_key| api_key.0.clone())
             .filter(|key| !key.is_empty())
             .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_string());
@@ -169,7 +201,10 @@ impl HasPiLauncherMetadata for PiLauncher {
             name: "Pi CLI".to_string(),
             description: "Pi terminal coding agent harness".to_string(),
             default_command: "pi".to_string(),
-            supported_capabilities: HashSet::from([BindingType::AgentModel]),
+            supported_capabilities: HashSet::from([
+                BindingType::AgentModel,
+                BindingType::ModelProvider,
+            ]),
             mcp_transports: HashSet::new(),
             tags: vec!["pi".to_string(), "coding-agent".to_string()],
         }
@@ -206,10 +241,7 @@ impl PiLauncher {
             "baseUrl": pi_base_url(binding),
             "api": pi_api_name(&binding.api_type)?,
             "apiKey": format!("${API_KEY_ENV}"),
-            "models": [{
-                "id": binding.model_name,
-                "contextWindow": binding.context_length,
-            }],
+            "models": [pi_model_entry(&binding.model_name, binding.context_length)],
         });
 
         // Add custom headers from binding if present. They are merged at the
@@ -234,42 +266,83 @@ impl PiLauncher {
         Ok(entry)
     }
 
+    /// Builds one `models.json` provider entry for a bound
+    /// `ModelProviderCapability`: the dialect Pi's client knows, the session
+    /// proxy as `baseUrl`, and every model the dialect can reach. Pi's model
+    /// picker then offers them all without granite-cli choosing a default.
+    fn model_provider_entry(
+        &self,
+        ctx: &LaunchContext,
+        entry: &ModelProviderEntry,
+    ) -> anyhow::Result<serde_json::Value> {
+        let models: Vec<serde_json::Value> = entry
+            .models
+            .iter()
+            .map(|model| pi_model_entry(&model.model_name, model.context_length))
+            .collect();
+        let mut generated = serde_json::json!({
+            "baseUrl": proxied_base_url(ctx, &entry.endpoint_path),
+            "api": pi_api_name(&entry.api_type)?,
+            "apiKey": format!("${API_KEY_ENV}"),
+            "models": models,
+        });
+        merge_provider_overrides(&mut generated, &self.config.provider_overrides);
+        Ok(generated)
+    }
+
     /// Materializes the granite-cli Pi config directory for the bound model (if
     /// any) and returns the `--provider`/`--model` args selecting it. Shared by
     /// `launch` and `run_delegated_task`, which both need Pi pointed at the same
-    /// generated config before anything else on the command line.
+    /// generated config before anything else on the command line. A bound
+    /// `ModelProviderCapability` adds its entries to the same file but selects
+    /// nothing: the user picks a model in Pi.
     async fn provider_prefix_args(
         &self,
         ctx: &LaunchContext,
         ui: &dyn Ui,
     ) -> anyhow::Result<Vec<String>> {
         let mut pi_args: Vec<String> = vec![];
-        if let Some(binding) = &self.bound_binding {
-            let provider_name = &binding.provider_name;
-            let entry = self.provider_entry(binding)?;
-            let state_dir = pi_state_dir(ctx)?;
-            let source_dir = pi_source_dir()?;
 
-            if ctx.dry_run {
+        let mut providers = serde_json::Map::new();
+        if let Some(binding) = &self.bound_binding {
+            providers.insert(binding.provider_name.clone(), self.provider_entry(binding)?);
+        }
+        for entry in &self.bound_model_providers {
+            let generated = self.model_provider_entry(ctx, entry)?;
+            insert_or_merge_pi_provider(&mut providers, entry.provider_name.clone(), generated);
+        }
+        if providers.is_empty() {
+            return Ok(pi_args);
+        }
+
+        let state_dir = pi_state_dir(ctx)?;
+        let source_dir = pi_source_dir()?;
+        if ctx.dry_run {
+            for (provider_name, entry) in &providers {
                 ui.info(&format!(
                     "Would write Pi provider '{provider_name}' into {}:",
                     state_dir.join(MODELS_JSON).display()
                 ));
-                ui.info(&serde_json::to_string_pretty(&entry)?);
-                ui.info(&format!(
-                    "  (merged over {}, which is left unmodified)",
-                    source_dir.join(MODELS_JSON).display()
-                ));
-            } else {
-                materialize_pi_config(&state_dir, &source_dir, provider_name, entry, ui)?;
-                ui.info(&format!(
-                    "Wrote Pi provider '{provider_name}' to {}",
-                    state_dir.join(MODELS_JSON).display()
-                ));
+                ui.info(&serde_json::to_string_pretty(entry)?);
             }
+            ui.info(&format!(
+                "  (merged over {}, which is left unmodified)",
+                source_dir.join(MODELS_JSON).display()
+            ));
+        } else {
+            let names = providers.keys().cloned().collect::<Vec<_>>().join(", ");
+            materialize_pi_config(&state_dir, &source_dir, providers, ui)?;
+            ui.info(&format!(
+                "Wrote Pi provider(s) {} to {}",
+                names,
+                state_dir.join(MODELS_JSON).display()
+            ));
+        }
+
+        if let Some(binding) = &self.bound_binding {
             pi_args.extend([
                 "--provider".to_string(),
-                provider_name.clone(),
+                binding.provider_name.clone(),
                 "--model".to_string(),
                 binding.model_name.clone(),
             ]);
@@ -524,17 +597,81 @@ fn pi_api_name(api_type: &ApiType) -> anyhow::Result<&'static str> {
 }
 
 /// Pi's `baseUrl` is the API root it appends the operation path to (e.g.
-/// `/chat/completions`), so drop that trailing operation from the binding's
-/// full endpoint path and keep the version prefix.
+/// `/chat/completions` or `/messages`), so drop that trailing operation from
+/// the binding's full endpoint path and keep the version prefix.
 fn pi_base_url(binding: &AgentModelBinding) -> String {
-    let root = binding.base_url.trim_end_matches('/');
-    let prefix = match binding.api_type {
-        ApiType::OpenAI => binding.endpoint_path.strip_suffix("/chat/completions"),
-        ApiType::Anthropic => binding.endpoint_path.strip_suffix("/messages"),
-        ApiType::Ollama | ApiType::Jev => None,
+    base_url_for_endpoint(&binding.base_url, &binding.endpoint_path)
+}
+
+/// Shallow-merges the launcher's `provider_overrides` over a generated
+/// provider entry (last write wins), so a user override of e.g. `compat`
+/// does not clobber the generated `baseUrl`/`models`, and vice versa.
+fn merge_provider_overrides(entry: &mut serde_json::Value, overrides: &Option<serde_json::Value>) {
+    if let (Some(overrides), Some(target)) = (
+        overrides.as_ref().and_then(serde_json::Value::as_object),
+        entry.as_object_mut(),
+    ) {
+        for (key, value) in overrides {
+            target.insert(key.clone(), value.clone());
+        }
     }
-    .unwrap_or("");
-    format!("{root}{prefix}")
+}
+
+/// Adds a `model-provider` entry to the generated provider map. When the
+/// same provider already has an entry from `agent-model`, the two describe
+/// one provider: if they use the same Pi API, the model lists are merged and
+/// the existing entry's options (which may carry headers) are kept. A
+/// different API replaces it, since one entry cannot speak two dialects.
+fn insert_or_merge_pi_provider(
+    providers: &mut serde_json::Map<String, serde_json::Value>,
+    provider_name: String,
+    generated: serde_json::Value,
+) {
+    match providers.get_mut(&provider_name) {
+        Some(existing) if existing.get("api") == generated.get("api") => {
+            let (Some(existing_models), Some(generated_models)) = (
+                existing
+                    .get_mut("models")
+                    .and_then(serde_json::Value::as_array_mut),
+                generated
+                    .get("models")
+                    .and_then(serde_json::Value::as_array),
+            ) else {
+                providers.insert(provider_name, generated);
+                return;
+            };
+            let existing_ids: HashSet<String> = existing_models
+                .iter()
+                .filter_map(|model| model.get("id").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect();
+            for model in generated_models {
+                let Some(id) = model.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if !existing_ids.contains(id) {
+                    existing_models.push(model.clone());
+                }
+            }
+        }
+        _ => {
+            providers.insert(provider_name, generated);
+        }
+    }
+}
+
+/// Builds one `models.json` model entry. Pi's schema requires `contextWindow`
+/// to be a positive number when it is present, so a model whose provider did
+/// not report a context length (0, or no value at all) must omit the field
+/// entirely -- rendering `0` or `null` makes Pi reject the whole
+/// `models.json` and ignore every provider in it. Pi's own default then
+/// applies.
+fn pi_model_entry(model_name: &str, context_length: Option<u64>) -> serde_json::Value {
+    let mut entry = serde_json::json!({ "id": model_name });
+    if let Some(context_length) = context_length.filter(|length| *length > 0) {
+        entry["contextWindow"] = serde_json::json!(context_length);
+    }
+    entry
 }
 
 /// The granite-cli-owned Pi config directory for this launcher instance.
@@ -556,13 +693,13 @@ fn pi_source_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Builds `state_dir` into a usable Pi config directory: a generated
-/// `models.json` carrying `provider_name`, plus pass-through links to the rest of
-/// the user's Pi resources. Nothing under `source_dir` is written.
+/// `models.json` carrying every provider granite-cli bound, plus pass-through
+/// links to the rest of the user's Pi resources. Nothing under `source_dir` is
+/// written.
 fn materialize_pi_config(
     state_dir: &Path,
     source_dir: &Path,
-    provider_name: &str,
-    entry: serde_json::Value,
+    providers: serde_json::Map<String, serde_json::Value>,
     ui: &dyn Ui,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(state_dir)
@@ -584,13 +721,16 @@ fn materialize_pi_config(
             source_dir.join(MODELS_JSON).display()
         )
     };
-    root.as_object_mut()
+    let target = root
+        .as_object_mut()
         .ok_or_else(|| malformed("the top-level value"))?
         .entry("providers")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .ok_or_else(|| malformed("`providers`"))?
-        .insert(provider_name.to_string(), entry);
+        .ok_or_else(|| malformed("`providers`"))?;
+    for (provider_name, entry) in providers {
+        target.insert(provider_name, entry);
+    }
 
     write_owned_json(&state_dir.join(MODELS_JSON), &root)
 }
@@ -817,6 +957,29 @@ mod tests {
     }
 
     #[test]
+    fn pi_model_entry_omits_a_non_positive_context_window() {
+        assert_eq!(pi_model_entry("m", Some(8192))["contextWindow"], 8192);
+        assert!(pi_model_entry("m", Some(0)).get("contextWindow").is_none());
+        assert!(pi_model_entry("m", None).get("contextWindow").is_none());
+        assert_eq!(pi_model_entry("m", Some(0))["id"], "m");
+    }
+
+    #[test]
+    fn provider_entry_omits_context_window_for_unknown_context() {
+        for context_length in [Some(0), None] {
+            let b = AgentModelBinding {
+                context_length,
+                ..binding()
+            };
+            let entry = launcher(serde_json::json!({})).provider_entry(&b).unwrap();
+            assert!(
+                entry["models"][0].get("contextWindow").is_none(),
+                "context length {context_length:?} must be omitted, got {entry}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_entry_merges_overrides() {
         let l = launcher(serde_json::json!({
             "provider_overrides": { "compat": { "supportsDeveloperRole": false } }
@@ -966,6 +1129,283 @@ mod tests {
         assert_eq!(key.value, "granite-cli");
     }
 
+    // -- model provider entries ------------------------------------------------
+
+    fn model_provider_entry(
+        api_type: ApiType,
+        provider_name: &str,
+        models: &[&str],
+    ) -> ModelProviderEntry {
+        ModelProviderEntry {
+            provider_name: provider_name.to_string(),
+            endpoint_path: match api_type {
+                ApiType::OpenAI => "/v1/chat/completions",
+                ApiType::Anthropic => "/v1/messages",
+                _ => "/api/chat",
+            }
+            .to_string(),
+            api_type,
+            models: models
+                .iter()
+                .map(|name| crate::capabilities::ModelProviderModel {
+                    model_name: (*name).to_string(),
+                    context_length: Some(8192),
+                    supported_reasoning_efforts: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn metadata_supports_model_provider_binding() {
+        assert!(
+            PiLauncher::metadata()
+                .supported_capabilities
+                .contains(&BindingType::ModelProvider)
+        );
+    }
+
+    #[test]
+    fn model_provider_entry_describes_grouped_models_through_the_proxy() {
+        let l = launcher(serde_json::json!({}));
+        let entry = l
+            .model_provider_entry(
+                &ctx(true),
+                &model_provider_entry(ApiType::OpenAI, "models-openai", &["a", "b"]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            entry["baseUrl"],
+            format!("{}/v1", crate::launchers::base::DRY_RUN_PROXY_URL)
+        );
+        assert_eq!(entry["api"], "openai-completions");
+        assert_eq!(entry["apiKey"], "$GRANITE_CLI_PI_API_KEY");
+        assert_eq!(entry["models"][0]["id"], "a");
+        assert_eq!(entry["models"][0]["contextWindow"], 8192);
+        assert_eq!(entry["models"][1]["id"], "b");
+    }
+
+    #[test]
+    fn model_provider_entry_omits_context_window_for_unknown_context() {
+        for context_length in [Some(0), None] {
+            let mut provider = model_provider_entry(ApiType::OpenAI, "models-openai", &["a"]);
+            provider.models[0].context_length = context_length;
+
+            let entry = launcher(serde_json::json!({}))
+                .model_provider_entry(&ctx(true), &provider)
+                .unwrap();
+            assert!(
+                entry["models"][0].get("contextWindow").is_none(),
+                "context length {context_length:?} must be omitted, got {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_provider_entry_maps_the_anthropic_dialect() {
+        let l = launcher(serde_json::json!({}));
+        let entry = l
+            .model_provider_entry(
+                &ctx(true),
+                &model_provider_entry(ApiType::Anthropic, "models-anthropic", &["claude"]),
+            )
+            .unwrap();
+
+        assert_eq!(entry["api"], "anthropic-messages");
+        assert_eq!(
+            entry["baseUrl"],
+            format!("{}/v1", crate::launchers::base::DRY_RUN_PROXY_URL)
+        );
+    }
+
+    #[test]
+    fn model_provider_entry_merges_overrides() {
+        let l = launcher(serde_json::json!({
+            "provider_overrides": { "compat": { "supportsDeveloperRole": false } }
+        }));
+        let entry = l
+            .model_provider_entry(
+                &ctx(true),
+                &model_provider_entry(ApiType::OpenAI, "models-openai", &["a"]),
+            )
+            .unwrap();
+        assert_eq!(entry["compat"]["supportsDeveloperRole"], false);
+        assert_eq!(
+            entry["baseUrl"],
+            format!("{}/v1", crate::launchers::base::DRY_RUN_PROXY_URL)
+        );
+    }
+
+    #[tokio::test]
+    async fn env_overlay_redirects_config_with_only_model_providers() {
+        let mut l = launcher(serde_json::json!({}));
+        l.bound_model_providers = vec![model_provider_entry(
+            ApiType::OpenAI,
+            "models-openai",
+            &["a"],
+        )];
+
+        let overlay = l.env_overlay(&ctx(false)).await.unwrap();
+        assert!(overlay.iter().any(|b| b.key == CONFIG_DIR_ENV));
+        let key = overlay
+            .iter()
+            .find(|b| b.key == API_KEY_ENV)
+            .expect("the placeholder key Pi needs to show the models");
+        assert_eq!(key.value, "granite-cli");
+    }
+
+    #[tokio::test]
+    async fn model_providers_select_no_default_model() {
+        let mut l = launcher(serde_json::json!({}));
+        l.bound_model_providers = vec![model_provider_entry(
+            ApiType::OpenAI,
+            "models-openai",
+            &["a", "b"],
+        )];
+
+        let ui = CaptureUi::default();
+        let args = l.provider_prefix_args(&ctx(true), &ui).await.unwrap();
+        assert!(args.is_empty(), "Pi must pick the model, not granite-cli");
+
+        let dump = ui.infos.borrow().join("\n");
+        assert!(
+            dump.contains("Would write Pi provider 'models-openai'"),
+            "{dump}"
+        );
+        assert!(dump.contains("\"id\": \"a\""), "{dump}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_model_keeps_its_selection_when_model_providers_are_bound() {
+        let mut l = bound(serde_json::json!({}), binding());
+        l.bound_model_providers = vec![model_provider_entry(
+            ApiType::OpenAI,
+            "my-ollama",
+            &["extra-model"],
+        )];
+
+        let ui = CaptureUi::default();
+        let args = l.provider_prefix_args(&ctx(true), &ui).await.unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--provider".to_string(),
+                "my-ollama".to_string(),
+                "--model".to_string(),
+                "granite4.1:8b".to_string(),
+            ]
+        );
+
+        let dump = ui.infos.borrow().join("\n");
+        assert!(
+            dump.contains("Would write Pi provider 'my-ollama'"),
+            "{dump}"
+        );
+        // One provider entry, carrying the agent model and the extra one.
+        assert!(dump.contains("granite4.1:8b"), "{dump}");
+        assert!(dump.contains("extra-model"), "{dump}");
+    }
+
+    #[test]
+    fn insert_or_merge_pi_provider_merges_models_for_the_same_api() {
+        let mut providers = serde_json::Map::new();
+        providers.insert(
+            "p".to_string(),
+            serde_json::json!({
+                "api": "openai-completions",
+                "headers": { "X-Kept": "yes" },
+                "models": [{ "id": "existing", "contextWindow": 4096 }],
+            }),
+        );
+        insert_or_merge_pi_provider(
+            &mut providers,
+            "p".to_string(),
+            serde_json::json!({
+                "api": "openai-completions",
+                "models": [{ "id": "extra" }, { "id": "existing", "contextWindow": 8192 }],
+            }),
+        );
+
+        assert_eq!(providers["p"]["headers"]["X-Kept"], "yes");
+        let models = providers["p"]["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["contextWindow"], 4096);
+        assert_eq!(models[1]["id"], "extra");
+    }
+
+    #[test]
+    fn insert_or_merge_pi_provider_replaces_models_for_a_different_api() {
+        let mut providers = serde_json::Map::new();
+        providers.insert(
+            "p".to_string(),
+            serde_json::json!({
+                "api": "openai-completions",
+                "models": [{ "id": "existing" }],
+            }),
+        );
+        insert_or_merge_pi_provider(
+            &mut providers,
+            "p".to_string(),
+            serde_json::json!({
+                "api": "anthropic-messages",
+                "models": [{ "id": "extra" }],
+            }),
+        );
+
+        assert_eq!(providers["p"]["api"], "anthropic-messages");
+        assert_eq!(providers["p"]["models"][0]["id"], "extra");
+    }
+
+    /// A capability double that resolves to a fixed `ModelProviderBinding`.
+    struct FakeModelProviderCapability {
+        instance_id: String,
+        binding: crate::capabilities::ModelProviderBinding,
+    }
+
+    impl crate::registry::Named for FakeModelProviderCapability {
+        fn instance_id(&self) -> &str {
+            &self.instance_id
+        }
+    }
+
+    impl crate::capabilities::CapabilityInfo for FakeModelProviderCapability {
+        fn binding_types(&self) -> HashSet<BindingType> {
+            HashSet::from([BindingType::ModelProvider])
+        }
+    }
+
+    #[async_trait]
+    impl crate::capabilities::ResolvedCapability for FakeModelProviderCapability {
+        async fn bind(
+            &self,
+            _request: crate::capabilities::BindingRequest,
+        ) -> anyhow::Result<crate::capabilities::Binding> {
+            Ok(crate::capabilities::Binding::ModelProvider(
+                self.binding.clone(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_capability_pushes_every_model_provider_entry() {
+        let mut l = launcher(serde_json::json!({}));
+        let cap = FakeModelProviderCapability {
+            instance_id: "models".to_string(),
+            binding: crate::capabilities::ModelProviderBinding {
+                providers: vec![
+                    model_provider_entry(ApiType::OpenAI, "models-openai", &["a"]),
+                    model_provider_entry(ApiType::Anthropic, "models-anthropic", &["b"]),
+                ],
+            },
+        };
+
+        l.bind_capability(&cap).await.unwrap();
+        assert_eq!(l.bound_model_providers.len(), 2);
+        assert_eq!(l.bound_model_providers[0].provider_name, "models-openai");
+        assert_eq!(l.bound_model_providers[1].provider_name, "models-anthropic");
+    }
+
     // -- materialized config ---------------------------------------------------
 
     /// A (state_dir, source_dir) pair inside one tempdir.
@@ -979,6 +1419,14 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(dir.join(MODELS_JSON)).unwrap()).unwrap()
     }
 
+    /// A provider map for the one-entry tests below.
+    fn one_provider(
+        name: &str,
+        entry: serde_json::Value,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::from_iter([(name.to_string(), entry)])
+    }
+
     #[test]
     fn materialize_writes_provider_under_the_binding_name() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -986,8 +1434,10 @@ mod tests {
         materialize_pi_config(
             &state,
             &source,
-            "my-ollama",
-            serde_json::json!({ "api": "openai-completions" }),
+            one_provider(
+                "my-ollama",
+                serde_json::json!({ "api": "openai-completions" }),
+            ),
             &CaptureUi::default(),
         )
         .unwrap();
@@ -1010,8 +1460,7 @@ mod tests {
         materialize_pi_config(
             &state,
             &source,
-            "my-ollama",
-            serde_json::json!({ "api": "x" }),
+            one_provider("my-ollama", serde_json::json!({ "api": "x" })),
             &CaptureUi::default(),
         )
         .unwrap();
@@ -1033,8 +1482,7 @@ mod tests {
         materialize_pi_config(
             &state,
             &source,
-            "my-ollama",
-            serde_json::json!({}),
+            one_provider("my-ollama", serde_json::json!({})),
             &CaptureUi::default(),
         )
         .unwrap();
@@ -1050,8 +1498,7 @@ mod tests {
         materialize_pi_config(
             &state,
             &source,
-            "my-ollama",
-            serde_json::json!({ "api": "x" }),
+            one_provider("my-ollama", serde_json::json!({ "api": "x" })),
             &CaptureUi::default(),
         )
         .unwrap();
@@ -1071,8 +1518,7 @@ mod tests {
             materialize_pi_config(
                 &state,
                 &source,
-                "my-ollama",
-                serde_json::json!({ "api": api }),
+                one_provider("my-ollama", serde_json::json!({ "api": api })),
                 &CaptureUi::default(),
             )
             .unwrap();
@@ -1093,8 +1539,7 @@ mod tests {
         let err = materialize_pi_config(
             &state,
             &source,
-            "my-ollama",
-            serde_json::json!({}),
+            one_provider("my-ollama", serde_json::json!({})),
             &CaptureUi::default(),
         )
         .expect_err("must fail");
@@ -1111,8 +1556,7 @@ mod tests {
         let err = materialize_pi_config(
             &state,
             &source,
-            "my-ollama",
-            serde_json::json!({}),
+            one_provider("my-ollama", serde_json::json!({})),
             &CaptureUi::default(),
         )
         .expect_err("must fail");
@@ -1133,8 +1577,7 @@ mod tests {
         materialize_pi_config(
             &state,
             &source,
-            "my-ollama",
-            serde_json::json!({}),
+            one_provider("my-ollama", serde_json::json!({})),
             &CaptureUi::default(),
         )
         .unwrap();
@@ -1198,8 +1641,7 @@ mod tests {
         materialize_pi_config(
             &dir,
             &dir,
-            "my-ollama",
-            serde_json::json!({ "api": "x" }),
+            one_provider("my-ollama", serde_json::json!({ "api": "x" })),
             &CaptureUi::default(),
         )
         .unwrap();

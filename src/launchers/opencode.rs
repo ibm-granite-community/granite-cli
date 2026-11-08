@@ -22,10 +22,13 @@ use serde::{Deserialize, Serialize};
 
 // Local
 use crate::capabilities::{
-    AgentModelBinding, Binding, BindingType, KnownSubAgent, McpBinding, ResolvedCapability,
-    SubAgentBinding, ToolName,
+    AgentModelBinding, Binding, BindingType, KnownSubAgent, McpBinding, ModelProviderEntry,
+    ResolvedCapability, SubAgentBinding, ToolName,
 };
-use crate::launchers::base::{EnvBinding, LaunchContext, Launcher, LauncherMetadata, run_command};
+use crate::launchers::base::{
+    EnvBinding, LaunchContext, Launcher, LauncherMetadata, base_url_for_endpoint, proxied_base_url,
+    run_command,
+};
 use crate::launchers::shared::mcp_cli::{STDIO_HTTP_AND_SSE, mcp_binding_request, transport_set};
 use crate::providers::ApiType;
 use crate::proxy::ProxyHandle;
@@ -47,10 +50,10 @@ pub(crate) struct OpenCodeLauncherConfig {
     /// Extra keys merged (shallow, last-write-wins) into every generated
     /// provider entry -- e.g. `headers` a particular server needs. Necessary
     /// because the entries are regenerated on every launch. Applied
-    /// uniformly to the main model's provider entry *and* every bound
-    /// sub-agent's, since there is no per-sub-agent override knob yet -- an
-    /// override meant for one provider (e.g. a dialect-specific `npm`
-    /// package) will also land on any other bound provider.
+    /// uniformly to the main model's provider entry, every bound
+    /// sub-agent's, and every entry a `model-provider` capability
+    /// contributes -- so an override meant for one provider (e.g. a
+    /// dialect-specific `npm` package) will also land on the others.
     #[serde(default)]
     pub(crate) provider_overrides: Option<serde_json::Value>,
 }
@@ -70,6 +73,10 @@ pub(crate) struct OpenCodeLauncher {
     /// its own `provider.<name>` entry and is referenced directly as
     /// `<provider>/<model>` in `agent.<name>.model` -- no mini-router needed.
     bound_sub_agents: Vec<(String, SubAgentBinding)>,
+    /// One entry per API dialect a bound `ModelProviderCapability` exposes.
+    /// Each points at the session proxy and lists every model that dialect
+    /// can reach, so OpenCode's own model picker shows them all.
+    bound_model_providers: Vec<ModelProviderEntry>,
 }
 
 impl ConfigConstructable for OpenCodeLauncher {
@@ -84,6 +91,7 @@ impl ConfigConstructable for OpenCodeLauncher {
             bound_agent_model: None,
             bound_mcp_bindings: vec![],
             bound_sub_agents: vec![],
+            bound_model_providers: vec![],
         })
     }
 }
@@ -120,6 +128,28 @@ impl Launcher for OpenCodeLauncher {
                         .push((capability.instance_id().to_string(), binding));
                 }
                 other => anyhow::bail!("expected an Mcp binding, got {:?}", other.binding_type()),
+            }
+            return Ok(());
+        }
+
+        if capability_types.contains(&BindingType::ModelProvider) {
+            // OpenCode's custom-provider config expresses the OpenAI and
+            // Anthropic dialects. Ordering is preference: a model its
+            // provider can serve both ways appears once, under OpenAI.
+            let request = crate::capabilities::BindingRequest::ModelProvider(
+                crate::capabilities::ModelProviderBindingRequest {
+                    supported_api_types: vec![ApiType::OpenAI, ApiType::Anthropic],
+                },
+            );
+            let binding = capability.bind(request).await?;
+            match binding {
+                Binding::ModelProvider(binding) => {
+                    self.bound_model_providers.extend(binding.providers);
+                }
+                other => anyhow::bail!(
+                    "expected a ModelProvider binding, got {:?}",
+                    other.binding_type()
+                ),
             }
             return Ok(());
         }
@@ -213,6 +243,7 @@ impl Launcher for OpenCodeLauncher {
         if self.bound_agent_model.is_some()
             || !self.bound_mcp_bindings.is_empty()
             || !self.bound_sub_agents.is_empty()
+            || !self.bound_model_providers.is_empty()
         {
             overlay.push(EnvBinding {
                 key: CONFIG_ENV.to_string(),
@@ -262,6 +293,7 @@ impl Launcher for OpenCodeLauncher {
         if self.bound_agent_model.is_some()
             || !self.bound_mcp_bindings.is_empty()
             || !self.bound_sub_agents.is_empty()
+            || !self.bound_model_providers.is_empty()
         {
             // Build granite-cli provider entries
             let mut granite_providers = serde_json::Map::new();
@@ -273,6 +305,14 @@ impl Launcher for OpenCodeLauncher {
                     &provider_api_key_env(index),
                 )?;
                 granite_providers.insert(binding.provider_name.clone(), entry);
+            }
+            for entry in &self.bound_model_providers {
+                let generated = self.model_provider_entry(ctx, entry)?;
+                insert_or_merge_provider(
+                    &mut granite_providers,
+                    entry.provider_name.clone(),
+                    generated,
+                );
             }
 
             // Discover and register user providers for usage tracking.
@@ -338,6 +378,7 @@ impl HasOpenCodeLauncherMetadata for OpenCodeLauncher {
                 BindingType::AgentModel,
                 BindingType::Mcp,
                 BindingType::SubAgent,
+                BindingType::ModelProvider,
             ]),
             mcp_transports: transport_set(STDIO_HTTP_AND_SSE),
             tags: vec!["opencode".to_string(), "coding-agent".to_string()],
@@ -448,6 +489,54 @@ impl OpenCodeLauncher {
             }
         }
         Ok(entry)
+    }
+
+    /// Builds one `provider.<name>` entry for a bound `ModelProviderCapability`:
+    /// the dialect's SDK package, the session proxy as `baseURL`, and every
+    /// model the dialect can reach. OpenCode's own model picker then offers
+    /// them all without granite-cli choosing a default.
+    fn model_provider_entry(
+        &self,
+        ctx: &LaunchContext,
+        entry: &ModelProviderEntry,
+    ) -> anyhow::Result<serde_json::Value> {
+        let npm = match &entry.api_type {
+            ApiType::OpenAI => "@ai-sdk/openai-compatible",
+            ApiType::Anthropic => "@ai-sdk/anthropic",
+            other => anyhow::bail!(
+                "OpenCode's generated provider config cannot express the {other} API dialect"
+            ),
+        };
+
+        let mut models = serde_json::Map::new();
+        for model in &entry.models {
+            let mut model_entry = serde_json::json!({ "name": model.model_name });
+            if !model.supported_reasoning_efforts.is_empty() {
+                let variants: serde_json::Map<String, serde_json::Value> = model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .map(|effort| {
+                        (
+                            effort.as_str().to_string(),
+                            serde_json::json!({ "reasoningEffort": effort.as_str() }),
+                        )
+                    })
+                    .collect();
+                model_entry["variants"] = serde_json::Value::Object(variants);
+            }
+            models.insert(model.model_name.clone(), model_entry);
+        }
+
+        let mut generated = serde_json::json!({
+            "npm": npm,
+            "name": entry.provider_name,
+            "options": {
+                "baseURL": proxied_base_url(ctx, &entry.endpoint_path),
+            },
+            "models": serde_json::Value::Object(models),
+        });
+        merge_provider_overrides(&mut generated, &self.config.provider_overrides);
+        Ok(generated)
     }
 
     /// Groups the main model binding (if any) and every bound sub-agent's
@@ -975,14 +1064,60 @@ fn opencode_base_url(binding: &AgentModelBinding) -> String {
 
 /// Appends the binding's API version prefix (e.g. `/v1`) to `root`. Needed for
 /// the proxy URL too: the proxy serves the same paths as the real endpoint,
-/// and OpenAI-compatible SDKs append only the operation (`/chat/completions`).
+/// and the SDKs append only the operation (`/chat/completions` or
+/// `/messages`).
 fn join_base_url(root: &str, binding: &AgentModelBinding) -> String {
-    let root = root.trim_end_matches('/');
-    let prefix = binding
-        .endpoint_path
-        .strip_suffix("/chat/completions")
-        .unwrap_or("");
-    format!("{root}{prefix}")
+    base_url_for_endpoint(root, &binding.endpoint_path)
+}
+
+/// Shallow-merges the launcher's `provider_overrides` over a generated
+/// provider entry (last write wins), so a user override of e.g. `headers`
+/// does not clobber the generated `options`/`models`, and vice versa.
+fn merge_provider_overrides(entry: &mut serde_json::Value, overrides: &Option<serde_json::Value>) {
+    if let (Some(overrides), Some(target)) = (
+        overrides.as_ref().and_then(serde_json::Value::as_object),
+        entry.as_object_mut(),
+    ) {
+        for (key, value) in overrides {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// Adds a `model-provider` entry to the generated provider map. When the
+/// same provider already has an entry from `agent-model`/sub-agents, the two
+/// describe one provider: if they use the same SDK package, the model lists
+/// are merged and the existing entry's options (which may carry a credential
+/// or headers) are kept. A different package replaces it, since one entry
+/// cannot speak two dialects.
+fn insert_or_merge_provider(
+    providers: &mut serde_json::Map<String, serde_json::Value>,
+    provider_name: String,
+    generated: serde_json::Value,
+) {
+    match providers.get_mut(&provider_name) {
+        Some(existing) if existing.get("npm") == generated.get("npm") => {
+            let (Some(existing_models), Some(generated_models)) = (
+                existing
+                    .get_mut("models")
+                    .and_then(serde_json::Value::as_object_mut),
+                generated
+                    .get("models")
+                    .and_then(serde_json::Value::as_object),
+            ) else {
+                providers.insert(provider_name, generated);
+                return;
+            };
+            for (model_name, model_entry) in generated_models {
+                existing_models
+                    .entry(model_name.clone())
+                    .or_insert_with(|| model_entry.clone());
+            }
+        }
+        _ => {
+            providers.insert(provider_name, generated);
+        }
+    }
 }
 
 /// The granite-cli-owned config file this launcher instance writes and points
@@ -1296,6 +1431,263 @@ mod tests {
             "true"
         );
         assert_eq!(entry["options"]["headers"]["Helicone-User-Id"], "opencode");
+    }
+
+    // -- model provider entries ------------------------------------------------
+
+    fn model_provider_entry(
+        api_type: ApiType,
+        provider_name: &str,
+        models: &[&str],
+    ) -> ModelProviderEntry {
+        ModelProviderEntry {
+            provider_name: provider_name.to_string(),
+            endpoint_path: match api_type {
+                ApiType::OpenAI => "/v1/chat/completions",
+                ApiType::Anthropic => "/v1/messages",
+                _ => "/api/chat",
+            }
+            .to_string(),
+            api_type,
+            models: models
+                .iter()
+                .map(|name| crate::capabilities::ModelProviderModel {
+                    model_name: (*name).to_string(),
+                    context_length: Some(8192),
+                    supported_reasoning_efforts: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn model_provider_entry_groups_models_behind_the_proxy() {
+        let l = launcher(serde_json::json!({}));
+        let entry = l
+            .model_provider_entry(
+                &ctx(true),
+                &model_provider_entry(ApiType::OpenAI, "models-openai", &["a", "b"]),
+            )
+            .unwrap();
+
+        assert_eq!(entry["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(entry["name"], "models-openai");
+        assert_eq!(
+            entry["options"]["baseURL"],
+            format!("{}/v1", crate::launchers::base::DRY_RUN_PROXY_URL)
+        );
+        assert_eq!(entry["models"]["a"]["name"], "a");
+        assert_eq!(entry["models"]["b"]["name"], "b");
+    }
+
+    #[test]
+    fn model_provider_entry_uses_the_anthropic_sdk_for_anthropic_models() {
+        let l = launcher(serde_json::json!({}));
+        let entry = l
+            .model_provider_entry(
+                &ctx(true),
+                &model_provider_entry(ApiType::Anthropic, "models-anthropic", &["claude"]),
+            )
+            .unwrap();
+
+        assert_eq!(entry["npm"], "@ai-sdk/anthropic");
+        assert_eq!(
+            entry["options"]["baseURL"],
+            format!("{}/v1", crate::launchers::base::DRY_RUN_PROXY_URL)
+        );
+    }
+
+    #[tokio::test]
+    async fn model_provider_entry_uses_the_running_proxy_url() {
+        let server = crate::proxy::ProxyServer::start().unwrap();
+        let l = launcher(serde_json::json!({}));
+        let mut launch_ctx = ctx(true);
+        launch_ctx.model_proxy = Some(server.handle.clone());
+
+        let entry = l
+            .model_provider_entry(
+                &launch_ctx,
+                &model_provider_entry(ApiType::OpenAI, "models-openai", &["a"]),
+            )
+            .unwrap();
+        assert_eq!(
+            entry["options"]["baseURL"],
+            format!("{}/v1", server.handle.local_base_url)
+        );
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn model_provider_entry_emits_reasoning_variants_and_merges_overrides() {
+        use crate::models::ReasoningEffort;
+
+        let l = launcher(serde_json::json!({
+            "provider_overrides": { "compat": { "supportsDeveloperRole": false } }
+        }));
+        let mut entry = model_provider_entry(ApiType::OpenAI, "models-openai", &["a"]);
+        entry.models[0].supported_reasoning_efforts =
+            vec![ReasoningEffort::Low, ReasoningEffort::High];
+
+        let generated = l.model_provider_entry(&ctx(true), &entry).unwrap();
+        assert_eq!(
+            generated["models"]["a"]["variants"]["low"]["reasoningEffort"],
+            "low"
+        );
+        assert_eq!(
+            generated["models"]["a"]["variants"]["high"]["reasoningEffort"],
+            "high"
+        );
+        assert_eq!(generated["compat"]["supportsDeveloperRole"], false);
+        assert_eq!(
+            generated["options"]["baseURL"],
+            format!("{}/v1", crate::launchers::base::DRY_RUN_PROXY_URL)
+        );
+    }
+
+    #[test]
+    fn model_provider_entry_rejects_a_dialect_opencode_cannot_express() {
+        let l = launcher(serde_json::json!({}));
+        let error = l
+            .model_provider_entry(
+                &ctx(true),
+                &model_provider_entry(ApiType::Ollama, "models-ollama", &["a"]),
+            )
+            .expect_err("Ollama-native is not expressible");
+        assert!(error.to_string().contains("Ollama"));
+    }
+
+    /// A capability double that resolves to a fixed `ModelProviderBinding`.
+    struct FakeModelProviderCapability {
+        instance_id: String,
+        binding: crate::capabilities::ModelProviderBinding,
+    }
+
+    impl crate::registry::Named for FakeModelProviderCapability {
+        fn instance_id(&self) -> &str {
+            &self.instance_id
+        }
+    }
+
+    impl crate::capabilities::CapabilityInfo for FakeModelProviderCapability {
+        fn binding_types(&self) -> HashSet<BindingType> {
+            HashSet::from([BindingType::ModelProvider])
+        }
+    }
+
+    #[async_trait]
+    impl crate::capabilities::ResolvedCapability for FakeModelProviderCapability {
+        async fn bind(
+            &self,
+            _request: crate::capabilities::BindingRequest,
+        ) -> anyhow::Result<Binding> {
+            Ok(Binding::ModelProvider(self.binding.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_capability_pushes_every_model_provider_entry() {
+        let mut l = launcher(serde_json::json!({}));
+        let cap = FakeModelProviderCapability {
+            instance_id: "models".to_string(),
+            binding: crate::capabilities::ModelProviderBinding {
+                providers: vec![
+                    model_provider_entry(ApiType::OpenAI, "models-openai", &["a"]),
+                    model_provider_entry(ApiType::Anthropic, "models-anthropic", &["b"]),
+                ],
+            },
+        };
+
+        l.bind_capability(&cap).await.unwrap();
+        assert_eq!(l.bound_model_providers.len(), 2);
+        assert_eq!(l.bound_model_providers[0].provider_name, "models-openai");
+        assert_eq!(l.bound_model_providers[1].provider_name, "models-anthropic");
+    }
+
+    #[tokio::test]
+    async fn dry_run_launch_with_only_model_providers_writes_no_default_model() {
+        let mut l = launcher(serde_json::json!({ "command_path": "ls" }));
+        l.bound_model_providers = vec![model_provider_entry(
+            ApiType::OpenAI,
+            "models-openai",
+            &["a", "b"],
+        )];
+        let ui = CaptureUi::default();
+        l.launch(&[], &ctx(true), &ui).await.unwrap();
+
+        let dump = ui.infos.borrow().join("\n");
+        assert!(dump.contains("\"models-openai\""), "{dump}");
+        assert!(!dump.contains("\"model\":"), "{dump}");
+    }
+
+    #[tokio::test]
+    async fn dry_run_launch_merges_a_model_providers_models_into_the_agent_models_entry() {
+        let mut l = bound(serde_json::json!({ "command_path": "ls" }), binding());
+        l.bound_model_providers = vec![model_provider_entry(
+            ApiType::OpenAI,
+            "my-ollama",
+            &["extra-model"],
+        )];
+        let ui = CaptureUi::default();
+        l.launch(&[], &ctx(true), &ui).await.unwrap();
+
+        let dump = ui.infos.borrow().join("\n");
+        assert!(
+            dump.contains(r#""model": "my-ollama/granite4.1:8b""#),
+            "{dump}"
+        );
+        // One provider entry, carrying the agent model and the extra one.
+        assert!(dump.contains(r#""granite4.1:8b": {"#), "{dump}");
+        assert!(dump.contains(r#""extra-model": {"#), "{dump}");
+    }
+
+    #[test]
+    fn insert_or_merge_provider_merges_models_for_the_same_sdk() {
+        let mut providers = serde_json::Map::new();
+        providers.insert(
+            "p".to_string(),
+            serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "options": { "apiKey": "kept" },
+                "models": { "existing": { "name": "existing" } },
+            }),
+        );
+        insert_or_merge_provider(
+            &mut providers,
+            "p".to_string(),
+            serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "options": { "baseURL": "replaced" },
+                "models": { "extra": { "name": "extra" } },
+            }),
+        );
+
+        assert_eq!(providers["p"]["options"]["apiKey"], "kept");
+        assert!(providers["p"]["models"].get("existing").is_some());
+        assert!(providers["p"]["models"].get("extra").is_some());
+    }
+
+    #[test]
+    fn insert_or_merge_provider_replaces_models_for_a_different_sdk() {
+        let mut providers = serde_json::Map::new();
+        providers.insert(
+            "p".to_string(),
+            serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "models": { "existing": { "name": "existing" } },
+            }),
+        );
+        insert_or_merge_provider(
+            &mut providers,
+            "p".to_string(),
+            serde_json::json!({
+                "npm": "@ai-sdk/anthropic",
+                "models": { "extra": { "name": "extra" } },
+            }),
+        );
+
+        assert_eq!(providers["p"]["npm"], "@ai-sdk/anthropic");
+        assert!(providers["p"]["models"].get("extra").is_some());
+        assert!(providers["p"]["models"].get("existing").is_none());
     }
 
     // -- provider_api_key_env ---------------------------------------------------
