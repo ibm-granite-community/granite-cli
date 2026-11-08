@@ -266,6 +266,52 @@ pub(crate) struct VoiceInputBindingRequest {
     pub(crate) api_type: ApiType,
 }
 
+/// Request payload for `BindingType::ModelProvider` -- the API dialects the
+/// launcher's own provider configuration can express, in preference order.
+/// Each configured provider is exposed under the first dialect it serves, so
+/// its models appear once and the entry names the granite-cli provider they
+/// came from.
+#[derive(Debug, Clone)]
+pub(crate) struct ModelProviderBindingRequest {
+    pub(crate) supported_api_types: Vec<ApiType>,
+}
+
+/// Result payload for `BindingType::ModelProvider`: one provider entry per
+/// configured provider that can serve a requested dialect, listing every
+/// model available through it. The launched process addresses the session
+/// proxy, which routes each request to the model's real provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ModelProviderBinding {
+    pub(crate) providers: Vec<ModelProviderEntry>,
+}
+
+/// One generated provider entry, named after the configured provider instance
+/// it describes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ModelProviderEntry {
+    /// The configured provider instance id (e.g. `my-ollama`). One entry per
+    /// provider, so two providers that speak the same dialect stay distinct.
+    pub(crate) provider_name: String,
+    pub(crate) api_type: ApiType,
+    /// The chat operation's endpoint path (e.g. `/v1/chat/completions`). A
+    /// launcher derives its base URL from this by dropping the operation.
+    pub(crate) endpoint_path: String,
+    pub(crate) models: Vec<ModelProviderModel>,
+}
+
+/// One model inside a [`ModelProviderEntry`], named as its provider knows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ModelProviderModel {
+    pub(crate) model_name: String,
+    /// Context window when the model reports one. `None` means unknown (the
+    /// provider reported no length, or zero), so a launcher must omit the
+    /// field rather than render a value its own config rejects.
+    pub(crate) context_length: Option<u64>,
+    /// `reasoning_effort` values the model's chat template understands, so a
+    /// launcher can expose only the effort settings that will take effect.
+    pub(crate) supported_reasoning_efforts: Vec<crate::models::ReasoningEffort>,
+}
+
 /// Result payload for `BindingType::VoiceInput`: the connection details of a
 /// transcription model, plus the knobs a launcher's speech-to-text client
 /// commonly takes.
@@ -306,6 +352,11 @@ define_bindings! {
         request: VoiceInputBindingRequest,
         result: VoiceInputBinding,
         display: "Voice Input",
+    },
+    ModelProvider {
+        request: ModelProviderBindingRequest,
+        result: ModelProviderBinding,
+        display: "Model Provider",
     },
 }
 
@@ -510,6 +561,11 @@ pub(crate) enum Dependency {
         requirement: ShellCommandRequirement,
         required: bool,
     },
+    /// The whole configured model collection rather than one model named by a
+    /// config key. A capability that exposes every configured model declares
+    /// this, so the validator walks each model and the launch registers a
+    /// proxy route for each of them.
+    Models,
 }
 
 impl std::fmt::Display for Dependency {
@@ -550,6 +606,7 @@ impl std::fmt::Display for Dependency {
                     if *required { " (required)" } else { "" }
                 )
             }
+            Dependency::Models => write!(f, "Models: all configured"),
         }
     }
 }
