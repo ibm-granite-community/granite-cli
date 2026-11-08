@@ -1,0 +1,5 @@
+launcher_id: pi
+type: pi
+enabled_capabilities:
+- model-provider
+config: {}
