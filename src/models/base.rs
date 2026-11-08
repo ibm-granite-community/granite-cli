@@ -222,6 +222,11 @@ pub(crate) trait ModelLookup: Sync {
         model_id: &str,
         requirement: Option<&crate::capabilities::ModelRequirement>,
     ) -> anyhow::Result<ConfiguredModel>;
+
+    /// Every model id in the collection, sorted. A capability whose binding
+    /// covers the whole collection rather than one named model asks for this
+    /// and then resolves each id.
+    fn configured_ids(&self) -> Vec<String>;
 }
 
 /*-- ConfiguredModel -----------------------------------------------------------*/
