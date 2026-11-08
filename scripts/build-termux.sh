@@ -39,9 +39,9 @@ for arg in "$@"; do
     esac
 done
 
-# Default to "build --release" if no cargo subcommand was specified.
+# Default to "build" if no cargo subcommand was specified.
 if [ ${#CARGO_ARGS[@]} -eq 0 ]; then
-    CARGO_ARGS=(build --release)
+    CARGO_ARGS=(build)
 fi
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
