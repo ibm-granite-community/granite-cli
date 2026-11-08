@@ -192,9 +192,9 @@ pub(crate) fn dependents(kind: RefKind, id: &str, config: &Config) -> Vec<(RefKi
     })
     .filter(|(_, entry)| {
         entry
-            .refs()
+            .refs(config)
             .iter()
-            .any(|(target_kind, target_id)| *target_kind == kind && *target_id == id)
+            .any(|(target_kind, target_id)| *target_kind == kind && target_id == id)
     })
     .map(|(referrer_kind, entry)| (referrer_kind, entry.config_id().to_string()))
     .collect();
@@ -278,7 +278,11 @@ pub(crate) trait Validatable: ConfigId {
     /// be there is what building the instance answers, so an entry with
     /// nothing under a required key names nothing and construction reports
     /// it.
-    fn refs(&self) -> Vec<(RefKind, &str)>;
+    ///
+    /// `config` is what lets a capability that declares
+    /// [`Dependency::Models`] name every configured model. Every other kind
+    /// answers from its own settings alone.
+    fn refs(&self, config: &Config) -> Vec<(RefKind, String)>;
 }
 
 /// Reaching the four maps by [`RefKind`] rather than by name. These live with
@@ -350,8 +354,8 @@ fn validate(
     // Building a capability resolves its model, and a model that is missing
     // or broken is reported at the model, with this instance as the
     // referrer the remediation prompt acts on.
-    for (target_kind, target_id) in entry.refs() {
-        validate(target_kind, target_id, config, sources, Some((kind, id)))?;
+    for (target_kind, target_id) in entry.refs(config) {
+        validate(target_kind, &target_id, config, sources, Some((kind, id)))?;
     }
 
     resolves(kind, id, sources).map_err(|problem| err(kind, id, problem, referrer))?;
@@ -415,10 +419,10 @@ impl Validatable for LauncherConfig {
             .is_some()
     }
 
-    fn refs(&self) -> Vec<(RefKind, &str)> {
+    fn refs(&self, _config: &Config) -> Vec<(RefKind, String)> {
         self.enabled_capabilities
             .iter()
-            .map(|id| (RefKind::Capability, id.as_str()))
+            .map(|id| (RefKind::Capability, id.clone()))
             .collect()
     }
 }
@@ -437,11 +441,12 @@ impl Validatable for CapabilityConfig {
     /// A capability stores its dependency ids inside its own config JSON, and
     /// only its type's static metadata says which keys hold them. A type the
     /// registry does not have names nothing, which the walk reports as an
-    /// unknown type before it asks.
-    fn refs(&self) -> Vec<(RefKind, &str)> {
+    /// unknown type before it asks. A type that declares
+    /// [`Dependency::Models`] names every configured model instead.
+    fn refs(&self, config: &Config) -> Vec<(RefKind, String)> {
         crate::capabilities::CAPABILITY_REGISTRY
             .get(&self.capability_type)
-            .map(|metadata| dependency_refs(&self.config, &metadata.dependencies))
+            .map(|metadata| dependency_refs(&self.config, &metadata.dependencies, config))
             .unwrap_or_default()
     }
 }
@@ -459,8 +464,8 @@ impl Validatable for ModelConfig {
 
     /// `provider_id` is required, so a model always names a provider. Whether
     /// that name resolves is the walk's business, like any other reference.
-    fn refs(&self) -> Vec<(RefKind, &str)> {
-        vec![(RefKind::Provider, &self.provider_id)]
+    fn refs(&self, _config: &Config) -> Vec<(RefKind, String)> {
+        vec![(RefKind::Provider, self.provider_id.clone())]
     }
 }
 
@@ -476,46 +481,67 @@ impl Validatable for ProviderConfig {
     }
 
     /// A provider references no other configured instance.
-    fn refs(&self) -> Vec<(RefKind, &str)> {
+    fn refs(&self, _config: &Config) -> Vec<(RefKind, String)> {
         Vec::new()
     }
 }
 
 /// The ids a capability's config holds under its declared dependencies'
-/// `config_key`s.
+/// `config_key`s, plus every configured model when it declares
+/// [`Dependency::Models`].
 ///
 /// A dependency contributes a reference whenever it holds an id, whether or
 /// not it is declared required, so a dangling optional dependency is walked
 /// like any other. A key holding nothing, or holding an empty string, names
 /// nothing: whether the setting had to be there is what building the
 /// capability answers, since its config type is what declares that.
-fn dependency_refs<'a>(
-    capability_config: &'a serde_json::Value,
+fn dependency_refs(
+    capability_config: &serde_json::Value,
     dependencies: &[Dependency],
-) -> Vec<(RefKind, &'a str)> {
-    let mut refs = Vec::new();
+    config: &Config,
+) -> Vec<(RefKind, String)> {
+    let mut refs: Vec<(RefKind, String)> = Vec::new();
 
     for dependency in dependencies {
-        let (kind, config_key) = match dependency {
-            Dependency::Model { config_key, .. } => (RefKind::Model, config_key),
-            Dependency::Provider { config_key, .. } => (RefKind::Provider, config_key),
+        match dependency {
+            Dependency::Model { config_key, .. } => {
+                push_config_ref(&mut refs, RefKind::Model, capability_config, config_key)
+            }
+            Dependency::Provider { config_key, .. } => {
+                push_config_ref(&mut refs, RefKind::Provider, capability_config, config_key)
+            }
+            Dependency::Models => {
+                let mut model_ids: Vec<&String> = config.models.keys().collect();
+                model_ids.sort();
+                for model_id in model_ids {
+                    let reference = (RefKind::Model, model_id.clone());
+                    if !refs.contains(&reference) {
+                        refs.push(reference);
+                    }
+                }
+            }
             // An external tool is a shell command, not a configured instance.
-            Dependency::ExternalTool { .. } => continue,
-        };
-
-        let id = capability_config
-            .get(config_key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-
-        if id.is_empty() {
-            continue;
+            Dependency::ExternalTool { .. } => {}
         }
-
-        refs.push((kind, id));
     }
 
     refs
+}
+
+/// Adds the id under `config_key` as a reference, when there is one.
+fn push_config_ref(
+    refs: &mut Vec<(RefKind, String)>,
+    kind: RefKind,
+    capability_config: &serde_json::Value,
+    config_key: &str,
+) {
+    let id = capability_config
+        .get(config_key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !id.is_empty() {
+        refs.push((kind, id.to_string()));
+    }
 }
 
 fn err(
@@ -829,14 +855,19 @@ mod tests {
 
         // Absent: nothing to check.
         assert_eq!(
-            dependency_refs(&serde_json::json!({}), &optional("model_id")),
+            dependency_refs(
+                &serde_json::json!({}),
+                &optional("model_id"),
+                &Config::default()
+            ),
             vec![]
         );
         // Present but empty counts as absent.
         assert_eq!(
             dependency_refs(
                 &serde_json::json!({ "model_id": "" }),
-                &optional("model_id")
+                &optional("model_id"),
+                &Config::default()
             ),
             vec![]
         );
@@ -846,16 +877,68 @@ mod tests {
         assert_eq!(
             dependency_refs(
                 &serde_json::json!({ "model_id": "m1" }),
-                &optional("model_id")
+                &optional("model_id"),
+                &Config::default()
             ),
-            vec![(RefKind::Model, "m1")]
+            vec![(RefKind::Model, "m1".to_string())]
         );
         assert_eq!(
             dependency_refs(
                 &serde_json::json!({ "model_id": "gone" }),
-                &optional("model_id")
+                &optional("model_id"),
+                &Config::default()
             ),
-            vec![(RefKind::Model, "gone")]
+            vec![(RefKind::Model, "gone".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_models_dependency_names_every_configured_model() {
+        let config = healthy();
+        assert_eq!(
+            dependency_refs(&serde_json::json!({}), &[Dependency::Models], &config),
+            vec![(RefKind::Model, "m1".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_model_provider_capability_reports_a_broken_model_it_would_expose() {
+        let mut config = healthy();
+        config.capabilities.insert(
+            "models".into(),
+            CapabilityConfig {
+                capability_id: "models".to_string(),
+                capability_type: "model-provider".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        config
+            .models
+            .insert("m-gone".into(), model("m-gone", "custom", Some("gone")));
+
+        let err = check(RefKind::Capability, "models", &config).expect_err("must fail");
+        // The walk reaches the model the capability would expose, then the
+        // provider that model names. Either way, the model provider capability
+        // is what made it reachable.
+        assert_eq!(err.target, (RefKind::Provider, "gone".to_string()));
+        assert_eq!(err.referrer, Some((RefKind::Model, "m-gone".to_string())));
+    }
+
+    #[test]
+    fn a_model_provider_capability_is_a_dependent_of_every_model() {
+        let mut config = healthy();
+        config.capabilities.insert(
+            "models".into(),
+            CapabilityConfig {
+                capability_id: "models".to_string(),
+                capability_type: "model-provider".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+
+        assert!(
+            dependents(RefKind::Model, "m1", &config)
+                .contains(&(RefKind::Capability, "models".to_string()))
         );
     }
 
@@ -871,7 +954,10 @@ mod tests {
         // Whether a setting has to be there is what the capability's own
         // config type declares, so an entry with nothing under the key names
         // nothing here and is reported where it is built.
-        assert_eq!(dependency_refs(&serde_json::json!({}), &required), vec![]);
+        assert_eq!(
+            dependency_refs(&serde_json::json!({}), &required, &Config::default()),
+            vec![]
+        );
 
         let mut config = healthy();
         config
@@ -1090,7 +1176,10 @@ mod tests {
             },
             required: true,
         }];
-        assert_eq!(dependency_refs(&serde_json::json!({}), &deps), vec![]);
+        assert_eq!(
+            dependency_refs(&serde_json::json!({}), &deps, &Config::default()),
+            vec![]
+        );
     }
 
     #[test]
