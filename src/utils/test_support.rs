@@ -99,6 +99,7 @@ pub(crate) struct FakeModel {
     instance_id: String,
     model_type: ModelType,
     huggingface_repo: String,
+    context_length: u64,
     supported_functions: Vec<ModelFunction>,
     variants: Vec<ModelVariant>,
 }
@@ -111,6 +112,7 @@ impl FakeModel {
             instance_id: "granite-3.1-8b-instruct".to_string(),
             model_type: ModelType::Text,
             huggingface_repo: "test/test".to_string(),
+            context_length: 4096,
             supported_functions,
             variants: Vec::new(),
         }
@@ -123,6 +125,7 @@ impl FakeModel {
             instance_id: "granite-vision-test".to_string(),
             model_type: ModelType::Vision,
             huggingface_repo: "test/test-vision".to_string(),
+            context_length: 4096,
             supported_functions,
             variants: Vec::new(),
         }
@@ -132,6 +135,12 @@ impl FakeModel {
     /// carries. Empty unless a test sets them.
     pub(crate) fn with_variants(mut self, variants: Vec<ModelVariant>) -> Self {
         self.variants = variants;
+        self
+    }
+
+    /// The context length this model reports. 4096 unless a test sets it.
+    pub(crate) fn with_context_length(mut self, context_length: u64) -> Self {
+        self.context_length = context_length;
         self
     }
 }
@@ -161,7 +170,7 @@ impl Model for FakeModel {
         1
     }
     fn context_length(&self) -> u64 {
-        4096
+        self.context_length
     }
     fn model_type(&self) -> &ModelType {
         &self.model_type
