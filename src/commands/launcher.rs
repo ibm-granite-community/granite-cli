@@ -326,6 +326,23 @@ impl LauncherCommands {
     /// before anything about the environment, so a configuration problem is
     /// reported before a missing binary is.
     pub(crate) async fn prelaunch(ctx: &mut crate::AppContext, launcher_id: &str) -> Result<()> {
+        // Refresh only the providers this launch actually uses. A provider
+        // that is down must not block the launch; a model that sync removed
+        // will be caught by the validation below as an ordinary dangling
+        // reference.
+        for report in crate::commands::shared::discovery::sync_for_launcher(ctx, launcher_id).await
+        {
+            if let crate::commands::shared::discovery::SyncStatus::Failed(error) = &report.status {
+                ctx.ui.warn(&format!(
+                    "Model discovery for '{}' failed: {error}",
+                    report.provider_id
+                ));
+            }
+            for warning in &report.warnings {
+                ctx.ui.warn(warning);
+            }
+        }
+
         let outcome = crate::commands::shared::remediation::remediate(
             ctx,
             RefKind::Launcher,
@@ -954,6 +971,7 @@ mod tests {
         ctx.config_mut().models.insert(
             model_id.to_string(),
             crate::config::ModelConfig {
+                discovered: None,
                 model_id: model_id.to_string(),
                 model_type: model_id.to_string(),
                 config: serde_json::json!({}),

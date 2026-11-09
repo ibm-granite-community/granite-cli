@@ -30,19 +30,14 @@ fn main() {
 
     fs::write(&dest_path, code).expect("Failed to write generated code");
 
-    // The hardware catalog is embedded with include_str! and parsed at run
-    // time; parsing it here turns a malformed file into a build error.
+    // Generate the hardware catalog (same pattern as generated_models.rs)
     let hardware_yaml =
         fs::read_to_string("resources/hardware.yaml").expect("Failed to read hardware.yaml");
     let hardware: Vec<YamlHardwareEntry> =
         serde_yaml::from_str(&hardware_yaml).expect("Failed to parse hardware.yaml");
-    for entry in &hardware {
-        assert!(
-            !entry.family.trim().is_empty(),
-            "hardware.yaml: entry '{}' names no family",
-            entry.id
-        );
-    }
+    let hardware_path = Path::new(&out_dir).join("generated_hardware_catalog.rs");
+    fs::write(&hardware_path, generate_hardware_catalog_code(&hardware))
+        .expect("Failed to write generated_hardware_catalog.rs");
 
     // Generate version module to OUT_DIR (same pattern as generated_models.rs)
     let version_info = get_version_info();
@@ -380,15 +375,17 @@ fn generate_layer_kind_literal(ltc: &YamlLayerTypeCount) -> String {
 
 fn format_float(value: Option<f64>) -> String {
     match value {
-        Some(f) => {
-            let formatted = if f.fract() == 0.0 {
-                format!("{f:.1}")
-            } else {
-                f.to_string()
-            };
-            format!("Some({formatted})")
-        }
+        Some(f) => format!("Some({})", float_literal(f)),
         None => "None".to_string(),
+    }
+}
+
+/// `f` as an `f64` literal: a whole number keeps a `.0`.
+fn float_literal(f: f64) -> String {
+    if f.fract() == 0.0 {
+        format!("{f:.1}")
+    } else {
+        f.to_string()
     }
 }
 
@@ -464,10 +461,12 @@ struct YamlMambaShape {
     n_groups: u64,
 }
 
-/// Mirrors `CatalogEntry` in `src/utils/hardware_catalog.rs`.
+/*-- hardware catalog --*/
+
+/// One entry of `resources/hardware.yaml`, read to generate
+/// `HARDWARE_CATALOG` in `src/utils/hardware_catalog.rs`.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct YamlHardwareEntry {
     id: String,
     name: String,
@@ -477,7 +476,7 @@ struct YamlHardwareEntry {
     sizes: Vec<YamlHardwareSize>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 enum YamlMemoryKind {
     Discrete,
@@ -487,10 +486,45 @@ enum YamlMemoryKind {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct YamlHardwareSize {
     memory_gb: f64,
     addressable_gb: Option<f64>,
+}
+
+/// The catalog as a static slice of `CatalogEntry`. An entry that names no
+/// family fails the build.
+fn generate_hardware_catalog_code(entries: &[YamlHardwareEntry]) -> String {
+    let mut code = String::from("// Auto-generated from resources/hardware.yaml - do not edit\n\n");
+    code.push_str("/// Every entry of resources/hardware.yaml, in file order.\n");
+    code.push_str("pub(crate) static HARDWARE_CATALOG: &[CatalogEntry] = &[\n");
+    for entry in entries {
+        assert!(
+            !entry.family.trim().is_empty(),
+            "hardware.yaml: entry '{}' names no family",
+            entry.id
+        );
+        code.push_str("    CatalogEntry {\n");
+        code.push_str(&format!("        id: {:?},\n", entry.id));
+        code.push_str(&format!("        name: {:?},\n", entry.name));
+        code.push_str(&format!("        family: {:?},\n", entry.family));
+        code.push_str(&format!("        vendor: {:?},\n", entry.vendor.as_deref()));
+        code.push_str(&format!(
+            "        memory_kind: MemoryKind::{:?},\n",
+            entry.memory_kind
+        ));
+        code.push_str("        sizes: &[\n");
+        for size in &entry.sizes {
+            code.push_str(&format!(
+                "            CatalogSize {{ memory_gb: {}, addressable_gb: {} }},\n",
+                float_literal(size.memory_gb),
+                format_float(size.addressable_gb)
+            ));
+        }
+        code.push_str("        ],\n");
+        code.push_str("    },\n");
+    }
+    code.push_str("];\n");
+    code
 }
 
 /*-- version info --*/

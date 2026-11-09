@@ -149,12 +149,26 @@ impl crate::dependency::Configured<dyn Provider> for ProviderSource {
     }
 }
 
+/*-- Model discovery ---------------------------------------------------------*/
+
+/// Whether a provider instance's stored config has discovery on. An absent
+/// field means off: the type's setup default applies only when a config is
+/// first written, never to a config that predates the field. Reads
+/// configuration only, so a provider whose discovery is off is never
+/// constructed.
+pub(crate) fn discovery_enabled(config: &serde_json::Value) -> bool {
+    config
+        .get("discover_models")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 /*-- Module Declarations -----------------------------------------------------*/
 
 mod base;
 pub(crate) use base::{
     ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError, ProviderMetadata,
-    ProviderType, PullResult,
+    ProviderModel, ProviderType, PullResult,
 };
 
 mod openai;
@@ -279,5 +293,25 @@ mod tests {
         let mut ids = resolution.existing_instances;
         ids.sort();
         assert_eq!(ids, vec!["llama-cpp".to_string(), "ollama".to_string()]);
+    }
+
+    #[test]
+    fn discovery_enabled_is_off_when_the_field_is_absent() {
+        // A stored config that predates the field stays off, whatever the
+        // type's setup default is.
+        assert!(!discovery_enabled(&serde_json::json!({
+            "base_url": "http://localhost:11434"
+        })));
+        assert!(!discovery_enabled(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn discovery_enabled_honours_an_explicit_false() {
+        assert!(!discovery_enabled(&serde_json::json!({
+            "discover_models": false
+        })));
+        assert!(discovery_enabled(&serde_json::json!({
+            "discover_models": true
+        })));
     }
 }

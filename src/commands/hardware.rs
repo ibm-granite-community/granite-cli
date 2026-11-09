@@ -84,9 +84,9 @@ impl HardwareCommands {
             .filter(|e| family.is_none_or(|f| e.family == f))
             .map(|e| {
                 vec![
-                    e.family.clone(),
-                    e.id.clone(),
-                    e.name.clone(),
+                    e.family.to_string(),
+                    e.id.to_string(),
+                    e.name.to_string(),
                     catalog_memory(e),
                 ]
             })
@@ -366,7 +366,7 @@ impl HardwareCommands {
             .ok_or_else(|| not_configured(ctx, id))?;
         let mut fields: Vec<(&str, String)> = vec![("Type", hardware.hardware_type.clone())];
         if let Some(entry) = hardware_catalog::find(&hardware.hardware_type) {
-            fields.push(("Device", entry.name.clone()));
+            fields.push(("Device", entry.name.to_string()));
         }
         if let Some(local) = hardware.local_settings() {
             fields.push(("Mode", mode_label(local.mode).to_string()));
@@ -707,8 +707,8 @@ fn find_family(name: &str) -> Result<&'static str> {
 fn families() -> Vec<&'static str> {
     let mut families: Vec<&'static str> = vec![];
     for e in HARDWARE_CATALOG.iter() {
-        if !families.contains(&e.family.as_str()) {
-            families.push(&e.family);
+        if !families.contains(&e.family) {
+            families.push(e.family);
         }
     }
     families
@@ -750,14 +750,14 @@ fn choose_target(ctx: &AppContext) -> Result<String> {
         .filter(|e| e.family == *family)
         .collect();
     if let [entry] = entries.as_slice() {
-        return Ok(entry.id.clone());
+        return Ok(entry.id.to_string());
     }
     let items: Vec<String> = entries
         .iter()
         .map(|e| format!("{} ({})", e.id, e.name))
         .collect();
     let index = ctx.ui.select("Hardware type", &items, 0)?;
-    Ok(entries[index].id.clone())
+    Ok(entries[index].id.to_string())
 }
 
 fn catalog_size(
@@ -2048,7 +2048,7 @@ mod tests {
         let entry = HARDWARE_CATALOG.iter().find(|e| e.sizes.len() > 1).unwrap();
         let sizes: Vec<String> = entry.sizes.iter().map(|s| format_gb(s.memory_gb)).collect();
 
-        let err = HardwareCommands::profile_for_fit_with(&mut ctx, &entry.id, false, no_detection)
+        let err = HardwareCommands::profile_for_fit_with(&mut ctx, entry.id, false, no_detection)
             .unwrap_err();
 
         assert!(

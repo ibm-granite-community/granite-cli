@@ -626,9 +626,9 @@ classDiagram
 Solid arrows are references stored in configuration or in the catalog. The
 dashed arrow is a read at run time.
 
-The catalog is plain data: `build.rs` embeds `resources/hardware.yaml` and
-checks that it parses, and the binary parses it once, as it does for
-recommended configurations. A configured hardware profile has the same shape
+The catalog is plain data: `build.rs` reads `resources/hardware.yaml` and
+generates a static list of entries, as it does for the model catalog, so a
+malformed file fails the build and nothing is parsed at run time. A configured hardware profile has the same shape
 as a configured model: an id, a type, a selector (`memory`, where a model has
 `variant`) and a `config` blob, which holds the figures for custom and local
 profiles and the mode for `local`. The optional `headroom` sits next to
@@ -678,8 +678,13 @@ Launch, validation, capabilities and launchers never read fit.
   small: `can_run_model` reads the provider's hardware profile. It changes the
   provider interface and every implementation, and is tracked as a follow-up
   (#225).
-- Estimating how a model splits across several GPUs. A hardware profile states
-  their total memory.
+- Machines with several GPUs. A hardware profile describes one machine with
+  one memory figure: a catalog profile is one device, and detection reads the
+  first GPU only. A custom profile can state the total memory of several
+  GPUs, but the estimate then counts the per-GPU overhead once and does not
+  check that the model can be split across them, so it can report a fit that
+  does not hold. Support for several devices per profile, in detection, the
+  catalog and the fit estimate, is left to a separate spec.
 - Changing the estimator's formula or its default headroom factors. A
   hardware profile can set its own factor (see "Overriding the headroom");
   granite-cli does not detect a factor or probe a machine for
@@ -839,9 +844,9 @@ Ship a catalog of known devices in the binary.
 `resources/hardware.yaml` lists devices as plain data, each with its family,
 the memory sizes it is sold in and, for unified memory, the GPU-addressable
 figure for each size. Apple sizes other than 64 GB use the measured 81%
-ratio, and the file says which figures were measured. `build.rs` embeds the
-file and fails the build if it does not parse or an entry names no family.
-The binary parses it once, on first use.
+ratio, and the file says which figures were measured. `build.rs` generates the
+catalog from the file as a static list, and fails the build if the file does
+not parse or an entry names no family.
 
 Tests cover: every entry declaring at least one size, each with `memory_gb`
 above 0, and naming a family; unique ids; one entry
@@ -850,8 +855,8 @@ giving the same usable memory as a detected profile with the measured working
 set.
 
 **Relevant Context**
-- `build.rs` (how `resources/recommended_configs` is embedded)
-- `src/config/recommended_config.rs` (`BUILTIN_RECOMMENDED_CONFIGS`)
+- `build.rs` (`generate_models_code`: how `resources/models.yaml` becomes code)
+- `src/models/mod.rs` (the `include!` of the generated models)
 
 **Status** — `[x]` done
 
