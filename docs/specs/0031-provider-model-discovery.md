@@ -231,7 +231,7 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
   parses as a single number; `26B-A4B` stays `None`).
 - `context_length` and `supported_functions`: `POST /api/show` with
   `{"model": "<id>"}` per model. N+1 requests, up to 8 `/api/show` requests
-  at a time (`MAX_CONCURRENT_SHOWS`), so a slow server stays inside the
+  at a time (a fixed limit in the code), so a slow server stays inside the
   launch-time sync cap for longer lists. Read
   `capabilities` (`completion`, `tools`, `vision`, `thinking`, `embedding`).
   `context_length` is the `num_ctx` line of the `parameters` string (the
@@ -321,7 +321,8 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
 - `context_length`: the `-c N`, `--ctx-size N`, `-c=N` or `--ctx-size=N`
   value in `status.args` (the llama-server command line the router runs the
   model with), last occurrence wins. Absent, malformed or `0` (llama-server's
-  "use the trained context") gives `None`.
+  "use the trained context") gives `None`. This is best effort: llama-server
+  options that size the context another way, such as `--fit`, are not read.
 - `parameter_count`, `disk_size_bytes`: not in the router list. Leave
   `None`/0. (`/v1/models` in a single-server build sometimes has
   `meta.n_ctx_train`/`meta.n_params`; do not depend on it.)
