@@ -254,10 +254,28 @@ struct OllamaShowResponse {
     capabilities: Vec<String>,
     #[serde(default)]
     model_info: HashMap<String, serde_json::Value>,
+    /// The model's Modelfile `PARAMETER` lines, one `<name> <value>` per line.
+    #[serde(default)]
+    parameters: String,
 }
 
 /// How many `POST /api/show` requests `list_models` keeps in flight.
 const MAX_CONCURRENT_SHOWS: usize = 8;
+
+/// The `num_ctx` value in an `/api/show` `parameters` string, when set and
+/// greater than zero. Ollama serves a model with that context size.
+fn num_ctx_from_parameters(parameters: &str) -> Option<u64> {
+    parameters.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("num_ctx") {
+            return None;
+        }
+        fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    })
+}
 
 impl ConfigConstructable for OllamaProvider {
     type Config = OllamaProviderConfig;
@@ -400,12 +418,19 @@ impl Provider for OllamaProvider {
                 .as_ref()
                 .map(|s| s.capabilities.as_slice())
                 .unwrap_or_default();
+            // A `num_ctx` in the Modelfile parameters is the context Ollama
+            // runs the model with, so agents are told to stay within it.
+            // Without it, the trained maximum from `model_info` is stored.
+            // Ollama may allocate less by default, and its llama-server
+            // `--context-shift` keeps longer requests from failing.
             let context_length = shown.as_ref().and_then(|s| {
-                s.model_info
-                    .iter()
-                    .filter(|(key, _)| key.ends_with(".context_length"))
-                    .filter_map(|(_, value)| value.as_u64())
-                    .max()
+                num_ctx_from_parameters(&s.parameters).or_else(|| {
+                    s.model_info
+                        .iter()
+                        .filter(|(key, _)| key.ends_with(".context_length"))
+                        .filter_map(|(_, value)| value.as_u64())
+                        .max()
+                })
             });
             let is_embedding = capabilities.iter().any(|c| c == "embedding");
             let supported_functions = if capabilities.is_empty() {
@@ -899,6 +924,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn num_ctx_from_parameters_reads_the_num_ctx_line() {
+        assert_eq!(
+            num_ctx_from_parameters("stop \"<|im_end|>\"\nnum_ctx    8192\ntemperature 0.7"),
+            Some(8192)
+        );
+        assert_eq!(num_ctx_from_parameters("temperature 0.7"), None);
+        assert_eq!(num_ctx_from_parameters(""), None);
+        assert_eq!(num_ctx_from_parameters("num_ctx 0"), None);
+        assert_eq!(num_ctx_from_parameters("num_ctx lots"), None);
+    }
+
     async fn discovery_server(show_status_failure: bool) -> String {
         use axum::{
             Json, Router,
@@ -917,6 +954,11 @@ mod tests {
                             "parameter_size": "8.0B",
                             "quantization_level": "Q4_K_M"
                         }
+                    },
+                    {
+                        "name": "granite4:8b-32k",
+                        "model": "granite4:8b-32k",
+                        "details": { "family": "granite", "parameter_size": "8.0B" }
                     },
                     {
                         "name": "nomic-embed-text:latest",
@@ -938,6 +980,14 @@ mod tests {
                 return Json(serde_json::json!({
                     "capabilities": ["embedding"],
                     "model_info": { "nomic_bert.context_length": 2048 }
+                }))
+                .into_response();
+            }
+            if model.starts_with("granite4:8b-32k") {
+                return Json(serde_json::json!({
+                    "capabilities": ["completion", "tools"],
+                    "model_info": { "granite.context_length": 131072 },
+                    "parameters": "stop                           \"<|end_of_text|>\"\nnum_ctx                        32768\ntemperature                    0"
                 }))
                 .into_response();
             }
@@ -972,10 +1022,14 @@ mod tests {
         )
         .unwrap();
         let models = provider.list_models().await.unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
 
         let chat = models.iter().find(|m| m.id == "granite4:8b").unwrap();
         assert_eq!(chat.context_length, Some(131072));
+
+        // `num_ctx` in the Modelfile parameters wins over the trained maximum.
+        let tuned = models.iter().find(|m| m.id == "granite4:8b-32k").unwrap();
+        assert_eq!(tuned.context_length, Some(32768));
         assert_eq!(chat.parameter_count, Some(8_000_000_000));
         assert_eq!(chat.disk_size_bytes, Some(4_900_000_000));
         assert!(chat.supported_functions.contains(&ModelFunction::Chat));
@@ -1010,7 +1064,7 @@ mod tests {
         )
         .unwrap();
         let models = provider.list_models().await.unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         let chat = models.iter().find(|m| m.id == "granite4:8b").unwrap();
         assert_eq!(chat.context_length, None);
         assert_eq!(

@@ -233,13 +233,15 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
   `{"model": "<id>"}` per model. N+1 requests, up to 8 `/api/show` requests
   at a time (`MAX_CONCURRENT_SHOWS`), so a slow server stays inside the
   launch-time sync cap for longer lists. Read
-  `capabilities` (`completion`, `tools`, `vision`, `thinking`, `embedding`) and
-  the `model_info` key ending in `.context_length` (e.g.
-  `llama.context_length`), the trained maximum. Ollama may load the model
-  with a smaller context (a Modelfile `num_ctx`, or its default from available
-  VRAM). It runs llama-server with `--context-shift`, so a request longer than
-  the loaded context is shifted and does not fail, and agents are given the
-  trained maximum. Older builds without `capabilities` fall back to
+  `capabilities` (`completion`, `tools`, `vision`, `thinking`, `embedding`).
+  `context_length` is the `num_ctx` line of the `parameters` string (the
+  Modelfile `PARAMETER` lines) when the model sets one, since Ollama runs the
+  model with that context. Otherwise it is the `model_info` key ending in
+  `.context_length` (e.g. `llama.context_length`), the trained maximum.
+  Without `num_ctx`, Ollama may allocate less, from its default for the
+  available VRAM. It runs llama-server with `--context-shift`, so a request
+  longer than the loaded context is shifted and does not fail; this is a
+  fallback for machines with less memory. Older builds without `capabilities` fall back to
   `[Chat, ToolCalling]` for `completion` models.
 - `model_type`: `Embedding` when `capabilities` has `embedding`, otherwise
   `Text` (Ollama does not distinguish vision at the type level; the function is
@@ -701,7 +703,7 @@ No test may reach the internet or depend on locally running servers
 Provider parsers (fixture JSON, no network):
 
 - Ollama `/api/tags` + `/api/show`: name/model fallback, parameter size parse,
-  context key, capability mapping, show failure degrades.
+  `num_ctx` before the context key, capability mapping, show failure degrades.
 - LM Studio `/api/v1/models`: `key`, `type` mapping, vision/tools/reasoning,
   `max_context_length`, `params_string` parse.
 - llama.cpp `/models`: the observed router shape; image/audio modalities →
