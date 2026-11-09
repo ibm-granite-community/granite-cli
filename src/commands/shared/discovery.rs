@@ -52,7 +52,8 @@ pub(crate) struct SyncReport {
     /// Instance ids that had to be namespaced because the natural id was
     /// taken by a different model.
     pub(crate) conflicts: Vec<String>,
-    /// Warnings to show, including dependents of removed models.
+    /// Warnings to show, including dependents of removed models and reported
+    /// models that were skipped.
     pub(crate) warnings: Vec<String>,
 }
 
@@ -346,11 +347,18 @@ fn apply_prepared(ctx: &mut crate::AppContext, prepared: PreparedSync) -> SyncRe
 
     let duplicates = discovery::duplicates(&input.reported);
     if !duplicates.is_empty() {
+        // `escape_debug` keeps a control character in a reported id from
+        // reaching the terminal through this warning.
+        let duplicates: Vec<String> = duplicates
+            .iter()
+            .map(|id| id.escape_debug().to_string())
+            .collect();
         report.warnings.push(format!(
             "provider reported duplicate model ids: {}",
             duplicates.join(", ")
         ));
     }
+    report.warnings.extend(plan.skipped.iter().cloned());
     for (_, addition) in &plan.additions {
         report.added.push(addition.model_id.clone());
     }

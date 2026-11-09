@@ -388,7 +388,7 @@ Sync creates a `custom` model with defaults. No prompt: sync runs from
 | field | default |
 |---|---|
 | `model_type` | `"custom"` |
-| `family` | `display_name` else wire id |
+| `family` | `display_name` else wire id, control characters removed |
 | `context_length` | reported else `0` (unknown; agent-model and sub-agent bindings pass `None` to launchers for `0`) |
 | `size` | reported parameter count else `0` |
 | `model_type` (capability) | inferred else `Text` |
@@ -661,6 +661,11 @@ on.
   would be longer than 255 bytes, `Config::id_to_filename` cuts the name short
   and ends it with `~` and a 64-bit FNV-1a hash of the id. The file holds the
   full id, and loading accepts a file whose name is the id's shortened name.
+- **Wire id or display name contains control characters.** `model list` and
+  `model info` print ids and families as stored, so the plan skips an id with
+  any `char::is_control` character (with a warning that shows it escaped) and
+  drops control characters from the display name before storing it as
+  `family`.
 - **Save fails after a listing.** The report status is `Failed` with the save
   error, and `added`/`removed` are empty, so the summary does not claim
   changes that did not reach disk.

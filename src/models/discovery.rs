@@ -28,6 +28,9 @@ pub(crate) struct DiscoveryPlan {
     /// Instance ids that had to be namespaced because the natural id was
     /// taken by a different configured model.
     pub(crate) conflicts: Vec<String>,
+    /// Reported models that were not added, one message each, for the sync
+    /// report's warnings.
+    pub(crate) skipped: Vec<String>,
 }
 
 impl DiscoveryPlan {
@@ -49,9 +52,20 @@ pub(crate) fn plan(
     models: &HashMap<String, ModelConfig>,
     covered: &HashMap<String, String>,
 ) -> DiscoveryPlan {
+    let mut skipped = Vec::new();
     let mut reported_by_id: HashMap<&str, &ProviderModel> = HashMap::new();
     for model in reported {
         if model.id.is_empty() {
+            continue;
+        }
+        // `model list` and `model info` print instance ids as they are, so an
+        // id with a control character could send escape sequences to the
+        // terminal. Such an id is not added.
+        if model.id.chars().any(char::is_control) {
+            skipped.push(format!(
+                "skipped model {}: its id contains control characters",
+                id_preview(&model.id)
+            ));
             continue;
         }
         // First occurrence wins; a duplicate is not worth failing a sync.
@@ -122,6 +136,7 @@ pub(crate) fn plan(
         removals,
         present,
         conflicts,
+        skipped,
     }
 }
 
@@ -143,11 +158,17 @@ fn discovered_model_config(
     } else {
         model.supported_functions.clone()
     };
+    // The display name is printed as the model's family; control characters
+    // are dropped from it for the same reason ids with them are skipped.
+    let family: String = model
+        .display_name
+        .as_deref()
+        .unwrap_or(&model.id)
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect();
     let config = CustomModelConfig {
-        family: model
-            .display_name
-            .clone()
-            .unwrap_or_else(|| model.id.clone()),
+        family,
         version: String::new(),
         size: model.parameter_count.unwrap_or(0),
         context_length: model.context_length.unwrap_or(0),
@@ -192,6 +213,23 @@ fn available_id(provider_id: &str, wire_id: &str, reserved: &HashSet<String>) ->
         }
         suffix += 1;
     }
+}
+
+/// How many characters of a reported id a warning shows.
+const ID_PREVIEW_CHARS: usize = 40;
+
+/// The start of a reported id for a warning, with non-printing characters
+/// escaped by `char::escape_debug`.
+fn id_preview(id: &str) -> String {
+    let mut preview: String = id
+        .chars()
+        .take(ID_PREVIEW_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if id.chars().count() > ID_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    format!("'{preview}'")
 }
 
 /// Wire names that duplicate an entry the caller already saw, for a report.
@@ -409,6 +447,34 @@ mod tests {
         );
         assert_eq!(plan.present, 2);
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn skips_an_id_with_control_characters() {
+        let plan = plan(
+            "p1",
+            "ollama",
+            &[reported("evil\u{1b}[2J"), reported("llama3:8b")],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let ids: Vec<&str> = plan.additions.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["llama3:8b"]);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].contains("control characters"));
+        // The warning itself shows the escape character escaped.
+        assert!(!plan.skipped[0].contains('\u{1b}'));
+        assert!(plan.skipped[0].contains("\\u{1b}"), "{}", plan.skipped[0]);
+    }
+
+    #[test]
+    fn strips_control_characters_from_the_display_name() {
+        let mut model = reported("llama3:8b");
+        model.display_name = Some("Llama\u{1b}[31m 3\u{7}".to_string());
+        let plan = plan("p1", "ollama", &[model], &HashMap::new(), &HashMap::new());
+        let custom: CustomModelConfig =
+            serde_json::from_value(plan.additions[0].1.config.clone()).unwrap();
+        assert_eq!(custom.family, "Llama[31m 3");
     }
 
     #[test]
