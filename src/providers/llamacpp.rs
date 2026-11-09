@@ -66,6 +66,20 @@ struct LlamaCppDiscoveryStatus {
     args: Vec<String>,
 }
 
+/// Whether a llama-server command line serves embeddings (`--embedding` or
+/// `--embeddings`). Such a server does not answer chat completions.
+fn serves_embeddings(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--embedding" | "--embeddings"))
+}
+
+/// Whether a llama-server command line serves reranking (`--rerank` or
+/// `--reranking`), through `/v1/rerank`.
+fn serves_reranking(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--rerank" | "--reranking"))
+}
+
 /// The context size set by `-c N`, `--ctx-size N`, `-c=N` or `--ctx-size=N`
 /// in a llama-server command line. The last occurrence wins, as it does for
 /// llama-server. `0` means "use the model's trained context" to
@@ -524,7 +538,14 @@ impl Provider for LlamaCppProvider {
             let has_image = modalities.iter().any(|m| m == "image");
             let has_audio = modalities.iter().any(|m| m == "audio");
 
-            let (model_type, supported_functions) = if has_audio {
+            // ModelFunction has no reranking variant, so no capability can
+            // use a reranker. It is left out of the listing.
+            if serves_reranking(&args) {
+                continue;
+            }
+            let (model_type, supported_functions) = if serves_embeddings(&args) {
+                (ModelType::Embedding, vec![ModelFunction::Embeddings])
+            } else if has_audio {
                 (
                     ModelType::Speech,
                     vec![ModelFunction::Chat, ModelFunction::Transcription],
@@ -832,6 +853,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn serves_embeddings_and_serves_reranking_match_every_flag_spelling() {
+        for flag in ["--embedding", "--embeddings"] {
+            assert!(serves_embeddings(&args(&["llama-server", flag])), "{flag}");
+            assert!(!serves_reranking(&args(&["llama-server", flag])), "{flag}");
+        }
+        for flag in ["--rerank", "--reranking"] {
+            assert!(serves_reranking(&args(&["llama-server", flag])), "{flag}");
+            assert!(!serves_embeddings(&args(&["llama-server", flag])), "{flag}");
+        }
+        assert!(!serves_embeddings(&args(&["llama-server", "--jinja"])));
+        assert!(!serves_reranking(&[]));
+    }
+
     async fn discovery_server() -> String {
         use axum::{Json, Router, routing::get};
 
@@ -845,6 +880,16 @@ mod tests {
                             "value": "unloaded",
                             "args": ["llama-server", "--port", "0", "--ctx-size", "65536", "--jinja"]
                         }
+                    },
+                    {
+                        "id": "embeddinggemma-300m",
+                        "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
+                        "status": { "value": "unloaded", "args": ["llama-server", "--embeddings", "--pooling", "mean"] }
+                    },
+                    {
+                        "id": "bge-reranker-v2-m3",
+                        "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
+                        "status": { "value": "unloaded", "args": ["llama-server", "--reranking"] }
                     },
                     {
                         "id": "Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M",
@@ -875,7 +920,19 @@ mod tests {
         )
         .unwrap();
         let models = provider.list_models().await.unwrap();
-        assert_eq!(models.len(), 3);
+        // The reranker is left out.
+        assert_eq!(models.len(), 4);
+        assert!(!models.iter().any(|m| m.id == "bge-reranker-v2-m3"));
+
+        let embedding = models
+            .iter()
+            .find(|m| m.id == "embeddinggemma-300m")
+            .unwrap();
+        assert_eq!(embedding.model_type, Some(ModelType::Embedding));
+        assert_eq!(
+            embedding.supported_functions,
+            vec![ModelFunction::Embeddings]
+        );
 
         let text = models
             .iter()

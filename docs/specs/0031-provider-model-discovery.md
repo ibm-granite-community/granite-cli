@@ -300,7 +300,12 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
 
 - `id` = `id` (the router uses the alias as the request name).
 - `display_name` = `id` (no separate display name).
-- `model_type` and functions from `architecture.input_modalities`:
+- `status.args` containing `--rerank` or `--reranking` → not listed.
+  `ModelFunction` has no reranking variant, so no capability can use the
+  model.
+- `status.args` containing `--embedding` or `--embeddings` →
+  `ModelType::Embedding`, functions `[Embeddings]`.
+- Otherwise `model_type` and functions from `architecture.input_modalities`:
   - `image` → `ModelType::Vision`, functions `[Chat, ToolCalling, ImageUnderstanding]`;
   - `audio` → `ModelType::Speech`, functions `[Chat, Transcription]` (observed
     on `ibm-granite/granite-4.0-1b-speech-GGUF:Q4_K_M` on the example router);
@@ -698,8 +703,8 @@ Provider parsers (fixture JSON, no network):
 - LM Studio `/api/v1/models`: `key`, `type` mapping, vision/tools/reasoning,
   `max_context_length`, `params_string` parse.
 - llama.cpp `/models`: the observed router shape; image/audio modalities →
-  vision/transcription; unloaded entries included; context from
-  `status.args`.
+  vision/transcription; embedding flags in `status.args` → embedding; rerank flags → left out;
+  unloaded entries included; context from `status.args`.
 
 Pure logic (new module, no network):
 
