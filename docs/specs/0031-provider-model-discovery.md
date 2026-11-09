@@ -649,6 +649,13 @@ on.
 - **Wire id contains `/` or `:`** (llama.cpp `org/model:Q4_K_M`, Ollama tags).
   Both are legal in instance ids; `Config::id_to_filename` maps the separator
   and escapes Windows-invalid characters so config file names remain usable.
+- **Instance id too long for a file name.** When the escaped id plus `.yaml`
+  would be longer than 255 bytes, `Config::id_to_filename` cuts the name short
+  and ends it with `~` and a 64-bit FNV-1a hash of the id. The file holds the
+  full id, and loading accepts a file whose name is the id's shortened name.
+- **Save fails after a listing.** The report status is `Failed` with the save
+  error, and `added`/`removed` are empty, so the summary does not claim
+  changes that did not reach disk.
 - **Provider reports the same id twice.** First wins; warn.
 - **Ollama `/api/show` fails for one model.** Keep the `/api/tags` entry; the
   next sync retries.
