@@ -208,9 +208,13 @@ impl PiLauncher {
             "apiKey": format!("${API_KEY_ENV}"),
             "models": [{
                 "id": binding.model_name,
-                "contextWindow": binding.context_length,
             }],
         });
+        // `contextWindow` is written only when `binding.context_length` is
+        // known.
+        if let Some(context_length) = binding.context_length {
+            entry["models"][0]["contextWindow"] = serde_json::json!(context_length);
+        }
 
         // Add custom headers from binding if present. They are merged at the
         // provider level in Pi's models.json.
@@ -814,6 +818,16 @@ mod tests {
         assert_eq!(entry["apiKey"], "$GRANITE_CLI_PI_API_KEY");
         assert_eq!(entry["models"][0]["id"], "granite4.1:8b");
         assert_eq!(entry["models"][0]["contextWindow"], 131072);
+    }
+
+    #[test]
+    fn provider_entry_omits_context_window_when_unknown() {
+        let mut binding = binding();
+        binding.context_length = None;
+        let entry = launcher(serde_json::json!({}))
+            .provider_entry(&binding)
+            .unwrap();
+        assert!(entry["models"][0].get("contextWindow").is_none());
     }
 
     #[test]

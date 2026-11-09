@@ -233,7 +233,11 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
   `{"model": "<id>"}` per model. N+1 requests, local and cheap. Read
   `capabilities` (`completion`, `tools`, `vision`, `thinking`, `embedding`) and
   the `model_info` key ending in `.context_length` (e.g.
-  `llama.context_length`). Older builds without `capabilities` fall back to
+  `llama.context_length`), the trained maximum. Ollama may load the model
+  with a smaller context (a Modelfile `num_ctx`, or its default from available
+  VRAM). It runs llama-server with `--context-shift`, so a request longer than
+  the loaded context is shifted and does not fail, and agents are given the
+  trained maximum. Older builds without `capabilities` fall back to
   `[Chat, ToolCalling]` for `completion` models.
 - `model_type`: `Embedding` when `capabilities` has `embedding`, otherwise
   `Text` (Ollama does not distinguish vision at the type level; the function is
@@ -304,8 +308,12 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
   The endpoint exposes no tool capability beyond modalities, so `ToolCalling`
   is the same optimistic default as the generic fallback for text/vision.
   Audio drops it: a speech model is not a tool caller.
-- `context_length`, `parameter_count`, `disk_size_bytes`: not in the router
-  list. Leave `None`/0. (`/v1/models` in a single-server build sometimes has
+- `context_length`: the `-c N`, `--ctx-size N`, `-c=N` or `--ctx-size=N`
+  value in `status.args` (the llama-server command line the router runs the
+  model with), last occurrence wins. Absent, malformed or `0` (llama-server's
+  "use the trained context") gives `None`.
+- `parameter_count`, `disk_size_bytes`: not in the router list. Leave
+  `None`/0. (`/v1/models` in a single-server build sometimes has
   `meta.n_ctx_train`/`meta.n_params`; do not depend on it.)
 - `status.value` (`loaded`/`unloaded`/`loading`/`sleeping`/`failed`) is
   informational. In router mode with `models_autoload: true`, unloaded entries
@@ -381,7 +389,7 @@ Sync creates a `custom` model with defaults. No prompt: sync runs from
 |---|---|
 | `model_type` | `"custom"` |
 | `family` | `display_name` else wire id |
-| `context_length` | reported else `0` (unknown) |
+| `context_length` | reported else `0` (unknown; agent-model and sub-agent bindings pass `None` to launchers for `0`) |
 | `size` | reported parameter count else `0` |
 | `model_type` (capability) | inferred else `Text` |
 | `supported_functions` | inferred, else `[Chat, ToolCalling]` |
@@ -686,7 +694,8 @@ Provider parsers (fixture JSON, no network):
 - LM Studio `/api/v1/models`: `key`, `type` mapping, vision/tools/reasoning,
   `max_context_length`, `params_string` parse.
 - llama.cpp `/models`: the observed router shape; image/audio modalities →
-  vision/transcription; unloaded entries included; no context.
+  vision/transcription; unloaded entries included; context from
+  `status.args`.
 
 Pure logic (new module, no network):
 

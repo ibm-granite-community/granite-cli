@@ -42,8 +42,8 @@ struct LlamaCppModelStatus {
 }
 
 /// One entry from the router's `GET /models` discovery response. Only the
-/// fields sync uses are represented; the endpoint also returns presets, args,
-/// and tags, which are noise here.
+/// fields sync uses are represented; the endpoint also returns presets and
+/// tags, which are noise here.
 #[derive(Debug, Deserialize)]
 struct LlamaCppDiscoveryResponse {
     data: Vec<LlamaCppDiscoveryEntry>,
@@ -54,6 +54,37 @@ struct LlamaCppDiscoveryEntry {
     id: String,
     #[serde(default)]
     architecture: Option<LlamaCppArchitecture>,
+    #[serde(default)]
+    status: Option<LlamaCppDiscoveryStatus>,
+}
+
+/// `status` of a discovery entry. `args` is the llama-server command line
+/// the router uses for the model.
+#[derive(Debug, Default, Deserialize)]
+struct LlamaCppDiscoveryStatus {
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+/// The context size set by `-c N`, `--ctx-size N`, `-c=N` or `--ctx-size=N`
+/// in a llama-server command line. The last occurrence wins, as it does for
+/// llama-server. `0` means "use the model's trained context" to
+/// llama-server, so it is reported as unknown.
+fn ctx_size_from_args(args: &[String]) -> Option<u64> {
+    let mut ctx_size = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let value = match arg.as_str() {
+            "-c" | "--ctx-size" => iter.next().map(String::as_str),
+            other => other
+                .strip_prefix("--ctx-size=")
+                .or_else(|| other.strip_prefix("-c=")),
+        };
+        if let Some(value) = value {
+            ctx_size = value.trim().parse::<u64>().ok();
+        }
+    }
+    ctx_size.filter(|n| *n > 0)
 }
 
 #[derive(Debug, Deserialize)]
@@ -485,6 +516,7 @@ impl Provider for LlamaCppProvider {
             if entry.id.is_empty() {
                 continue;
             }
+            let args = entry.status.map(|status| status.args).unwrap_or_default();
             let modalities = entry
                 .architecture
                 .map(|a| a.input_modalities)
@@ -516,7 +548,7 @@ impl Provider for LlamaCppProvider {
             models.push(ProviderModel {
                 id: entry.id.clone(),
                 display_name: Some(entry.id),
-                context_length: None,
+                context_length: ctx_size_from_args(&args),
                 parameter_count: None,
                 disk_size_bytes: None,
                 model_type: Some(model_type),
@@ -761,6 +793,45 @@ mod tests {
         assert!(parsed.data[0].status.failed);
     }
 
+    fn args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn ctx_size_from_args_reads_every_spelling() {
+        assert_eq!(ctx_size_from_args(&args(&["-c", "4096"])), Some(4096));
+        assert_eq!(
+            ctx_size_from_args(&args(&["--ctx-size", "8192"])),
+            Some(8192)
+        );
+        assert_eq!(ctx_size_from_args(&args(&["-c=16384"])), Some(16384));
+        assert_eq!(
+            ctx_size_from_args(&args(&["--ctx-size=32768"])),
+            Some(32768)
+        );
+    }
+
+    #[test]
+    fn ctx_size_from_args_uses_the_last_occurrence() {
+        assert_eq!(
+            ctx_size_from_args(&args(&["-c", "4096", "--ctx-size", "8192"])),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn ctx_size_from_args_is_none_when_absent_zero_or_malformed() {
+        assert_eq!(ctx_size_from_args(&args(&["--port", "8080"])), None);
+        assert_eq!(ctx_size_from_args(&args(&["-c", "0"])), None);
+        assert_eq!(ctx_size_from_args(&args(&["-c", "big"])), None);
+        assert_eq!(ctx_size_from_args(&args(&["-c"])), None);
+        // `-cb` and `--ctx-size-draft` are other flags.
+        assert_eq!(
+            ctx_size_from_args(&args(&["-cb", "--ctx-size-draft", "512"])),
+            None
+        );
+    }
+
     async fn discovery_server() -> String {
         use axum::{Json, Router, routing::get};
 
@@ -770,7 +841,10 @@ mod tests {
                     {
                         "id": "Qwen-3.8-27b-d4-UD-Q4_K_XL",
                         "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
-                        "status": { "value": "unloaded" }
+                        "status": {
+                            "value": "unloaded",
+                            "args": ["llama-server", "--port", "0", "--ctx-size", "65536", "--jinja"]
+                        }
                     },
                     {
                         "id": "Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M",
@@ -812,12 +886,15 @@ mod tests {
             text.supported_functions,
             vec![ModelFunction::Chat, ModelFunction::ToolCalling]
         );
+        assert_eq!(text.context_length, Some(65536));
 
         let vision = models
             .iter()
             .find(|m| m.id == "Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M")
             .unwrap();
         assert_eq!(vision.model_type, Some(ModelType::Vision));
+        // No `status.args`: the context size is unknown.
+        assert_eq!(vision.context_length, None);
         assert!(
             vision
                 .supported_functions
