@@ -230,7 +230,9 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
 - `parameter_count` = parsed `details.parameter_size` (`8.0B` → 8e9; only if it
   parses as a single number; `26B-A4B` stays `None`).
 - `context_length` and `supported_functions`: `POST /api/show` with
-  `{"model": "<id>"}` per model. N+1 requests, local and cheap. Read
+  `{"model": "<id>"}` per model. N+1 requests, up to 8 `/api/show` requests
+  at a time (`MAX_CONCURRENT_SHOWS`), so a slow server stays inside the
+  launch-time sync cap for longer lists. Read
   `capabilities` (`completion`, `tools`, `vision`, `thinking`, `embedding`) and
   the `model_info` key ending in `.context_length` (e.g.
   `llama.context_length`), the trained maximum. Ollama may load the model
