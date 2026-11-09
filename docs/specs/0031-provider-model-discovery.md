@@ -607,17 +607,16 @@ path benefits most from parallel listing.
   (`yes` / `-`).
 - `provider info`: `Config: discover_models` already appears via
   `config_fields`; optionally show managed model count from config.
-- `model list`: `NOTES` already exists (`dangling_notes`). Optionally add a
-  `SOURCE` column (`catalog` / `custom` / `discovered`) from
-  `ModelConfig.discovered`.
+- `model list`: `NOTES` already exists (`dangling_notes`). A `SOURCE`
+  column, between `PROVIDER` and `NOTES`, shows `discovered` when
+  `ModelConfig.discovered` is set, `custom` for other entries with
+  `model_type: custom`, and `catalog` otherwise. `PROVIDER` is the plain
+  provider id in every output format.
 - `model info`: `Config: Discovered from`, `Config: Wire name`.
-- Discovered vs configured models use one marker, `⌕` (U+2315, magnifying
-  glass), defined once as `DISCOVERED_MARK`:
-  - `model list` table: the `PROVIDER` cell of a discovered model is
-    prefixed, e.g. `(⌕) llama-cpp-pgx`; a configured model shows just
-    `llama-cpp-pgx`.
-  - TUI Models view: the marker column shows a magenta `⌕` for discovered
-    models instead of the green `✓` used for other configured models.
+- The TUI Models view marks discovered models with `⌕` (U+2315, magnifying
+  glass), defined as `DISCOVERED_MARK`: the marker column shows a magenta `⌕`
+  for discovered models and the green `✓` for other configured models. The
+  `model list` command shows the same distinction in its `SOURCE` column.
 
 ### Read-only inspection
 

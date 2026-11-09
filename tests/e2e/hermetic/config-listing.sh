@@ -20,6 +20,7 @@ gcli model list -o json
 expect_rc 0
 expect_json 'ids | sort == ["granite-4.2-3b", "granite-4.2-8b"]' "both models, in any order"
 expect_json 'col("PROVIDER") | unique == ["ollama"]'
+expect_json 'col("SOURCE") | unique == ["catalog"]' "both are catalog models"
 expect_json 'row("granite-4.2-8b").SIZE == "8B"'
 expect_json 'col("NOTES") | unique == [""]' "no notes"
 
