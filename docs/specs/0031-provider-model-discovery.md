@@ -620,8 +620,10 @@ path benefits most from parallel listing.
 - `model list`: `NOTES` already exists (`dangling_notes`). A `SOURCE`
   column, between `PROVIDER` and `NOTES`, shows `discovered` when
   `ModelConfig.discovered` is set, `custom` for other entries with
-  `model_type: custom`, and `catalog` otherwise. `PROVIDER` is the plain
-  provider id in every output format.
+  `model_type: custom`, and `catalog` otherwise. In terminal output,
+  `discovered` is magenta and `custom` yellow, through `Ui::tint`; other
+  formats carry the text only. `PROVIDER` is the plain provider id in every
+  output format.
 - `model info`: `Config: Discovered from`, `Config: Wire name`.
 - The TUI Models view marks discovered models with `⌕` (U+2315, magnifying
   glass), defined as `DISCOVERED_MARK`: the marker column shows a magenta `⌕`

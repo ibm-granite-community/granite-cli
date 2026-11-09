@@ -9,7 +9,7 @@ use crate::models::{ContextFit, MODEL_REGISTRY, ModelMetadata, ModelType, ModelV
 use crate::providers::{PROVIDER_REGISTRY, Provider, ProviderMetadata, ProviderType, PullResult};
 use crate::utils::hardware::{HardwareProfile, detect_hardware};
 use crate::utils::prompt_from_schema;
-use crate::utils::ui::Ui;
+use crate::utils::ui::{Tint, Ui};
 
 /// Compare semantic versions in descending order (higher versions first).
 /// Handles versions like "3.1", "4.0", "3.0.1".
@@ -503,6 +503,14 @@ impl ModelCommands {
             } else {
                 "catalog"
             };
+            // The terminal colours the non-catalog sources, matching the
+            // discovered marker in the TUI (magenta), so they stand out when
+            // scanning a long list.
+            let source_cell = match model_source {
+                "discovered" => ctx.ui.tint(model_source, Tint::Magenta),
+                "custom" => ctx.ui.tint(model_source, Tint::Yellow),
+                _ => model_source.to_string(),
+            };
             let row = vec![
                 instance_id.clone(),
                 md.family.clone(),
@@ -510,7 +518,7 @@ impl ModelCommands {
                 md.context_length.to_string(),
                 md.model_type.to_string(),
                 model_config.provider_id.clone(),
-                model_source.to_string(),
+                source_cell,
             ];
             enriched.push((row, md));
         }
