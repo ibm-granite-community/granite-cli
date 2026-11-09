@@ -73,13 +73,6 @@ fn serves_embeddings(args: &[String]) -> bool {
         .any(|arg| matches!(arg.as_str(), "--embedding" | "--embeddings"))
 }
 
-/// Whether a llama-server command line serves reranking (`--rerank` or
-/// `--reranking`), through `/v1/rerank`.
-fn serves_reranking(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--rerank" | "--reranking"))
-}
-
 /// The context size set by `-c N`, `--ctx-size N`, `-c=N` or `--ctx-size=N`
 /// in a llama-server command line. The last occurrence wins, as it does for
 /// llama-server. `0` means "use the model's trained context" to
@@ -538,11 +531,9 @@ impl Provider for LlamaCppProvider {
             let has_image = modalities.iter().any(|m| m == "image");
             let has_audio = modalities.iter().any(|m| m == "audio");
 
-            // ModelFunction has no reranking variant, so no capability can
-            // use a reranker. It is left out of the listing.
-            if serves_reranking(&args) {
-                continue;
-            }
+            // `--rerank` adds `/v1/rerank` and leaves chat completions
+            // available, so it does not change the classification below.
+            // ModelFunction has no reranking variant yet (#278).
             let (model_type, supported_functions) = if serves_embeddings(&args) {
                 (ModelType::Embedding, vec![ModelFunction::Embeddings])
             } else if has_audio {
@@ -854,17 +845,14 @@ mod tests {
     }
 
     #[test]
-    fn serves_embeddings_and_serves_reranking_match_every_flag_spelling() {
+    fn serves_embeddings_matches_every_flag_spelling() {
         for flag in ["--embedding", "--embeddings"] {
             assert!(serves_embeddings(&args(&["llama-server", flag])), "{flag}");
-            assert!(!serves_reranking(&args(&["llama-server", flag])), "{flag}");
         }
-        for flag in ["--rerank", "--reranking"] {
-            assert!(serves_reranking(&args(&["llama-server", flag])), "{flag}");
+        for flag in ["--rerank", "--reranking", "--jinja"] {
             assert!(!serves_embeddings(&args(&["llama-server", flag])), "{flag}");
         }
-        assert!(!serves_embeddings(&args(&["llama-server", "--jinja"])));
-        assert!(!serves_reranking(&[]));
+        assert!(!serves_embeddings(&[]));
     }
 
     async fn discovery_server() -> String {
@@ -887,9 +875,9 @@ mod tests {
                         "status": { "value": "unloaded", "args": ["llama-server", "--embeddings", "--pooling", "mean"] }
                     },
                     {
-                        "id": "bge-reranker-v2-m3",
+                        "id": "granite-4.0-300m",
                         "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
-                        "status": { "value": "unloaded", "args": ["llama-server", "--reranking"] }
+                        "status": { "value": "unloaded", "args": ["llama-server", "--rerank"] }
                     },
                     {
                         "id": "Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M",
@@ -920,9 +908,13 @@ mod tests {
         )
         .unwrap();
         let models = provider.list_models().await.unwrap();
-        // The reranker is left out.
-        assert_eq!(models.len(), 4);
-        assert!(!models.iter().any(|m| m.id == "bge-reranker-v2-m3"));
+        assert_eq!(models.len(), 5);
+
+        // `--rerank` keeps chat completions, so the model is classified by
+        // its modalities like any other.
+        let reranking = models.iter().find(|m| m.id == "granite-4.0-300m").unwrap();
+        assert_eq!(reranking.model_type, Some(ModelType::Text));
+        assert!(reranking.supported_functions.contains(&ModelFunction::Chat));
 
         let embedding = models
             .iter()

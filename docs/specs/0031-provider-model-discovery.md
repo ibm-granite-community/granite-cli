@@ -304,9 +304,10 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
 
 - `id` = `id` (the router uses the alias as the request name).
 - `display_name` = `id` (no separate display name).
-- `status.args` containing `--rerank` or `--reranking` → not listed.
-  `ModelFunction` has no reranking variant, so no capability can use the
-  model.
+- `--rerank` or `--reranking` in `status.args` does not change the
+  classification: llama-server then also serves `/v1/rerank`, and chat
+  completions stay available. `ModelFunction` has no reranking variant yet
+  (#278).
 - `status.args` containing `--embedding` or `--embeddings` →
   `ModelType::Embedding`, functions `[Embeddings]`.
 - Otherwise `model_type` and functions from `architecture.input_modalities`:
@@ -707,7 +708,7 @@ Provider parsers (fixture JSON, no network):
 - LM Studio `/api/v1/models`: `key`, `type` mapping, vision/tools/reasoning,
   `max_context_length`, `params_string` parse.
 - llama.cpp `/models`: the observed router shape; image/audio modalities →
-  vision/transcription; embedding flags in `status.args` → embedding; rerank flags → left out;
+  vision/transcription; embedding flags in `status.args` → embedding; rerank flags ignored;
   unloaded entries included; context from `status.args`.
 
 Pure logic (new module, no network):
