@@ -299,8 +299,10 @@ a custom profile, and a mode: `auto` or `manual`.
   json` or `markdown`. This needs no prompt, so `setup --auto` works on a
   new machine.
 - **Detection.** In both modes, granite-cli detects the hardware again on
-  the commands that use fit (`model recommend`, `setup`), on the `hardware`
-  commands other than `catalog`, and when the TUI starts. Other commands, such as `launch`, do
+  the commands that estimate fit for `local` (`model recommend`, `setup`),
+  on the `hardware` commands other than `catalog`, and when the TUI starts.
+  `model recommend --hardware` with another profile does not detect, since
+  it does not read `local`. Other commands, such as `launch`, do
   not detect: detection calls NVML, Metal or DXGI, and a launch should not
   change configuration.
 - **When detection differs.** granite-cli never overwrites the saved figures
@@ -922,8 +924,8 @@ default, and `hardware list` names a set factor in NOTES. Updating `local` to
 the detected figures keeps its factor. `setup` refuses a profile id that is
 not a plain name.
 
-The commands that use fit and the `hardware` commands other than `catalog`
-compare detection with the saved local figures, and in manual mode with the
+The commands that estimate fit for `local` and the `hardware` commands
+other than `catalog` compare detection with the saved local figures, and in manual mode with the
 recorded detection. A `local` profile whose recorded detection cannot be read fails
 to load with an error that names `detected`. A difference prompts when the
 run is interactive and warns when it is not, naming `hardware setup local
@@ -978,14 +980,16 @@ them, such as "Fit not available (1 model)". An id with no hardware profile offe
 is interactive, from the catalog entry with that id or as a custom profile.
 Otherwise it is an error that lists the configured ids, `local` among them,
 and names the `hardware setup` command with the flags a script needs. An id
-that cannot be a profile id is refused without the offer.
+that cannot be a profile id is refused without the offer. Estimating for a
+profile other than `local` does not detect this machine.
 
 Tests cover: one model fitting a large hardware profile and not a small one;
 the default giving today's rows; a hosted variant listed with "fit not
 available"; creating a hardware profile from a catalog id with scripted
 answers; an unknown id in a non-interactive run, for a catalog entry with one
-size and with several and for a custom profile; and a reserved or malformed
-id refused.
+size and with several and for a custom profile; a reserved or malformed
+id refused; and a configured profile other than `local` used without
+detecting.
 
 **Relevant Context**
 - `src/commands/model.rs` (`recommend`, `recommend_rows`)

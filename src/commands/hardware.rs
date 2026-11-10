@@ -2053,6 +2053,25 @@ mod tests {
     }
 
     #[test]
+    fn estimating_for_another_profile_does_not_detect_this_machine() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let args = HardwareSetupArgs {
+            target: Some("dgx-spark".to_string()),
+            id: Some("spark".to_string()),
+            ..Default::default()
+        };
+        setup(&mut ctx, args, false).unwrap();
+
+        let (id, p) =
+            HardwareCommands::profile_for_fit_with(&mut ctx, "spark", true, no_detection).unwrap();
+
+        assert_eq!(id, "spark");
+        assert_eq!(p.memory_kind(), MemoryKind::Unified);
+    }
+
+    #[test]
     fn an_unknown_id_in_a_run_that_cannot_ask_lists_the_configured_ids() {
         let _home = TestConfigHome::new();
         let ui = Arc::new(CaptureUi::default());
