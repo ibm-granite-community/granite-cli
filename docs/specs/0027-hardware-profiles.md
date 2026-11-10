@@ -981,15 +981,17 @@ is interactive, from the catalog entry with that id or as a custom profile.
 Otherwise it is an error that lists the configured ids, `local` among them,
 and names the `hardware setup` command with the flags a script needs. An id
 that cannot be a profile id is refused without the offer. Estimating for a
-profile other than `local` does not detect this machine.
+profile other than `local` does not detect this machine. Declining to replace
+an existing profile under the id typed while creating one ends the command
+with an error, with nothing estimated.
 
 Tests cover: one model fitting a large hardware profile and not a small one;
 the default giving today's rows; a hosted variant listed with "fit not
 available"; creating a hardware profile from a catalog id with scripted
 answers; an unknown id in a non-interactive run, for a catalog entry with one
 size and with several and for a custom profile; a reserved or malformed
-id refused; and a configured profile other than `local` used without
-detecting.
+id refused; a configured profile other than `local` used without
+detecting; and a declined replacement while creating a profile.
 
 **Relevant Context**
 - `src/commands/model.rs` (`recommend`, `recommend_rows`)
