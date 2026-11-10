@@ -2800,8 +2800,9 @@ mod tests {
 
     #[test]
     fn a_hosted_variant_is_listed_with_fit_not_available() {
-        // Too small for any local variant of granite-4.0-h-micro; its
-        // OpenRouter variant states no size, so fit cannot be estimated.
+        // Too small for any local variant of a model with an OpenRouter
+        // variant, which states no size, so fit cannot be estimated.
+        let hosted_id = hosted_model_id();
         let tiny =
             HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 0.5 });
         let ctx = empty_ctx();
@@ -2813,12 +2814,13 @@ mod tests {
             .iter()
             .find(|(title, _, _)| title.starts_with("Fit not available"))
             .expect("a fit-not-available table");
-        assert_eq!(title, &format!("Fit not available ({} models)", rows.len()));
+        let noun = if rows.len() == 1 { "model" } else { "models" };
+        assert_eq!(title, &format!("Fit not available ({} {noun})", rows.len()));
         assert_eq!(headers, &["ID", "SIZE", "VARIANT", "TYPE", "FIT"]);
-        let micro = rows.iter().find(|r| r[0] == "granite-4.0-h-micro").unwrap();
-        assert_eq!(micro[2], "OpenRouter");
+        let hosted = rows.iter().find(|r| r[0] == hosted_id).unwrap();
+        assert_eq!(hosted[2], "OpenRouter");
         assert_eq!(
-            micro[4],
+            hosted[4],
             "fit not available: hosted provider doesn't specify size"
         );
         // Printed after the main table.
@@ -2842,7 +2844,22 @@ mod tests {
 
         let unavailable = ModelCommands::fit_unavailable_rows(None, None, &fit);
 
-        assert!(!row_ids(&unavailable).contains(&"granite-4.0-h-micro".to_string()));
+        assert!(!row_ids(&unavailable).contains(&hosted_model_id()));
+    }
+
+    /// A model with an OpenRouter variant as well as local ones. It is looked
+    /// up, since catalog updates change which models have one.
+    fn hosted_model_id() -> String {
+        MODEL_REGISTRY
+            .entries()
+            .iter()
+            .filter(|(_, m)| {
+                m.variants.iter().any(|v| v.format == "OpenRouter")
+                    && m.variants.iter().any(|v| v.size_gb.is_some())
+            })
+            .map(|(id, _)| id.to_string())
+            .min()
+            .expect("a model with an OpenRouter variant and a local one")
     }
 
     fn ctx_with_ollama() -> crate::AppContext {
