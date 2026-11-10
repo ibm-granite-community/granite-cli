@@ -922,7 +922,9 @@ profile other than `local` asks before replacing it and is refused when the
 run cannot ask. `hardware info` shows the headroom factor in use and whether it is the
 default, and `hardware list` names a set factor in NOTES. Updating `local` to
 the detected figures keeps its factor. `setup` refuses a profile id that is
-not a plain name.
+not a plain name. `setup` of a profile other than `local` checks `local`
+after its own questions and flags, just before saving, so a command that
+fails leaves `local` as it was.
 
 The commands that estimate fit for `local` and the `hardware` commands
 other than `catalog` compare detection with the saved local figures, and in manual mode with the
@@ -953,7 +955,8 @@ recorded detection, a detection kept for the session, and the factor in
 refused; an existing id asking before it is replaced, refused when the run
 cannot ask, and replaced without asking when forced; and a run that cannot
 ask keeping the profile's factor, `setup local --auto` among them, and
-saving the default for a new profile.
+saving the default for a new profile; and a `setup` of another profile that
+fails leaving `local` unwritten.
 
 **Relevant Context**
 - `src/commands/hardware.rs`, `src/main.rs` (`Commands::Hardware`)

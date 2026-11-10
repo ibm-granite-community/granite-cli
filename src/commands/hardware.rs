@@ -34,6 +34,10 @@ pub(crate) struct HardwareSetupArgs {
     /// Replace a profile with the same id without asking, for callers that
     /// have already asked.
     pub(crate) force_overwrite: bool,
+    /// Check `local` against detection before saving a profile other than
+    /// `local`, as the `hardware` commands do. Set by `hardware setup`;
+    /// callers that create a profile on the way leave it off.
+    pub(crate) check_local: bool,
 }
 
 impl HardwareCommands {
@@ -468,8 +472,10 @@ impl HardwareCommands {
             ),
         };
         check_flags(&target, &args)?;
+        // Taken by `setup local`, or by the check of `local` below.
+        let mut detect = Some(detect);
         let mut config = match target.as_str() {
-            LOCAL_HARDWARE_ID => setup_local(ctx, &args, interactive, detect)?,
+            LOCAL_HARDWARE_ID => setup_local(ctx, &args, interactive, detect.take().unwrap())?,
             CUSTOM_HARDWARE_TYPE => {
                 let id = profile_id(ctx, &args, None, interactive)?;
                 if !replace_existing(ctx, &id, args.force_overwrite, interactive)? {
@@ -497,6 +503,11 @@ impl HardwareCommands {
         let kind = config.profile().map_err(anyhow::Error::msg)?.memory_kind();
         let kept = ctx.config().get_hardware(&id).and_then(|h| h.headroom);
         config.headroom = headroom(ctx, args.headroom, kept, kind, interactive)?;
+        // After every question and flag has been checked, so a command that
+        // fails leaves `local` as it was.
+        if let Some(detect) = detect.take().filter(|_| args.check_local) {
+            Self::check_local_or_warn(ctx, detect, interactive);
+        }
         ctx.config_mut().insert_hardware(&id, config)?;
         let summary = ctx
             .hardware_profile(&id)
@@ -1504,6 +1515,29 @@ mod tests {
             Some(&HardwareConfig::catalog("studio", "apple-m4-max", 64.0))
         );
         assert!(ui.confirm_prompts.borrow().is_empty());
+    }
+
+    #[test]
+    fn setup_of_another_profile_checks_local_after_its_own_checks() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx(&ui);
+        let args = |kind: Option<MemoryKind>| HardwareSetupArgs {
+            target: Some(CUSTOM_HARDWARE_TYPE.to_string()),
+            id: Some("box".to_string()),
+            kind,
+            memory: Some(16.0),
+            check_local: true,
+            ..Default::default()
+        };
+
+        HardwareCommands::setup_with(&mut ctx, args(None), false, no_detection).unwrap_err();
+        assert!(ctx.config().get_hardware(LOCAL_HARDWARE_ID).is_none());
+
+        HardwareCommands::setup_with(&mut ctx, args(Some(MemoryKind::Discrete)), false, mac_36)
+            .unwrap();
+        assert!(local(&ctx).profile.same_memory(&mac_36()));
+        assert!(ctx.config().get_hardware("box").is_some());
     }
 
     #[test]
