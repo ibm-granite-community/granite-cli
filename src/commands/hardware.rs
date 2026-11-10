@@ -651,8 +651,9 @@ fn headroom_label(profile: &HardwareProfile) -> String {
 
 /// The headroom factor to save: `flag` when given; otherwise asked for when
 /// the run is interactive, starting from the factor the profile already has
-/// (`kept`) or the kind's default; otherwise the kind's default. A factor
-/// equal to the kind's default is not saved.
+/// (`kept`) or the kind's default; otherwise `kept`, so a script that
+/// updates a profile, such as `hardware setup local --auto`, leaves its
+/// factor alone. A factor equal to the kind's default is not saved.
 fn headroom(
     ctx: &AppContext,
     flag: Option<f64>,
@@ -671,7 +672,10 @@ fn headroom(
                 .parse::<f64>()
                 .map_err(|_| anyhow!("'{answer}' is not a headroom factor"))?
         }
-        (None, false) => return Ok(None),
+        (None, false) => match kept {
+            Some(factor) => factor,
+            None => return Ok(None),
+        },
     };
     if !factor.is_finite() || factor < 1.0 {
         bail!("the headroom factor must be at least 1.0, got {factor}");
@@ -1492,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_that_cannot_ask_saves_the_default_headroom_without_the_flag() {
+    fn a_run_that_cannot_ask_keeps_the_headroom_without_the_flag() {
         let _home = TestConfigHome::new();
         let ui = Arc::new(CaptureUi::default());
         let mut ctx = ctx(&ui);
@@ -1507,8 +1511,52 @@ mod tests {
 
         setup(&mut ctx, args(None), false).unwrap();
 
-        assert_eq!(ctx.config().get_hardware("spark").unwrap().headroom, None);
+        assert_eq!(
+            ctx.config().get_hardware("spark").unwrap().headroom,
+            Some(1.2)
+        );
         assert!(ui.text_prompts.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_run_that_cannot_ask_saves_the_default_headroom_for_a_new_profile() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx(&ui);
+        let args = HardwareSetupArgs {
+            target: Some("dgx-spark".to_string()),
+            id: Some("spark".to_string()),
+            ..Default::default()
+        };
+
+        setup(&mut ctx, args, false).unwrap();
+
+        assert_eq!(ctx.config().get_hardware("spark").unwrap().headroom, None);
+    }
+
+    #[test]
+    fn setup_local_auto_in_a_script_keeps_the_headroom() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let set = HardwareSetupArgs {
+            target: Some(LOCAL_HARDWARE_ID.to_string()),
+            auto: true,
+            headroom: Some(1.2),
+            ..Default::default()
+        };
+        HardwareCommands::setup_with(&mut ctx, set, false, mac_36).unwrap();
+        let update = HardwareSetupArgs {
+            target: Some(LOCAL_HARDWARE_ID.to_string()),
+            auto: true,
+            ..Default::default()
+        };
+
+        HardwareCommands::setup_with(&mut ctx, update, false, mac_48).unwrap();
+
+        let saved = ctx.config().get_hardware(LOCAL_HARDWARE_ID).unwrap();
+        assert_eq!(saved.headroom, Some(1.2));
+        assert!(local(&ctx).profile.same_memory(&mac_48()));
     }
 
     #[test]
