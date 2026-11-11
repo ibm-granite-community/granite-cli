@@ -27,7 +27,7 @@ use std::collections::HashMap;
 // TODO: This is a circular dependency that needs to be untangled
 use crate::capabilities::Dependency;
 use crate::config::{
-    CapabilityConfig, Config, ConfigId, LauncherConfig, ModelConfig, ProviderConfig,
+    CapabilityConfig, Config, ConfigId, HardwareConfig, LauncherConfig, ModelConfig, ProviderConfig,
 };
 use crate::sources::Sources;
 
@@ -40,6 +40,7 @@ pub(crate) enum RefKind {
     Capability,
     Model,
     Provider,
+    Hardware,
 }
 
 /// What went wrong with a reference. Callers branch on this to decide what to
@@ -183,6 +184,7 @@ pub(crate) fn dependents(kind: RefKind, id: &str, config: &Config) -> Vec<(RefKi
         RefKind::Capability,
         RefKind::Model,
         RefKind::Provider,
+        RefKind::Hardware,
     ]
     .into_iter()
     .flat_map(|referrer_kind| {
@@ -216,6 +218,7 @@ impl std::fmt::Display for RefKind {
             RefKind::Capability => "capability",
             RefKind::Model => "model",
             RefKind::Provider => "provider",
+            RefKind::Hardware => "hardware profile",
         };
         f.write_str(s)
     }
@@ -291,6 +294,7 @@ fn config_entry<'a>(config: &'a Config, kind: RefKind, id: &str) -> Option<&'a d
         RefKind::Capability => lookup(&config.capabilities, id),
         RefKind::Model => lookup(&config.models, id),
         RefKind::Provider => lookup(&config.providers, id),
+        RefKind::Hardware => lookup(&config.hardware, id),
     }
 }
 
@@ -300,6 +304,7 @@ fn config_entries(config: &Config, kind: RefKind) -> Vec<&dyn Validatable> {
         RefKind::Capability => erase(&config.capabilities),
         RefKind::Model => erase(&config.models),
         RefKind::Provider => erase(&config.providers),
+        RefKind::Hardware => erase(&config.hardware),
     }
 }
 
@@ -350,11 +355,37 @@ fn validate(
     // Building a capability resolves its model, and a model that is missing
     // or broken is reported at the model, with this instance as the
     // referrer the remediation prompt acts on.
+    //
+    // A provider's hardware link is followed only when the provider itself is
+    // what is being validated. Hardware matters to the commands that
+    // estimate fit, not to launching an agent, so a launcher's walk stops at
+    // its providers.
     for (target_kind, target_id) in entry.refs() {
+        if target_kind == RefKind::Hardware && referrer.is_some() {
+            continue;
+        }
         validate(target_kind, target_id, config, sources, Some((kind, id)))?;
     }
+    // A provider on `local` declares no reference, since `local` is written
+    // when first needed and cannot dangle. Once it is saved, its figures and
+    // headroom factor are checked like those of any linked profile.
+    if kind == RefKind::Provider && referrer.is_none() {
+        use crate::config::hardware::{HardwareLink, LOCAL_HARDWARE_ID};
+        let on_local = config
+            .get_provider(id)
+            .is_some_and(|p| p.hardware_link() == HardwareLink::Local);
+        if on_local && config.get_hardware(LOCAL_HARDWARE_ID).is_some() {
+            validate(
+                RefKind::Hardware,
+                LOCAL_HARDWARE_ID,
+                config,
+                sources,
+                Some((kind, id)),
+            )?;
+        }
+    }
 
-    resolves(kind, id, sources).map_err(|problem| err(kind, id, problem, referrer))?;
+    resolves(kind, id, config, sources).map_err(|problem| err(kind, id, problem, referrer))?;
 
     // A capability reached through a launcher must also be one that launcher
     // can carry. The transport is a property of the capability's own
@@ -393,15 +424,24 @@ fn transport_conflict(
 /// What the source that owns `kind` says about the entry under `id`: whether
 /// its settings are valid, and for a capability whether the model it names
 /// meets what its type requires. What is built here stays in that source's
-/// cache, so the command that goes on to use it does not build it again.
-fn resolves(kind: RefKind, id: &str, sources: &Sources) -> Result<(), Problem> {
-    match kind {
+/// cache, so the command that goes on to use it does not build it again. A
+/// hardware profile has no source; it resolves when its figures can be
+/// looked up.
+fn resolves(kind: RefKind, id: &str, config: &Config, sources: &Sources) -> Result<(), Problem> {
+    let built = match kind {
         RefKind::Launcher => sources.launchers().build(id).map(|_| ()),
         RefKind::Capability => sources.capabilities().build(id).map(|_| ()),
         RefKind::Model => sources.models().build(id).map(|_| ()),
         RefKind::Provider => sources.providers().build(id).map(|_| ()),
-    }
-    .map_err(Problem::from)
+        RefKind::Hardware => {
+            return match config.get_hardware(id).map(HardwareConfig::profile) {
+                Some(Ok(_)) => Ok(()),
+                Some(Err(detail)) => Err(Problem::UnreadableSettings { detail }),
+                None => Err(Problem::NotConfigured),
+            };
+        }
+    };
+    built.map_err(Problem::from)
 }
 
 impl Validatable for LauncherConfig {
@@ -475,7 +515,33 @@ impl Validatable for ProviderConfig {
             .is_some()
     }
 
-    /// A provider references no other configured instance.
+    /// A provider names the hardware profile it runs on. `local` is written
+    /// from detection the first time it is needed, so a link to it is not a
+    /// reference that can dangle.
+    fn refs(&self) -> Vec<(RefKind, &str)> {
+        match &self.hardware {
+            Some(crate::config::hardware::HardwareLink::Profile(id)) => {
+                vec![(RefKind::Hardware, id.as_str())]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl Validatable for HardwareConfig {
+    fn type_name(&self) -> &str {
+        &self.hardware_type
+    }
+
+    /// `local`, `custom`, or an entry of the hardware catalog.
+    fn type_is_registered(&self) -> bool {
+        use crate::config::hardware::{CUSTOM_HARDWARE_TYPE, LOCAL_HARDWARE_ID};
+        self.hardware_type == LOCAL_HARDWARE_ID
+            || self.hardware_type == CUSTOM_HARDWARE_TYPE
+            || crate::utils::hardware_catalog::find(&self.hardware_type).is_some()
+    }
+
+    /// A hardware profile references no other configured instance.
     fn refs(&self) -> Vec<(RefKind, &str)> {
         Vec::new()
     }
@@ -540,6 +606,7 @@ mod tests {
 
     fn provider(id: &str, provider_type: &str) -> ProviderConfig {
         ProviderConfig {
+            hardware: Default::default(),
             provider_id: id.to_string(),
             provider_type: provider_type.to_string(),
             config: serde_json::json!({}),
@@ -1068,6 +1135,7 @@ mod tests {
         config.providers.insert(
             "p1".into(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "p1".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({ "timeout_secs": "ten" }),
@@ -1216,6 +1284,116 @@ mod tests {
         assert_eq!(
             dangling[0].reason,
             "model 'm1' depends on provider 'p1', which is not configured"
+        );
+    }
+
+    #[test]
+    fn a_link_to_a_missing_hardware_profile_is_reported() {
+        let mut config = Config::default();
+        let mut p = provider("vllm-lab", "openai-compatible");
+        p.hardware = Some(crate::config::hardware::HardwareLink::Profile(
+            "lab-box".to_string(),
+        ));
+        config.providers.insert("vllm-lab".to_string(), p);
+
+        let err = check(RefKind::Provider, "vllm-lab", &config).unwrap_err();
+
+        assert_eq!(err.target, (RefKind::Hardware, "lab-box".to_string()));
+        assert_eq!(err.problem, Problem::NotConfigured);
+        assert_eq!(
+            err.to_string(),
+            "provider 'vllm-lab' depends on hardware profile 'lab-box', which is not configured"
+        );
+    }
+
+    #[test]
+    fn a_link_to_a_hardware_profile_with_a_factor_below_one_is_reported() {
+        let mut config = Config::default();
+        config.hardware.insert(
+            "card".to_string(),
+            HardwareConfig {
+                headroom: Some(0.9),
+                ..HardwareConfig::catalog("card", "nvidia-rtx-4090", 24.0)
+            },
+        );
+        let mut p = provider("vllm-lab", "openai-compatible");
+        p.hardware = Some(crate::config::hardware::HardwareLink::Profile(
+            "card".to_string(),
+        ));
+        config.providers.insert("vllm-lab".to_string(), p);
+
+        let err = check(RefKind::Provider, "vllm-lab", &config).unwrap_err();
+
+        assert_eq!(err.target, (RefKind::Hardware, "card".to_string()));
+        assert_eq!(
+            err.problem,
+            Problem::UnreadableSettings {
+                detail: "headroom must be at least 1.0, got 0.9".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_walk_from_a_launcher_does_not_follow_a_providers_hardware_link() {
+        let mut config = healthy();
+        config.providers.get_mut("p1").unwrap().hardware = Some(
+            crate::config::hardware::HardwareLink::Profile("gone".to_string()),
+        );
+
+        // Launching does not read fit, so a broken link does not stop it.
+        assert!(check(RefKind::Launcher, "claude", &config).is_ok());
+        assert!(check(RefKind::Model, "m1", &config).is_ok());
+        // The provider itself still reports it, for lists and fit commands.
+        let err = check(RefKind::Provider, "p1", &config).unwrap_err();
+        assert_eq!(err.target, (RefKind::Hardware, "gone".to_string()));
+    }
+
+    #[test]
+    fn a_provider_on_local_reports_an_unusable_local_profile() {
+        let mut config = healthy();
+        let mut local = HardwareConfig::local_from_detection(
+            crate::utils::hardware::HardwareProfile::with_memory(
+                crate::utils::hardware::Memory::System { ram_gb: 64.0 },
+            ),
+        );
+        local.headroom = Some(0.9);
+        config.hardware.insert("local".to_string(), local);
+
+        let err = check(RefKind::Provider, "p1", &config).unwrap_err();
+
+        assert_eq!(err.target, (RefKind::Hardware, "local".to_string()));
+        // A launch is not stopped by it.
+        assert!(check(RefKind::Launcher, "claude", &config).is_ok());
+    }
+
+    #[test]
+    fn a_link_to_local_or_unspecified_needs_no_profile() {
+        for link in [
+            None,
+            Some(crate::config::hardware::HardwareLink::Local),
+            Some(crate::config::hardware::HardwareLink::Unspecified),
+        ] {
+            let mut config = Config::default();
+            let mut p = provider("ollama", "ollama");
+            p.hardware = link;
+            config.providers.insert("ollama".to_string(), p);
+
+            assert!(check(RefKind::Provider, "ollama", &config).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_hardware_profile_lists_the_providers_linked_to_it_as_dependents() {
+        let mut config = Config::default();
+        let mut p = provider("llamacpp-spark", "llama-cpp");
+        p.hardware = Some(crate::config::hardware::HardwareLink::Profile(
+            "spark".to_string(),
+        ));
+        config.providers.insert("llamacpp-spark".to_string(), p);
+
+        assert_eq!(
+            dependents(RefKind::Hardware, "spark", &config),
+            vec![(RefKind::Provider, "llamacpp-spark".to_string())]
         );
     }
 }

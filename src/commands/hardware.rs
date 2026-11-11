@@ -1,8 +1,10 @@
 // Local
 use crate::AppContext;
+use crate::commands::shared::remediation::DependentsPolicy;
 use crate::config::HardwareConfig;
 use crate::config::hardware::{
-    CUSTOM_HARDWARE_TYPE, LOCAL_HARDWARE_ID, LocalHardware, LocalMode, saved_figures,
+    CUSTOM_HARDWARE_TYPE, HardwareLink, LOCAL_HARDWARE_ID, LocalHardware, LocalMode,
+    UNSPECIFIED_HARDWARE, saved_figures,
 };
 use crate::utils::hardware::{HardwareProfile, MachineInfo, Memory, MemoryKind, detect_hardware};
 use crate::utils::hardware_catalog::{self, CatalogEntry, HARDWARE_CATALOG};
@@ -129,15 +131,16 @@ impl HardwareCommands {
         Self::setup_with(ctx, args, interactive, detect_hardware)
     }
 
-    /// `hardware remove <id>`. `local` cannot be removed.
-    pub(crate) fn remove(ctx: &mut AppContext, id: &str) -> Result<()> {
+    /// `hardware remove <id>`. `local` cannot be removed. When providers are
+    /// linked to the profile, they are listed and the user chooses to remove
+    /// them too, keep the profile, or remove it alone.
+    pub(crate) fn remove(
+        ctx: &mut AppContext,
+        id: &str,
+        policy: Option<DependentsPolicy>,
+    ) -> Result<()> {
         Self::check_local(ctx, detect_hardware, can_prompt(ctx))?;
-        if ctx.config().get_hardware(id).is_none() {
-            return Err(not_configured(ctx, id));
-        }
-        ctx.config_mut().remove_hardware(id)?;
-        ctx.ui.info(&format!("Hardware profile '{id}' removed."));
-        Ok(())
+        Self::remove_profile(ctx, id, policy)
     }
 
     /// The local hardware profile's figures, for a command that estimates
@@ -163,11 +166,23 @@ impl HardwareCommands {
         Self::profile_for_fit_with(ctx, id, can_prompt, detect_hardware)
     }
 
-    /// The providers that run on hardware profile `id`, sorted. Until
-    /// providers are linked to hardware, every provider runs on `local`,
-    /// which is how existing configuration is read.
+    /// The providers linked to hardware profile `id`, sorted.
     pub(crate) fn providers_on(ctx: &AppContext, id: &str) -> Vec<String> {
         providers_on(ctx, id)
+    }
+
+    /// Asks which hardware profile a provider of `provider_type` runs on:
+    /// `local`, another configured profile, "not specified", or a new
+    /// profile created with the `hardware setup` steps. `current` is offered
+    /// first when the provider is being reconfigured; otherwise `local` for a
+    /// provider the user runs and "not specified" for a hosted one.
+    pub(crate) fn choose_link(
+        ctx: &mut AppContext,
+        provider_type: &str,
+        current: Option<HardwareLink>,
+    ) -> Result<HardwareLink> {
+        let interactive = can_prompt(ctx);
+        Self::choose_link_with(ctx, provider_type, current, interactive, detect_hardware)
     }
 
     /// Whether this run can ask the user something: the output backend is
@@ -295,6 +310,90 @@ impl HardwareCommands {
         ctx.config_mut()
             .insert_hardware(LOCAL_HARDWARE_ID, config)?;
         Ok(None)
+    }
+
+    fn remove_profile(
+        ctx: &mut AppContext,
+        id: &str,
+        policy: Option<DependentsPolicy>,
+    ) -> Result<()> {
+        use crate::commands::shared::remediation::{Removal, confirm_removal, remove_all};
+        use crate::config::validation::RefKind;
+
+        if ctx.config().get_hardware(id).is_none() {
+            return Err(not_configured(ctx, id));
+        }
+        if id == LOCAL_HARDWARE_ID {
+            bail!("hardware profile '{id}' describes this machine and cannot be removed");
+        }
+        match confirm_removal(ctx, RefKind::Hardware, id, policy)? {
+            Removal::Cancel => {
+                ctx.ui.info(&format!("Keeping hardware profile '{id}'."));
+                return Ok(());
+            }
+            Removal::Proceed { with } => remove_all(ctx, &with, policy)?,
+        }
+        ctx.config_mut().remove_hardware(id)?;
+        ctx.ui.info(&format!("Hardware profile '{id}' removed."));
+        Ok(())
+    }
+
+    /// `detect` writes `local` when there is none, so the question can show
+    /// its figures.
+    fn choose_link_with(
+        ctx: &mut AppContext,
+        provider_type: &str,
+        current: Option<HardwareLink>,
+        interactive: bool,
+        detect: impl FnOnce() -> HardwareProfile,
+    ) -> Result<HardwareLink> {
+        let default = current.unwrap_or_else(|| HardwareLink::default_for(provider_type));
+        if !interactive {
+            return Ok(default);
+        }
+        ctx.ensure_local_hardware(detect)?;
+        let mut others: Vec<String> = ctx
+            .config()
+            .hardware
+            .keys()
+            .filter(|id| id.as_str() != LOCAL_HARDWARE_ID)
+            .cloned()
+            .collect();
+        others.sort();
+        let mut links = vec![HardwareLink::Local];
+        let local = ctx
+            .hardware_profile(LOCAL_HARDWARE_ID)
+            .map(|p| format!("local (this machine, {})", p.memory_summary()))
+            .unwrap_or_else(|_| "local (this machine)".to_string());
+        let mut items = vec![local];
+        for id in others {
+            let summary = ctx
+                .hardware_profile(&id)
+                .map(|p| p.memory_summary())
+                .unwrap_or_else(|e| e);
+            items.push(format!("{id} ({summary})"));
+            links.push(HardwareLink::Profile(id));
+        }
+        links.push(HardwareLink::Unspecified);
+        items.push("not specified (fit cannot be estimated)".to_string());
+        items.push("create new profile…".to_string());
+        let default_index = links.iter().position(|l| *l == default).unwrap_or(0);
+        let picked = ctx
+            .ui
+            .select("Hardware this provider runs on", &items, default_index)?;
+        if picked < links.len() {
+            return Ok(links[picked].clone());
+        }
+        // Declining to replace a profile under the id typed leaves no new
+        // profile to link.
+        let id = Self::setup_with(
+            ctx,
+            HardwareSetupArgs::default(),
+            interactive,
+            detect_hardware,
+        )?
+        .ok_or_else(|| anyhow!("no hardware profile to link; hardware setup was skipped"))?;
+        Ok(HardwareLink::Profile(id))
     }
 
     fn profile_for_fit_with(
@@ -613,10 +712,13 @@ fn setup_command(id: &str) -> String {
 
 /// See [`HardwareCommands::providers_on`].
 fn providers_on(ctx: &AppContext, id: &str) -> Vec<String> {
-    if id != LOCAL_HARDWARE_ID {
-        return Vec::new();
-    }
-    let mut ids: Vec<String> = ctx.config().providers.keys().cloned().collect();
+    let mut ids: Vec<String> = ctx
+        .config()
+        .providers
+        .values()
+        .filter(|p| p.hardware_link().profile_id() == Some(id))
+        .map(|p| p.provider_id.clone())
+        .collect();
     ids.sort();
     ids
 }
@@ -844,7 +946,7 @@ fn check_profile_id(id: &str) -> Result<()> {
     if id.is_empty() {
         bail!("a hardware profile needs an id");
     }
-    if id == LOCAL_HARDWARE_ID || id == CUSTOM_HARDWARE_TYPE {
+    if id == LOCAL_HARDWARE_ID || id == CUSTOM_HARDWARE_TYPE || id == UNSPECIFIED_HARDWARE {
         bail!("'{id}' is reserved; choose another id");
     }
     let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
@@ -1101,6 +1203,7 @@ mod tests {
             .insert_provider(
                 "ollama",
                 crate::config::ProviderConfig {
+                    hardware: Default::default(),
                     provider_id: "ollama".to_string(),
                     provider_type: "ollama".to_string(),
                     config: serde_json::json!({}),
@@ -1201,9 +1304,9 @@ mod tests {
             )
             .unwrap();
 
-        HardwareCommands::remove(&mut ctx, "spark").unwrap();
+        HardwareCommands::remove_profile(&mut ctx, "spark", None).unwrap();
         assert!(ctx.config().get_hardware("spark").is_none());
-        assert!(HardwareCommands::remove(&mut ctx, LOCAL_HARDWARE_ID).is_err());
+        assert!(HardwareCommands::remove_profile(&mut ctx, LOCAL_HARDWARE_ID, None).is_err());
     }
 
     // -- setup -------------------------------------------------------------------
@@ -2259,6 +2362,244 @@ mod tests {
                 .is_err()
         );
         assert!(ctx.config().get_hardware("dgx-spark").is_none());
+    }
+
+    // -- linking providers ----------------------------------------------------------
+
+    fn insert_provider(ctx: &mut AppContext, id: &str, provider_type: &str, link: HardwareLink) {
+        ctx.config_mut()
+            .insert_provider(
+                id,
+                crate::config::ProviderConfig {
+                    provider_id: id.to_string(),
+                    provider_type: provider_type.to_string(),
+                    config: serde_json::json!({}),
+                    hardware: Some(link),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_setup_can_create_and_link_a_hardware_profile() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let spark = HARDWARE_CATALOG
+            .iter()
+            .filter(|e| e.family == "NVIDIA Workstation")
+            .position(|e| e.id == "dgx-spark")
+            .unwrap();
+        // "create new profile…" is last: local, not specified, create. Then
+        // the family and the device in it.
+        ui.select_answers
+            .borrow_mut()
+            .extend([2, family_index("NVIDIA Workstation"), spark]);
+        ui.text_answers.borrow_mut().push_back("spark".to_string());
+
+        let link =
+            HardwareCommands::choose_link_with(&mut ctx, "llama-cpp", None, true, no_detection)
+                .unwrap();
+
+        assert_eq!(link, HardwareLink::Profile("spark".to_string()));
+        assert!(ctx.config().get_hardware("spark").is_some());
+        let (_, items, default) = &ui.select_prompts.borrow()[0];
+        assert_eq!(items[0], "local (this machine, unified 29.2 GB)");
+        assert_eq!(*default, 0);
+    }
+
+    #[test]
+    fn provider_setup_declining_to_replace_the_typed_id_is_an_error() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let lab = HardwareSetupArgs {
+            target: Some(CUSTOM_HARDWARE_TYPE.to_string()),
+            id: Some("spark".to_string()),
+            kind: Some(MemoryKind::Discrete),
+            memory: Some(24.0),
+            ..Default::default()
+        };
+        setup(&mut ctx, lab, false).unwrap();
+        let spark = HARDWARE_CATALOG
+            .iter()
+            .filter(|e| e.family == "NVIDIA Workstation")
+            .position(|e| e.id == "dgx-spark")
+            .unwrap();
+        // local, spark, not specified, create. Then the family and the
+        // device, the id of the existing profile, and no to replacing it.
+        ui.select_answers
+            .borrow_mut()
+            .extend([3, family_index("NVIDIA Workstation"), spark]);
+        ui.text_answers.borrow_mut().push_back("spark".to_string());
+        ui.confirm_answers.borrow_mut().push_back(false);
+
+        let err =
+            HardwareCommands::choose_link_with(&mut ctx, "llama-cpp", None, true, no_detection)
+                .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "no hardware profile to link; hardware setup was skipped"
+        );
+        assert_eq!(
+            ctx.hardware_profile("spark").unwrap().memory.vram_gb(),
+            Some(24.0)
+        );
+    }
+
+    #[test]
+    fn provider_setup_writes_local_first_so_the_question_shows_its_figures() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx(&ui);
+
+        let link =
+            HardwareCommands::choose_link_with(&mut ctx, "llama-cpp", None, true, mac_36).unwrap();
+
+        assert_eq!(link, HardwareLink::Local);
+        let (_, items, _) = &ui.select_prompts.borrow()[0];
+        assert_eq!(items[0], "local (this machine, unified 29.2 GB)");
+        assert_eq!(ui.stderr_infos.borrow().len(), 1);
+    }
+
+    #[test]
+    fn provider_setup_offers_not_specified_first_for_a_hosted_provider() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+
+        let link =
+            HardwareCommands::choose_link_with(&mut ctx, "openrouter", None, true, no_detection)
+                .unwrap();
+
+        assert_eq!(link, HardwareLink::Unspecified);
+        assert_eq!(
+            HardwareCommands::choose_link_with(&mut ctx, "openrouter", None, false, no_detection)
+                .unwrap(),
+            HardwareLink::Unspecified
+        );
+    }
+
+    #[test]
+    fn removing_a_linked_profile_lists_its_providers_and_can_be_cancelled() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        ctx.config_mut()
+            .insert_hardware(
+                "spark",
+                HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+            )
+            .unwrap();
+        insert_provider(
+            &mut ctx,
+            "llamacpp-spark",
+            "llama-cpp",
+            HardwareLink::Profile("spark".to_string()),
+        );
+        ui.select_answers.borrow_mut().push_back(1); // Cancel
+
+        HardwareCommands::remove_profile(&mut ctx, "spark", None).unwrap();
+
+        assert_eq!(
+            ui.warns.borrow()[0],
+            "Removing hardware profile 'spark' will break:"
+        );
+        assert_eq!(
+            ui.infos.borrow()[0],
+            "  - provider 'llamacpp-spark' (llama-cpp)"
+        );
+        assert!(ctx.config().get_hardware("spark").is_some());
+    }
+
+    #[test]
+    fn providers_on_follows_each_providers_link() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        insert_provider(&mut ctx, "ollama", "ollama", HardwareLink::Local);
+        insert_provider(
+            &mut ctx,
+            "llamacpp-spark",
+            "llama-cpp",
+            HardwareLink::Profile("spark".to_string()),
+        );
+        insert_provider(
+            &mut ctx,
+            "openrouter",
+            "openrouter",
+            HardwareLink::Unspecified,
+        );
+
+        assert_eq!(
+            HardwareCommands::providers_on(&ctx, LOCAL_HARDWARE_ID),
+            vec!["ollama"]
+        );
+        assert_eq!(
+            HardwareCommands::providers_on(&ctx, "spark"),
+            vec!["llamacpp-spark"]
+        );
+    }
+
+    #[test]
+    fn list_and_info_name_the_providers_linked_to_each_profile() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        ctx.config_mut()
+            .insert_hardware(
+                "spark",
+                HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+            )
+            .unwrap();
+        insert_provider(&mut ctx, "ollama", "ollama", HardwareLink::Local);
+        insert_provider(
+            &mut ctx,
+            "llamacpp-spark",
+            "llama-cpp",
+            HardwareLink::Profile("spark".to_string()),
+        );
+
+        HardwareCommands::list_table(&ctx, None);
+        HardwareCommands::info_detail(&ctx, "spark", None).unwrap();
+
+        let tables = ui.tables.borrow();
+        let rows = &tables[0].2;
+        assert_eq!(rows[0][3], "ollama");
+        assert_eq!(rows[1][3], "llamacpp-spark");
+        let details = ui.details.borrow();
+        let providers = details[0]
+            .1
+            .iter()
+            .find(|(k, _)| *k == "Providers")
+            .unwrap();
+        assert_eq!(providers.1, "llamacpp-spark");
+    }
+
+    #[test]
+    fn removing_a_linked_profile_together_removes_its_providers() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        ctx.config_mut()
+            .insert_hardware(
+                "spark",
+                HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+            )
+            .unwrap();
+        insert_provider(
+            &mut ctx,
+            "llamacpp-spark",
+            "llama-cpp",
+            HardwareLink::Profile("spark".to_string()),
+        );
+        ui.select_answers.borrow_mut().push_back(0); // Remove together
+
+        HardwareCommands::remove_profile(&mut ctx, "spark", None).unwrap();
+
+        assert!(ctx.config().get_hardware("spark").is_none());
+        assert!(ctx.config().get_provider("llamacpp-spark").is_none());
     }
 
     #[test]

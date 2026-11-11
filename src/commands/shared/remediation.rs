@@ -15,7 +15,9 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::commands::{CapabilityCommands, LauncherCommands, ModelCommands, ProviderCommands};
+use crate::commands::{
+    CapabilityCommands, HardwareCommands, LauncherCommands, ModelCommands, ProviderCommands,
+};
 use crate::config::Config;
 use crate::config::validation::{
     Problem, RefKind, ValidationError, dependents, find_dangling, type_name, validate_ref,
@@ -463,6 +465,7 @@ fn settings<'a>(kind: RefKind, id: &str, config: &'a Config) -> Option<&'a serde
         RefKind::Capability => config.get_capability(id).map(|c| &c.config),
         RefKind::Model => config.get_model(id).map(|c| &c.config),
         RefKind::Provider => config.get_provider(id).map(|c| &c.config),
+        RefKind::Hardware => config.get_hardware(id).map(|c| &c.config),
     }
 }
 
@@ -568,6 +571,8 @@ fn constructs(kind: RefKind, type_name: &str, settings: &serde_json::Value) -> b
         RefKind::Provider => crate::providers::PROVIDER_REGISTRY
             .construct(type_name, type_name, settings)
             .is_ok(),
+        // A hardware profile is not built from settings; it has no reset.
+        RefKind::Hardware => false,
     }
 }
 
@@ -578,6 +583,7 @@ fn default_settings(kind: RefKind, type_name: &str) -> serde_json::Value {
         RefKind::Capability => crate::capabilities::CAPABILITY_REGISTRY.default_config(type_name),
         RefKind::Model => crate::models::MODEL_REGISTRY.default_config(type_name),
         RefKind::Provider => crate::providers::PROVIDER_REGISTRY.default_config(type_name),
+        RefKind::Hardware => serde_json::Value::Null,
     }
 }
 
@@ -697,6 +703,16 @@ async fn reconfigure(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
         RefKind::Capability => CapabilityCommands::setup(ctx, type_name, id, true).await,
         RefKind::Model => ModelCommands::setup(ctx, type_name, id, true).await,
         RefKind::Provider => ProviderCommands::setup(ctx, type_name, id, true).await,
+        RefKind::Hardware => {
+            use crate::config::hardware::LOCAL_HARDWARE_ID;
+            let args = crate::commands::hardware::HardwareSetupArgs {
+                target: Some(type_name.to_string()),
+                id: id.filter(|id| *id != LOCAL_HARDWARE_ID).map(str::to_string),
+                force_overwrite: true,
+                ..Default::default()
+            };
+            HardwareCommands::setup(ctx, args).map(|_| ())
+        }
     }
 }
 
@@ -728,6 +744,9 @@ fn reset(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
         RefKind::Provider => ctx
             .config_mut()
             .update_provider(&id, |provider| provider.config = defaults),
+        // `default_settings` gives a hardware profile no defaults, so no reset
+        // plan is ever made for one.
+        RefKind::Hardware => Ok(()),
     };
     if let Err(e) = saved {
         ctx.ui
@@ -781,6 +800,7 @@ fn remove(
         RefKind::Capability => CapabilityCommands::remove(ctx, id, policy),
         RefKind::Model => ModelCommands::remove(ctx, id, policy),
         RefKind::Provider => ProviderCommands::remove(ctx, id, policy),
+        RefKind::Hardware => HardwareCommands::remove(ctx, id, policy),
     }
 }
 
@@ -826,6 +846,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 // A deliberately chosen endpoint beside a field that cannot
@@ -933,6 +954,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
@@ -1465,6 +1487,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconfiguring_a_hardware_profile_replaces_it_without_an_overwrite_confirm() {
+        use crate::config::HardwareConfig;
+        use crate::config::hardware::HardwareLink;
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()));
+        ctx.config_mut().hardware.insert(
+            "card".to_string(),
+            HardwareConfig {
+                headroom: Some(0.9),
+                ..HardwareConfig::catalog("card", "nvidia-rtx-4090", 24.0)
+            },
+        );
+        ctx.config_mut().providers.insert(
+            "vllm-lab".to_string(),
+            ProviderConfig {
+                hardware: Some(HardwareLink::Profile("card".to_string())),
+                provider_id: "vllm-lab".to_string(),
+                provider_type: "openai-compatible".to_string(),
+                config: serde_json::json!({ "base_url": "http://lab:8000" }),
+            },
+        );
+        answer(&ctx, &[0]);
+        capture(&ctx)
+            .text_answers
+            .borrow_mut()
+            .push_back("1.5".to_string());
+
+        let outcome = remediate(
+            &mut ctx,
+            RefKind::Provider,
+            "vllm-lab",
+            OnDecline::Skip,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Clean);
+        assert!(prompts(&ctx)[0].1[0].starts_with("Reconfigure hardware profile 'card'"));
+        assert!(capture(&ctx).confirm_prompts.borrow().is_empty());
+        assert_eq!(
+            ctx.config().get_hardware("card"),
+            Some(&HardwareConfig::catalog("card", "nvidia-rtx-4090", 24.0))
+        );
+    }
+
+    #[tokio::test]
     async fn a_launch_reconfigure_fixes_the_reference_without_an_overwrite_confirm() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_a_dangling_model_ref();
@@ -1501,6 +1570,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),

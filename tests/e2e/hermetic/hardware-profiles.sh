@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The hardware command group and `model recommend --hardware`, run through
 # the binary: subcommand and argument routing, exit codes, what a run that
-# cannot prompt refuses, and the profile files written and removed. The
+# cannot prompt refuses, the profile files written and removed, and the
+# providers `hardware remove --dependents` takes with them. The
 # fixture's `local` is manual with no recorded detection, so no result here
 # depends on the machine the test runs on. The one step that lets detection
 # write `local` checks only which stream each line goes to.
@@ -67,12 +68,37 @@ expect_same_tree "$E2E_TMP/hardware-before" "$(hw_dir)"
 
 step "remove deletes a profile; local cannot be removed"
 use_fixture hardware
-gcli hardware remove box -o json
+gcli hardware remove spark -o json
 expect_rc 0
-expect_no_file "$(hw_dir)/box.yaml"
+expect_no_file "$(hw_dir)/spark.yaml"
 gcli hardware remove local -o json
 expect_rc 1
 expect_file "$(hw_dir)/local.yaml"
+
+step "remove of a profile a provider runs on, without --dependents or with refuse: exits 1 and removes nothing"
+use_fixture hardware
+gcli hardware remove box -o plain
+expect_rc 1
+expect_err_contains "--dependents cascade, --dependents leave, or --dependents refuse"
+gcli hardware remove box --dependents refuse -o json
+expect_rc 1
+expect_file "$(hw_dir)/box.yaml"
+expect_file "$P/lab.yaml"
+
+step "--dependents leave removes only the profile"
+use_fixture hardware
+gcli hardware remove box --dependents leave -o json
+expect_rc 0
+expect_no_file "$(hw_dir)/box.yaml"
+expect_file "$P/lab.yaml"
+
+step "--dependents cascade removes the profile and the provider"
+use_fixture hardware
+gcli hardware remove box --dependents cascade -o json
+expect_rc 0
+expect_no_file "$(hw_dir)/box.yaml"
+expect_no_file "$P/lab.yaml"
+expect_file "$(hw_dir)/spark.yaml"
 
 step "markdown output keeps notices and warnings on stderr"
 fresh

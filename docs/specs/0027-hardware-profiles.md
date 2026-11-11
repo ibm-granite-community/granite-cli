@@ -433,8 +433,10 @@ for its type.
 
 `provider setup` asks for the link. It offers the local hardware profile, the
 configured ones, "not specified", and "create new profile…", which runs the
-same steps as `hardware setup` and links the result. The two commands can
-therefore be used in either order.
+same steps as `hardware setup` and links the result. If the id typed belongs
+to an existing profile and the user declines to replace it, `provider setup`
+stops with an error and saves nothing. The two commands can therefore be used
+in either order.
 
 ```
 $ granite-cli provider setup
@@ -1043,7 +1045,7 @@ one to `local`.
 - `src/commands/provider.rs`
 - `src/providers/base.rs` (`ProviderType::Hosted`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1079,7 +1081,7 @@ existing setup tests passing with every provider on `local`.
 - `src/commands/setup.rs` (`resolve_model_set`, `rank_variants_among`,
   `run_auto_with_hardware`, `select_variants`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
