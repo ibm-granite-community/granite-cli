@@ -46,3 +46,15 @@ proxy. Both launchers need their command on `PATH` (`stub_bin opencode`,
 | model | `discovered-unknown-context` | a discovered `custom` model with `context_length: 0`, so Pi must omit `contextWindow` |
 | capability | `model-provider` | takes no settings; covers every configured model |
 | launcher | `opencode`, `pi` | each enables `model-provider` |
+
+## hardware
+
+Hardware profiles and nothing else. `local` is in manual mode with no
+recorded detection, so commands use its figures and never compare them with
+this machine: no result depends on the machine the test runs on.
+
+| Id | Type | Memory |
+|---|---|---|
+| `local` | `local`, manual | system 32.0 GB |
+| `box` | `custom` | discrete 24.0 GB |
+| `spark` | `dgx-spark` (catalog) | 128.0 GB |

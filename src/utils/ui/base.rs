@@ -31,6 +31,14 @@ pub(crate) struct UiMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PullHandle(pub(crate) u64);
 
+/// A colour for a label in table output, such as the SOURCE column of
+/// `model list`. Only a backend that writes to a colour terminal applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tint {
+    Magenta,
+    Yellow,
+}
+
 // Generate UiFactory and HasUiMetadata via the existing macro.
 use crate::define_factory;
 define_factory!(Ui, UiMetadata, UiFactory);
@@ -153,6 +161,21 @@ pub(crate) trait Ui: Send + Sync + Any {
     /// Warning message.
     fn warn(&self, msg: &str);
 
+    /// Warning about the run, as opposed to its result, which must not end up
+    /// in output a script reads. Backends that write their result to stdout
+    /// (JSON, markdown) send it to stderr; the others treat it as `warn`.
+    /// Those two backends do not go through `warn`, so a crate-wide way of
+    /// silencing warnings has to cover this method as well.
+    fn warn_stderr(&self, msg: &str) {
+        self.warn(msg);
+    }
+
+    /// Notice about the run, routed like [`Ui::warn_stderr`]; the backends
+    /// that do not override it treat it as `info`.
+    fn info_stderr(&self, msg: &str) {
+        self.info(msg);
+    }
+
     /// Error message. Implementations should route this to stderr.
     fn error(&self, msg: &str);
 
@@ -186,6 +209,13 @@ pub(crate) trait Ui: Send + Sync + Any {
 
     /// Apply severity-based markings (e.g. gray) to `msg`.
     fn detail_mark(&self, msg: &str) -> String {
+        msg.to_string()
+    }
+
+    /// Colour `msg` with `tint`. Backends other than a colour terminal
+    /// return `msg` unchanged, so JSON, Markdown and plain output carry the
+    /// text only.
+    fn tint(&self, msg: &str, _tint: Tint) -> String {
         msg.to_string()
     }
 
@@ -311,8 +341,12 @@ pub(crate) mod tests {
         pub(crate) statuses: RefCell<Vec<(String, bool, String)>>,
         pub(crate) infos: RefCell<Vec<String>>,
         pub(crate) warns: RefCell<Vec<String>>,
+        /// msg for each warn_stderr() call
+        pub(crate) stderr_warns: RefCell<Vec<String>>,
+        /// msg for each info_stderr() call
+        pub(crate) stderr_infos: RefCell<Vec<String>>,
         pub(crate) errors: RefCell<Vec<String>>,
-        oks: RefCell<Vec<String>>,
+        pub(crate) oks: RefCell<Vec<String>>,
         warn_marks: RefCell<Vec<String>>,
         error_marks: RefCell<Vec<String>>,
         detail_marks: RefCell<Vec<String>>,
@@ -400,6 +434,14 @@ pub(crate) mod tests {
 
         fn warn(&self, msg: &str) {
             self.warns.borrow_mut().push(msg.to_string());
+        }
+
+        fn warn_stderr(&self, msg: &str) {
+            self.stderr_warns.borrow_mut().push(msg.to_string());
+        }
+
+        fn info_stderr(&self, msg: &str) {
+            self.stderr_infos.borrow_mut().push(msg.to_string());
         }
 
         fn error(&self, msg: &str) {

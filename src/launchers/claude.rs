@@ -165,16 +165,18 @@ impl Launcher for ClaudeLauncher {
                     value: binding.model_name.clone(),
                 },
                 EnvBinding {
-                    key: "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
-                    value: binding
-                        .context_length
-                        .map_or(String::new(), |v| v.to_string()),
-                },
-                EnvBinding {
                     key: "ANTHROPIC_AUTH_TOKEN".to_string(),
                     value: api_key_val,
                 },
             ];
+            // An unknown context length leaves the variable unset, so Claude
+            // Code uses its own default.
+            if let Some(context_length) = binding.context_length {
+                bindings.push(EnvBinding {
+                    key: "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
+                    value: context_length.to_string(),
+                });
+            }
 
             // Add custom headers if configured, formatted as "Name: Value" pairs
             // newline-separated, matching ANTHROPIC_CUSTOM_HEADERS format.
@@ -564,6 +566,42 @@ mod tests {
         let overlay = l.env_overlay(&test_launch_context(false)).await.unwrap();
         let headers_entry = overlay.iter().find(|b| b.key == "ANTHROPIC_CUSTOM_HEADERS");
         assert!(headers_entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn env_overlay_sets_max_context_tokens_only_when_known() {
+        let binding = |context_length| crate::capabilities::AgentModelBinding {
+            api_type: crate::providers::ApiType::Anthropic,
+            provider_name: "test".to_string(),
+            base_url: "http://test".to_string(),
+            model_name: "test-model".to_string(),
+            endpoint_path: "/v1/messages".to_string(),
+            api_key: Some(crate::registry::Secret::from("test-key")),
+            verify_ssl: true,
+            context_length,
+            custom_headers: None,
+            supported_reasoning_efforts: vec![],
+        };
+        let max_tokens = |overlay: &[EnvBinding]| {
+            overlay
+                .iter()
+                .find(|b| b.key == "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                .map(|b| b.value.clone())
+        };
+
+        let known = launcher_with(Some(binding(Some(4096))), vec![]);
+        let overlay = known
+            .env_overlay(&test_launch_context(false))
+            .await
+            .unwrap();
+        assert_eq!(max_tokens(&overlay), Some("4096".to_string()));
+
+        let unknown = launcher_with(Some(binding(None)), vec![]);
+        let overlay = unknown
+            .env_overlay(&test_launch_context(false))
+            .await
+            .unwrap();
+        assert_eq!(max_tokens(&overlay), None);
     }
 
     #[tokio::test]

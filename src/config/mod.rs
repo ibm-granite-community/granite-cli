@@ -10,10 +10,21 @@ use serde::{Deserialize, Serialize};
 
 use_channel!("CONF");
 
+pub(crate) mod hardware;
 pub(crate) mod recommended_config;
 pub(crate) mod validation;
 
+pub(crate) use hardware::HardwareConfig;
+
 pub(crate) const PATH_DELIM: &str = "---";
+
+/// Longest file name, in bytes, that `Config::id_to_filename` returns
+/// together with the `.yaml` extension. APFS and ext4 reject a file name
+/// longer than 255 bytes, and NTFS one longer than 255 UTF-16 units.
+const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Extension of every entry file `Config::save` writes.
+const CONFIG_FILE_EXTENSION: &str = ".yaml";
 
 pub(crate) trait ConfigId {
     fn config_id(&self) -> &str;
@@ -43,6 +54,18 @@ impl ConfigId for LauncherConfig {
     }
 }
 
+impl ConfigId for HardwareConfig {
+    fn config_id(&self) -> &str {
+        &self.hardware_id
+    }
+}
+
+impl ConfigPathTranslator for HardwareConfig {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        None
+    }
+}
+
 impl ConfigId for recommended_config::RecommendedConfiguration {
     fn config_id(&self) -> &str {
         &self.launcher
@@ -62,6 +85,7 @@ pub(crate) struct Config {
     pub(crate) capabilities: HashMap<String, CapabilityConfig>,
     pub(crate) launchers: HashMap<String, LauncherConfig>,
     pub(crate) recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
+    pub(crate) hardware: HashMap<String, HardwareConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +421,10 @@ impl Config {
         Ok(Self::config_dir()?.join("recommended_configs"))
     }
 
+    fn hardware_dir() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("hardware"))
+    }
+
     pub(crate) fn sessions_dir() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("sessions"))
     }
@@ -424,6 +452,7 @@ impl Config {
         fs::create_dir_all(Self::capabilities_dir()?)?;
         fs::create_dir_all(Self::launchers_dir()?)?;
         fs::create_dir_all(Self::recommended_configs_dir()?)?;
+        fs::create_dir_all(Self::hardware_dir()?)?;
         fs::create_dir_all(Self::sessions_dir()?)?;
         Ok(())
     }
@@ -474,7 +503,9 @@ impl Config {
                 }
                 let id = config.config_id().to_string();
                 let file_id = Self::id_from_filename(&file_name);
-                if id != file_id {
+                // A long id is saved under a shortened name that does not
+                // decode back to the id, so the forward mapping is compared too.
+                if id != file_id && Self::id_to_filename(&id) != file_name {
                     let type_name = std::any::type_name::<V>();
                     alog_channel!(
                         MessageLevel::Warning,
@@ -520,6 +551,8 @@ impl Config {
         config.capabilities = Self::load_dir(capabilities_dir, |s| s.to_string())?;
         config.launchers = Self::load_dir(launchers_dir, |s| s.to_string())?;
         config.recommended_configs = Self::load_recommended_configs(recommended_configs_dir)?;
+        config.hardware = Self::load_dir(&Self::hardware_dir()?, |s| s.to_string())?;
+        config.report_hardware_problems();
 
         Ok(config)
     }
@@ -569,7 +602,25 @@ impl Config {
         Ok(map)
     }
 
+    /// The file name, without extension, that an entry with this id is
+    /// saved under. A name that would be longer than `MAX_FILE_NAME_BYTES`
+    /// with the extension is cut short and ends in `~` and a hash of the
+    /// whole id, so ids that share a long prefix get different files. The
+    /// file still holds the full id, which `load_dir` reads.
     fn id_to_filename(id: &str) -> String {
+        let filename = Self::escape_id(id);
+        if filename.len() + CONFIG_FILE_EXTENSION.len() <= MAX_FILE_NAME_BYTES {
+            return filename;
+        }
+        let suffix = format!("~{:016x}", fnv1a_64(id.as_bytes()));
+        let mut end = MAX_FILE_NAME_BYTES - CONFIG_FILE_EXTENSION.len() - suffix.len();
+        while !filename.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{suffix}", &filename[..end])
+    }
+
+    fn escape_id(id: &str) -> String {
         // Keep `/` mapped to `PATH_DELIM` for existing configs, and escape
         // characters that Windows rejects in file names. `%` is escaped too so
         // the mapping stays reversible.
@@ -687,6 +738,13 @@ impl Config {
             let path = Self::launchers_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
             alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
             Self::save_yaml_to_file(&path, &launcher)?;
+        }
+
+        // Save individual hardware profile files
+        for (id, hardware) in &self.hardware {
+            let path = Self::hardware_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
+            alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
+            Self::save_yaml_to_file(&path, hardware)?;
         }
 
         Ok(())
@@ -842,12 +900,74 @@ impl Config {
         }
     }
 
+    // -- Hardware --
+
+    pub(crate) fn get_hardware(&self, id: &str) -> Option<&HardwareConfig> {
+        self.hardware.get(id)
+    }
+
+    pub(crate) fn insert_hardware(&mut self, id: &str, config: HardwareConfig) -> Result<()> {
+        self.hardware.insert(id.to_string(), config);
+        self.save()
+    }
+
+    /// Removes a hardware profile. `local` describes the machine granite-cli
+    /// runs on and cannot be removed.
+    pub(crate) fn remove_hardware(&mut self, id: &str) -> Result<()> {
+        if id == hardware::LOCAL_HARDWARE_ID {
+            anyhow::bail!("hardware profile '{id}' describes this machine and cannot be removed");
+        }
+        self.hardware.remove(id);
+        let path = Self::hardware_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        self.save()
+    }
+
+    /// Every hardware profile whose figures cannot be looked up, such as one
+    /// that uses a size a newer catalog no longer offers, with the reason,
+    /// sorted by id.
+    fn hardware_problems(&self) -> Vec<(String, String)> {
+        let mut problems: Vec<(String, String)> = self
+            .hardware
+            .iter()
+            .filter_map(|(id, hardware)| hardware.profile().err().map(|e| (id.clone(), e)))
+            .collect();
+        problems.sort();
+        problems
+    }
+
+    /// Warns about each of `hardware_problems` on load. The profiles stay
+    /// loaded, so the user can still see and fix them.
+    fn report_hardware_problems(&self) {
+        for (id, problem) in self.hardware_problems() {
+            alog_channel!(
+                MessageLevel::Warning,
+                "Hardware profile '{}': {}",
+                id,
+                problem
+            );
+        }
+    }
+
     /// Calls `ensure_directories` from test code. Mirrors the real
     /// `ensure_directories` but public under `#[cfg(test)]`.
     #[cfg(test)]
     pub(crate) fn ensure_directories_for_test() {
         Self::ensure_directories().unwrap();
     }
+}
+
+/// 64-bit FNV-1a hash. `id_to_filename` uses it for the suffix of a shortened
+/// file name, which has to be the same in every build and Rust version so
+/// the file saved by one release is found by the next.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 /*-- Tests -- */
@@ -996,6 +1116,74 @@ mod tests {
         }
         assert_eq!(Config::id_to_filename("granite:8b"), "granite%3A8b");
         assert_eq!(Config::id_to_filename("org/model"), "org---model");
+    }
+
+    #[test]
+    fn a_long_id_gets_a_shortened_file_name_with_a_hash_suffix() {
+        let long_id = "x".repeat(300);
+        let other_long_id = format!("{}y", "x".repeat(299));
+        let filename = Config::id_to_filename(&long_id);
+        assert_eq!(filename.len() + ".yaml".len(), MAX_FILE_NAME_BYTES);
+        assert!(filename.starts_with("xxxx"), "{filename}");
+        assert_ne!(filename, Config::id_to_filename(&other_long_id));
+        // The same id always maps to the same name.
+        assert_eq!(filename, Config::id_to_filename(&long_id));
+    }
+
+    #[test]
+    fn a_shortened_file_name_never_splits_a_character() {
+        let long_id = "é".repeat(200);
+        let filename = Config::id_to_filename(&long_id);
+        assert!(filename.len() + ".yaml".len() <= MAX_FILE_NAME_BYTES);
+        assert!(filename.starts_with("éé"), "{filename}");
+    }
+
+    #[test]
+    fn fnv1a_64_matches_the_reference_values() {
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn a_model_with_a_long_id_saves_and_loads() {
+        let _home = TestConfigHome::new();
+        let long_id = format!("org/{}:Q4_K_M", "m".repeat(300));
+        let mut config = Config::default();
+        config
+            .insert_model(
+                &long_id,
+                ModelConfig {
+                    model_id: long_id.clone(),
+                    model_type: "custom".to_string(),
+                    provider_id: "p".to_string(),
+                    variant: None,
+                    discovered: None,
+                    config: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        config
+            .insert_model(
+                "granite:8b",
+                ModelConfig {
+                    model_id: "granite:8b".to_string(),
+                    model_type: "custom".to_string(),
+                    provider_id: "p".to_string(),
+                    variant: None,
+                    discovered: None,
+                    config: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+
+        let reloaded = Config::new().unwrap();
+        assert!(reloaded.get_model(&long_id).is_some());
+        assert!(reloaded.get_model("granite:8b").is_some());
+
+        let mut reloaded = reloaded;
+        reloaded.remove_model(&long_id).unwrap();
+        assert!(Config::new().unwrap().get_model(&long_id).is_none());
     }
 
     #[test]
@@ -1155,5 +1343,109 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    // -- hardware profiles ------------------------------------------------------
+
+    fn hardware_dir() -> PathBuf {
+        Path::new(&std::env::var("GRANITE_CLI_HOME").unwrap()).join("hardware")
+    }
+
+    #[test]
+    fn hardware_profiles_are_saved_and_loaded() {
+        let _home = TestConfigHome::new();
+
+        let mut config = Config::new().unwrap();
+        let spark = HardwareConfig::catalog("spark", "dgx-spark", 128.0);
+        config.insert_hardware("spark", spark.clone()).unwrap();
+
+        assert!(hardware_dir().join("spark.yaml").exists());
+        let reloaded = Config::new().unwrap();
+        assert_eq!(reloaded.get_hardware("spark"), Some(&spark));
+    }
+
+    #[test]
+    fn a_size_the_catalog_no_longer_offers_is_reported_on_load() {
+        let _home = TestConfigHome::new();
+        fs::write(
+            hardware_dir().join("card.yaml"),
+            "hardware_id: card\ntype: nvidia-rtx-4090\nmemory: 48.0\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+
+        // Still loaded, so the user can see and fix it.
+        assert!(config.get_hardware("card").is_some());
+        assert_eq!(
+            config.hardware_problems(),
+            vec![(
+                "card".to_string(),
+                "'nvidia-rtx-4090' is not offered with 48 GB; the catalog lists 24 GB".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_headroom_factor_below_one_is_reported_on_load() {
+        let _home = TestConfigHome::new();
+        fs::write(
+            hardware_dir().join("card.yaml"),
+            "hardware_id: card\ntype: nvidia-rtx-4090\nmemory: 24.0\nheadroom: 0.9\n",
+        )
+        .unwrap();
+
+        let config = Config::new().unwrap();
+
+        assert!(config.get_hardware("card").is_some());
+        assert_eq!(
+            config.hardware_problems(),
+            vec![(
+                "card".to_string(),
+                "headroom must be at least 1.0, got 0.9".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn local_hardware_profile_cannot_be_removed() {
+        let _home = TestConfigHome::new();
+        let mut config = Config::new().unwrap();
+        let local = HardwareConfig::local_from_detection(
+            crate::utils::hardware::HardwareProfile::with_memory(
+                crate::utils::hardware::Memory::System { ram_gb: 64.0 },
+            ),
+        );
+        config
+            .insert_hardware(hardware::LOCAL_HARDWARE_ID, local)
+            .unwrap();
+
+        let err = config
+            .remove_hardware(hardware::LOCAL_HARDWARE_ID)
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "hardware profile 'local' describes this machine and cannot be removed"
+        );
+        assert!(config.get_hardware(hardware::LOCAL_HARDWARE_ID).is_some());
+        assert!(hardware_dir().join("local.yaml").exists());
+    }
+
+    #[test]
+    fn other_hardware_profiles_can_be_removed() {
+        let _home = TestConfigHome::new();
+        let mut config = Config::new().unwrap();
+        config
+            .insert_hardware(
+                "spark",
+                HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+            )
+            .unwrap();
+
+        config.remove_hardware("spark").unwrap();
+
+        assert!(config.get_hardware("spark").is_none());
+        assert!(!hardware_dir().join("spark.yaml").exists());
     }
 }

@@ -108,6 +108,7 @@ Today, the project already supports:
 - configuring models and providers
 - checking provider health
 - recommending models based on local hardware
+- managing hardware profiles (`granite-cli hardware`): the local machine, devices from a built-in catalog, and custom figures
 - pulling model weights for supported local providers
 - rendering output in the terminal, as plain text, JSON, and Markdown
 
