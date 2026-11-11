@@ -1,8 +1,10 @@
 // Local
 use crate::AppContext;
+use crate::commands::shared::remediation::DependentsPolicy;
 use crate::config::HardwareConfig;
 use crate::config::hardware::{
-    CUSTOM_HARDWARE_TYPE, LOCAL_HARDWARE_ID, LocalHardware, LocalMode, saved_figures,
+    CUSTOM_HARDWARE_TYPE, HardwareLink, LOCAL_HARDWARE_ID, LocalHardware, LocalMode,
+    UNSPECIFIED_HARDWARE, saved_figures,
 };
 use crate::utils::hardware::{HardwareProfile, MachineInfo, Memory, MemoryKind, detect_hardware};
 use crate::utils::hardware_catalog::{self, CatalogEntry, HARDWARE_CATALOG};
@@ -41,37 +43,6 @@ pub(crate) struct HardwareSetupArgs {
 }
 
 impl HardwareCommands {
-    /// Key-value fields for the hardware detail panel, from detection.
-    /// Shared by the CLI command and the TUI.
-    pub(crate) fn hardware_fields() -> Vec<(&'static str, String)> {
-        let profile = detect_hardware();
-        let gb = |figure: Option<f64>| {
-            figure
-                .map(|v| format!("{v:.2} GB"))
-                .unwrap_or_else(|| "None".to_string())
-        };
-        vec![
-            (
-                "CPU Cores",
-                profile
-                    .machine
-                    .cpu_cores
-                    .map(|cores| cores.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-            ),
-            ("CPU Architecture", profile.machine.cpu_arch.clone()),
-            ("RAM", gb(profile.memory.ram_gb())),
-            (
-                "GPU Vendor",
-                profile
-                    .gpu_vendor
-                    .clone()
-                    .unwrap_or_else(|| "None".to_string()),
-            ),
-            ("VRAM", gb(profile.memory.vram_gb())),
-        ]
-    }
-
     /// `granite-cli hardware` with no subcommand: the local hardware profile
     /// and its mode.
     pub(crate) fn show(ctx: &mut AppContext) -> Result<()> {
@@ -82,19 +53,7 @@ impl HardwareCommands {
     /// `hardware catalog`: the built-in devices and their sizes, grouped by
     /// family in catalog order, or one family with `--family`.
     pub(crate) fn catalog(ctx: &AppContext, family: Option<&str>) -> Result<()> {
-        let family = family.map(find_family).transpose()?;
-        let rows: Vec<Vec<String>> = HARDWARE_CATALOG
-            .iter()
-            .filter(|e| family.is_none_or(|f| e.family == f))
-            .map(|e| {
-                vec![
-                    e.family.to_string(),
-                    e.id.to_string(),
-                    e.name.to_string(),
-                    catalog_memory(e),
-                ]
-            })
-            .collect();
+        let rows = Self::catalog_rows(family)?;
         ctx.ui.table(
             &format!(
                 "Hardware Catalog ({})",
@@ -119,6 +78,140 @@ impl HardwareCommands {
         Self::info_detail(ctx, id, unused.as_ref())
     }
 
+    /// The detail fields of configured hardware profile `id`, for `hardware
+    /// info` and the TUI's detail pane. `unused` is a detection of this
+    /// machine that differs from `local`'s figures and that this run did not
+    /// take; see [`Self::compare_local`].
+    pub(crate) fn info_fields(
+        ctx: &AppContext,
+        id: &str,
+        unused: Option<&HardwareProfile>,
+    ) -> Result<Vec<(&'static str, String)>> {
+        let hardware = ctx
+            .config()
+            .get_hardware(id)
+            .ok_or_else(|| not_configured(ctx, id))?;
+        let mut fields: Vec<(&'static str, String)> =
+            vec![("Type", hardware.hardware_type.clone())];
+        if let Some(entry) = hardware_catalog::find(&hardware.hardware_type) {
+            fields.push(("Device", entry.name.to_string()));
+        }
+        if let Some(local) = hardware.local_settings() {
+            fields.push(("Mode", mode_label(local.mode).to_string()));
+            if let Some(detected) = unused.or(local.detected.as_ref()) {
+                fields.push((
+                    "Detected",
+                    format!("{} (not used)", detected.memory_summary()),
+                ));
+            }
+        }
+        match ctx.hardware_profile(id) {
+            Ok(p) => {
+                let gb = |v: Option<f64>| v.map(|v| format!("{v:.2} GB"));
+                fields.push(("Memory", p.memory_summary()));
+                if let Some(vram) = gb(p.memory.vram_gb()) {
+                    fields.push(("Accelerator memory", vram));
+                }
+                if let Some(ram) = gb(p.memory.ram_gb()) {
+                    fields.push(("System memory", ram));
+                }
+                fields.push(("Headroom", headroom_label(&p)));
+                fields.push((
+                    "Usable for models",
+                    format!("{:.2} GB", p.usable_memory_gb()),
+                ));
+                let MachineInfo {
+                    os,
+                    cpu_cores,
+                    cpu_arch,
+                } = p.machine;
+                let text = |s: String| (!s.is_empty()).then_some(s);
+                let descriptive = [
+                    ("GPU Vendor", p.gpu_vendor),
+                    ("OS", text(os)),
+                    ("CPU Architecture", text(cpu_arch)),
+                    ("CPU Cores", cpu_cores.map(|c| c.to_string())),
+                ];
+                fields.extend(
+                    descriptive
+                        .into_iter()
+                        .filter_map(|(k, v)| v.map(|v| (k, v))),
+                );
+            }
+            Err(e) => fields.push(("Problem", ctx.ui.warn_mark(&format!("⚠ {e}")))),
+        }
+        fields.push(("Providers", providers_on(ctx, id).join(", ")));
+        Ok(fields)
+    }
+
+    /// Rows for the configured hardware profiles, `local` first:
+    /// [id, type, memory, providers, notes]. Shared by `hardware list` and
+    /// the TUI. `unused` is as for [`Self::info_fields`].
+    pub(crate) fn configured_rows(
+        ctx: &AppContext,
+        unused: Option<&HardwareProfile>,
+    ) -> Vec<Vec<String>> {
+        let config = ctx.config();
+        let mut ids: Vec<&String> = config.hardware.keys().collect();
+        ids.sort_by_key(|id| (id.as_str() != LOCAL_HARDWARE_ID, id.as_str()));
+        ids.into_iter()
+            .map(|id| {
+                let hardware = &config.hardware[id];
+                let (memory, problem) = match ctx.hardware_profile(id) {
+                    Ok(p) => (p.memory_summary(), None),
+                    Err(e) => ("-".to_string(), Some(ctx.ui.warn_mark(&format!("⚠ {e}")))),
+                };
+                vec![
+                    id.clone(),
+                    hardware.hardware_type.clone(),
+                    memory,
+                    providers_on(ctx, id).join(", "),
+                    problem.unwrap_or_else(|| notes(hardware, unused)),
+                ]
+            })
+            .collect()
+    }
+
+    /// Rows for the built-in catalog, or one family of it: [family, id,
+    /// name, memory], in catalog order. Shared by `hardware catalog` and the
+    /// TUI, which puts the id first.
+    pub(crate) fn catalog_rows(family: Option<&str>) -> Result<Vec<Vec<String>>> {
+        let family = family.map(find_family).transpose()?;
+        Ok(HARDWARE_CATALOG
+            .iter()
+            .filter(|e| family.is_none_or(|f| e.family == f))
+            .map(|e| {
+                vec![
+                    e.family.to_string(),
+                    e.id.to_string(),
+                    e.name.to_string(),
+                    catalog_memory(e),
+                ]
+            })
+            .collect())
+    }
+
+    /// The detail fields of catalog entry `id`, for the TUI's detail pane.
+    pub(crate) fn catalog_fields(id: &str) -> Option<Vec<(&'static str, String)>> {
+        let entry = hardware_catalog::find(id)?;
+        let mut fields = vec![
+            ("Name", entry.name.to_string()),
+            ("Memory", catalog_memory(entry)),
+            ("Family", entry.family.to_string()),
+        ];
+        if let Some(vendor) = entry.vendor {
+            fields.push(("Vendor", vendor.to_string()));
+        }
+        for size in entry.sizes {
+            let usable = entry.profile(size).usable_memory_gb();
+            fields.push((
+                "Usable for models",
+                format!("{:.2} GB at {} GB", usable, format_gb(size.memory_gb)),
+            ));
+        }
+        Some(fields)
+    }
+
     /// `hardware setup`: create or change a hardware profile from a catalog
     /// entry, from typed figures (`custom`), or set up `local`. Returns the id
     /// of the profile saved, or `None` when the user declines to replace an
@@ -129,15 +222,26 @@ impl HardwareCommands {
         Self::setup_with(ctx, args, interactive, detect_hardware)
     }
 
-    /// `hardware remove <id>`. `local` cannot be removed.
-    pub(crate) fn remove(ctx: &mut AppContext, id: &str) -> Result<()> {
+    /// The `hardware setup` steps for a caller that can always ask, such as
+    /// the TUI setup pane, whatever stdin is. Returns what [`Self::setup`]
+    /// returns.
+    pub(crate) fn setup_asking(
+        ctx: &mut AppContext,
+        args: HardwareSetupArgs,
+    ) -> Result<Option<String>> {
+        Self::setup_with(ctx, args, true, detect_hardware)
+    }
+
+    /// `hardware remove <id>`. `local` cannot be removed. When providers are
+    /// linked to the profile, they are listed and the user chooses to remove
+    /// them too, keep the profile, or remove it alone.
+    pub(crate) fn remove(
+        ctx: &mut AppContext,
+        id: &str,
+        policy: Option<DependentsPolicy>,
+    ) -> Result<()> {
         Self::check_local(ctx, detect_hardware, can_prompt(ctx))?;
-        if ctx.config().get_hardware(id).is_none() {
-            return Err(not_configured(ctx, id));
-        }
-        ctx.config_mut().remove_hardware(id)?;
-        ctx.ui.info(&format!("Hardware profile '{id}' removed."));
-        Ok(())
+        Self::remove_profile(ctx, id, policy)
     }
 
     /// The local hardware profile's figures, for a command that estimates
@@ -163,11 +267,23 @@ impl HardwareCommands {
         Self::profile_for_fit_with(ctx, id, can_prompt, detect_hardware)
     }
 
-    /// The providers that run on hardware profile `id`, sorted. Until
-    /// providers are linked to hardware, every provider runs on `local`,
-    /// which is how existing configuration is read.
+    /// The providers linked to hardware profile `id`, sorted.
     pub(crate) fn providers_on(ctx: &AppContext, id: &str) -> Vec<String> {
         providers_on(ctx, id)
+    }
+
+    /// Asks which hardware profile a provider of `provider_type` runs on:
+    /// `local`, another configured profile, "not specified", or a new
+    /// profile created with the `hardware setup` steps. `current` is offered
+    /// first when the provider is being reconfigured; otherwise `local` for a
+    /// provider the user runs and "not specified" for a hosted one.
+    pub(crate) fn choose_link(
+        ctx: &mut AppContext,
+        provider_type: &str,
+        current: Option<HardwareLink>,
+    ) -> Result<HardwareLink> {
+        let interactive = can_prompt(ctx);
+        Self::choose_link_with(ctx, provider_type, current, interactive, detect_hardware)
     }
 
     /// Whether this run can ask the user something: the output backend is
@@ -215,15 +331,11 @@ impl HardwareCommands {
             ctx.ui.warn_stderr(&e.to_string());
         }
     }
-}
 
-/*-- private --*/
-
-impl HardwareCommands {
     /// [`Self::check_local`], returning the detection that differs from the
     /// figures in use when this run keeps the stored figures without
-    /// recording it, so `hardware list` and `info` can show it.
-    fn compare_local(
+    /// recording it, so `hardware list`, `info` and the TUI can show it.
+    pub(crate) fn compare_local(
         ctx: &mut AppContext,
         detect: impl FnOnce() -> HardwareProfile,
         can_prompt: bool,
@@ -297,6 +409,90 @@ impl HardwareCommands {
         Ok(None)
     }
 
+    fn remove_profile(
+        ctx: &mut AppContext,
+        id: &str,
+        policy: Option<DependentsPolicy>,
+    ) -> Result<()> {
+        use crate::commands::shared::remediation::{Removal, confirm_removal, remove_all};
+        use crate::config::validation::RefKind;
+
+        if ctx.config().get_hardware(id).is_none() {
+            return Err(not_configured(ctx, id));
+        }
+        if id == LOCAL_HARDWARE_ID {
+            bail!("hardware profile '{id}' describes this machine and cannot be removed");
+        }
+        match confirm_removal(ctx, RefKind::Hardware, id, policy)? {
+            Removal::Cancel => {
+                ctx.ui.info(&format!("Keeping hardware profile '{id}'."));
+                return Ok(());
+            }
+            Removal::Proceed { with } => remove_all(ctx, &with, policy)?,
+        }
+        ctx.config_mut().remove_hardware(id)?;
+        ctx.ui.info(&format!("Hardware profile '{id}' removed."));
+        Ok(())
+    }
+
+    /// `detect` writes `local` when there is none, so the question can show
+    /// its figures.
+    fn choose_link_with(
+        ctx: &mut AppContext,
+        provider_type: &str,
+        current: Option<HardwareLink>,
+        interactive: bool,
+        detect: impl FnOnce() -> HardwareProfile,
+    ) -> Result<HardwareLink> {
+        let default = current.unwrap_or_else(|| HardwareLink::default_for(provider_type));
+        if !interactive {
+            return Ok(default);
+        }
+        ctx.ensure_local_hardware(detect)?;
+        let mut others: Vec<String> = ctx
+            .config()
+            .hardware
+            .keys()
+            .filter(|id| id.as_str() != LOCAL_HARDWARE_ID)
+            .cloned()
+            .collect();
+        others.sort();
+        let mut links = vec![HardwareLink::Local];
+        let local = ctx
+            .hardware_profile(LOCAL_HARDWARE_ID)
+            .map(|p| format!("local (this machine, {})", p.memory_summary()))
+            .unwrap_or_else(|_| "local (this machine)".to_string());
+        let mut items = vec![local];
+        for id in others {
+            let summary = ctx
+                .hardware_profile(&id)
+                .map(|p| p.memory_summary())
+                .unwrap_or_else(|e| e);
+            items.push(format!("{id} ({summary})"));
+            links.push(HardwareLink::Profile(id));
+        }
+        links.push(HardwareLink::Unspecified);
+        items.push("not specified (fit cannot be estimated)".to_string());
+        items.push("create new profile…".to_string());
+        let default_index = links.iter().position(|l| *l == default).unwrap_or(0);
+        let picked = ctx
+            .ui
+            .select("Hardware this provider runs on", &items, default_index)?;
+        if picked < links.len() {
+            return Ok(links[picked].clone());
+        }
+        // Declining to replace a profile under the id typed leaves no new
+        // profile to link.
+        let id = Self::setup_with(
+            ctx,
+            HardwareSetupArgs::default(),
+            interactive,
+            detect_hardware,
+        )?
+        .ok_or_else(|| anyhow!("no hardware profile to link; hardware setup was skipped"))?;
+        Ok(HardwareLink::Profile(id))
+    }
+
     fn profile_for_fit_with(
         ctx: &mut AppContext,
         id: &str,
@@ -355,7 +551,11 @@ impl HardwareCommands {
             .map_err(|e| anyhow!("hardware profile '{id}': {e}"))?;
         Ok((id, profile))
     }
+}
 
+/*-- private --*/
+
+impl HardwareCommands {
     fn show_with(
         ctx: &mut AppContext,
         detect: impl FnOnce() -> HardwareProfile,
@@ -365,88 +565,16 @@ impl HardwareCommands {
         Self::info_detail(ctx, LOCAL_HARDWARE_ID, unused.as_ref())
     }
 
-    /// `unused` is a detection of this machine that differs from `local`'s
-    /// figures and that this run did not take; see [`Self::compare_local`].
+    /// `unused` is as for [`Self::info_fields`].
     fn info_detail(ctx: &AppContext, id: &str, unused: Option<&HardwareProfile>) -> Result<()> {
-        let hardware = ctx
-            .config()
-            .get_hardware(id)
-            .ok_or_else(|| not_configured(ctx, id))?;
-        let mut fields: Vec<(&str, String)> = vec![("Type", hardware.hardware_type.clone())];
-        if let Some(entry) = hardware_catalog::find(&hardware.hardware_type) {
-            fields.push(("Device", entry.name.to_string()));
-        }
-        if let Some(local) = hardware.local_settings() {
-            fields.push(("Mode", mode_label(local.mode).to_string()));
-            if let Some(detected) = unused.or(local.detected.as_ref()) {
-                fields.push((
-                    "Detected",
-                    format!("{} (not used)", detected.memory_summary()),
-                ));
-            }
-        }
-        match ctx.hardware_profile(id) {
-            Ok(p) => {
-                let gb = |v: Option<f64>| v.map(|v| format!("{v:.2} GB"));
-                fields.push(("Memory", p.memory_summary()));
-                if let Some(vram) = gb(p.memory.vram_gb()) {
-                    fields.push(("Accelerator memory", vram));
-                }
-                if let Some(ram) = gb(p.memory.ram_gb()) {
-                    fields.push(("System memory", ram));
-                }
-                fields.push(("Headroom", headroom_label(&p)));
-                fields.push((
-                    "Usable for models",
-                    format!("{:.2} GB", p.usable_memory_gb()),
-                ));
-                let MachineInfo {
-                    os,
-                    cpu_cores,
-                    cpu_arch,
-                } = p.machine;
-                let text = |s: String| (!s.is_empty()).then_some(s);
-                let descriptive = [
-                    ("GPU Vendor", p.gpu_vendor),
-                    ("OS", text(os)),
-                    ("CPU Architecture", text(cpu_arch)),
-                    ("CPU Cores", cpu_cores.map(|c| c.to_string())),
-                ];
-                fields.extend(
-                    descriptive
-                        .into_iter()
-                        .filter_map(|(k, v)| v.map(|v| (k, v))),
-                );
-            }
-            Err(e) => fields.push(("Problem", ctx.ui.warn_mark(&format!("⚠ {e}")))),
-        }
-        fields.push(("Providers", providers_on(ctx, id).join(", ")));
+        let fields = Self::info_fields(ctx, id, unused)?;
         ctx.ui.detail(&format!("Hardware Profile '{id}'"), &fields);
         Ok(())
     }
 
-    /// `unused` is as for [`Self::info_detail`].
+    /// `unused` is as for [`Self::info_fields`].
     fn list_table(ctx: &AppContext, unused: Option<&HardwareProfile>) {
-        let config = ctx.config();
-        let mut ids: Vec<&String> = config.hardware.keys().collect();
-        ids.sort_by_key(|id| (id.as_str() != LOCAL_HARDWARE_ID, id.as_str()));
-        let rows: Vec<Vec<String>> = ids
-            .into_iter()
-            .map(|id| {
-                let hardware = &config.hardware[id];
-                let (memory, problem) = match ctx.hardware_profile(id) {
-                    Ok(p) => (p.memory_summary(), None),
-                    Err(e) => ("-".to_string(), Some(ctx.ui.warn_mark(&format!("⚠ {e}")))),
-                };
-                vec![
-                    id.clone(),
-                    hardware.hardware_type.clone(),
-                    memory,
-                    providers_on(ctx, id).join(", "),
-                    problem.unwrap_or_else(|| notes(hardware, unused)),
-                ]
-            })
-            .collect();
+        let rows = Self::configured_rows(ctx, unused);
         ctx.ui.table(
             &format!(
                 "Configured Hardware ({})",
@@ -613,10 +741,13 @@ fn setup_command(id: &str) -> String {
 
 /// See [`HardwareCommands::providers_on`].
 fn providers_on(ctx: &AppContext, id: &str) -> Vec<String> {
-    if id != LOCAL_HARDWARE_ID {
-        return Vec::new();
-    }
-    let mut ids: Vec<String> = ctx.config().providers.keys().cloned().collect();
+    let mut ids: Vec<String> = ctx
+        .config()
+        .providers
+        .values()
+        .filter(|p| p.hardware_link().profile_id() == Some(id))
+        .map(|p| p.provider_id.clone())
+        .collect();
     ids.sort();
     ids
 }
@@ -844,7 +975,7 @@ fn check_profile_id(id: &str) -> Result<()> {
     if id.is_empty() {
         bail!("a hardware profile needs an id");
     }
-    if id == LOCAL_HARDWARE_ID || id == CUSTOM_HARDWARE_TYPE {
+    if id == LOCAL_HARDWARE_ID || id == CUSTOM_HARDWARE_TYPE || id == UNSPECIFIED_HARDWARE {
         bail!("'{id}' is reserved; choose another id");
     }
     let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
@@ -1101,6 +1232,7 @@ mod tests {
             .insert_provider(
                 "ollama",
                 crate::config::ProviderConfig {
+                    hardware: Default::default(),
                     provider_id: "ollama".to_string(),
                     provider_type: "ollama".to_string(),
                     config: serde_json::json!({}),
@@ -1201,9 +1333,9 @@ mod tests {
             )
             .unwrap();
 
-        HardwareCommands::remove(&mut ctx, "spark").unwrap();
+        HardwareCommands::remove_profile(&mut ctx, "spark", None).unwrap();
         assert!(ctx.config().get_hardware("spark").is_none());
-        assert!(HardwareCommands::remove(&mut ctx, LOCAL_HARDWARE_ID).is_err());
+        assert!(HardwareCommands::remove_profile(&mut ctx, LOCAL_HARDWARE_ID, None).is_err());
     }
 
     // -- setup -------------------------------------------------------------------
@@ -2259,6 +2391,244 @@ mod tests {
                 .is_err()
         );
         assert!(ctx.config().get_hardware("dgx-spark").is_none());
+    }
+
+    // -- linking providers ----------------------------------------------------------
+
+    fn insert_provider(ctx: &mut AppContext, id: &str, provider_type: &str, link: HardwareLink) {
+        ctx.config_mut()
+            .insert_provider(
+                id,
+                crate::config::ProviderConfig {
+                    provider_id: id.to_string(),
+                    provider_type: provider_type.to_string(),
+                    config: serde_json::json!({}),
+                    hardware: Some(link),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_setup_can_create_and_link_a_hardware_profile() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let spark = HARDWARE_CATALOG
+            .iter()
+            .filter(|e| e.family == "NVIDIA Workstation")
+            .position(|e| e.id == "dgx-spark")
+            .unwrap();
+        // "create new profile…" is last: local, not specified, create. Then
+        // the family and the device in it.
+        ui.select_answers
+            .borrow_mut()
+            .extend([2, family_index("NVIDIA Workstation"), spark]);
+        ui.text_answers.borrow_mut().push_back("spark".to_string());
+
+        let link =
+            HardwareCommands::choose_link_with(&mut ctx, "llama-cpp", None, true, no_detection)
+                .unwrap();
+
+        assert_eq!(link, HardwareLink::Profile("spark".to_string()));
+        assert!(ctx.config().get_hardware("spark").is_some());
+        let (_, items, default) = &ui.select_prompts.borrow()[0];
+        assert_eq!(items[0], "local (this machine, unified 29.2 GB)");
+        assert_eq!(*default, 0);
+    }
+
+    #[test]
+    fn provider_setup_declining_to_replace_the_typed_id_is_an_error() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let lab = HardwareSetupArgs {
+            target: Some(CUSTOM_HARDWARE_TYPE.to_string()),
+            id: Some("spark".to_string()),
+            kind: Some(MemoryKind::Discrete),
+            memory: Some(24.0),
+            ..Default::default()
+        };
+        setup(&mut ctx, lab, false).unwrap();
+        let spark = HARDWARE_CATALOG
+            .iter()
+            .filter(|e| e.family == "NVIDIA Workstation")
+            .position(|e| e.id == "dgx-spark")
+            .unwrap();
+        // local, spark, not specified, create. Then the family and the
+        // device, the id of the existing profile, and no to replacing it.
+        ui.select_answers
+            .borrow_mut()
+            .extend([3, family_index("NVIDIA Workstation"), spark]);
+        ui.text_answers.borrow_mut().push_back("spark".to_string());
+        ui.confirm_answers.borrow_mut().push_back(false);
+
+        let err =
+            HardwareCommands::choose_link_with(&mut ctx, "llama-cpp", None, true, no_detection)
+                .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "no hardware profile to link; hardware setup was skipped"
+        );
+        assert_eq!(
+            ctx.hardware_profile("spark").unwrap().memory.vram_gb(),
+            Some(24.0)
+        );
+    }
+
+    #[test]
+    fn provider_setup_writes_local_first_so_the_question_shows_its_figures() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx(&ui);
+
+        let link =
+            HardwareCommands::choose_link_with(&mut ctx, "llama-cpp", None, true, mac_36).unwrap();
+
+        assert_eq!(link, HardwareLink::Local);
+        let (_, items, _) = &ui.select_prompts.borrow()[0];
+        assert_eq!(items[0], "local (this machine, unified 29.2 GB)");
+        assert_eq!(ui.stderr_infos.borrow().len(), 1);
+    }
+
+    #[test]
+    fn provider_setup_offers_not_specified_first_for_a_hosted_provider() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+
+        let link =
+            HardwareCommands::choose_link_with(&mut ctx, "openrouter", None, true, no_detection)
+                .unwrap();
+
+        assert_eq!(link, HardwareLink::Unspecified);
+        assert_eq!(
+            HardwareCommands::choose_link_with(&mut ctx, "openrouter", None, false, no_detection)
+                .unwrap(),
+            HardwareLink::Unspecified
+        );
+    }
+
+    #[test]
+    fn removing_a_linked_profile_lists_its_providers_and_can_be_cancelled() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        ctx.config_mut()
+            .insert_hardware(
+                "spark",
+                HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+            )
+            .unwrap();
+        insert_provider(
+            &mut ctx,
+            "llamacpp-spark",
+            "llama-cpp",
+            HardwareLink::Profile("spark".to_string()),
+        );
+        ui.select_answers.borrow_mut().push_back(1); // Cancel
+
+        HardwareCommands::remove_profile(&mut ctx, "spark", None).unwrap();
+
+        assert_eq!(
+            ui.warns.borrow()[0],
+            "Removing hardware profile 'spark' will break:"
+        );
+        assert_eq!(
+            ui.infos.borrow()[0],
+            "  - provider 'llamacpp-spark' (llama-cpp)"
+        );
+        assert!(ctx.config().get_hardware("spark").is_some());
+    }
+
+    #[test]
+    fn providers_on_follows_each_providers_link() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        insert_provider(&mut ctx, "ollama", "ollama", HardwareLink::Local);
+        insert_provider(
+            &mut ctx,
+            "llamacpp-spark",
+            "llama-cpp",
+            HardwareLink::Profile("spark".to_string()),
+        );
+        insert_provider(
+            &mut ctx,
+            "openrouter",
+            "openrouter",
+            HardwareLink::Unspecified,
+        );
+
+        assert_eq!(
+            HardwareCommands::providers_on(&ctx, LOCAL_HARDWARE_ID),
+            vec!["ollama"]
+        );
+        assert_eq!(
+            HardwareCommands::providers_on(&ctx, "spark"),
+            vec!["llamacpp-spark"]
+        );
+    }
+
+    #[test]
+    fn list_and_info_name_the_providers_linked_to_each_profile() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        ctx.config_mut()
+            .insert_hardware(
+                "spark",
+                HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+            )
+            .unwrap();
+        insert_provider(&mut ctx, "ollama", "ollama", HardwareLink::Local);
+        insert_provider(
+            &mut ctx,
+            "llamacpp-spark",
+            "llama-cpp",
+            HardwareLink::Profile("spark".to_string()),
+        );
+
+        HardwareCommands::list_table(&ctx, None);
+        HardwareCommands::info_detail(&ctx, "spark", None).unwrap();
+
+        let tables = ui.tables.borrow();
+        let rows = &tables[0].2;
+        assert_eq!(rows[0][3], "ollama");
+        assert_eq!(rows[1][3], "llamacpp-spark");
+        let details = ui.details.borrow();
+        let providers = details[0]
+            .1
+            .iter()
+            .find(|(k, _)| *k == "Providers")
+            .unwrap();
+        assert_eq!(providers.1, "llamacpp-spark");
+    }
+
+    #[test]
+    fn removing_a_linked_profile_together_removes_its_providers() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        ctx.config_mut()
+            .insert_hardware(
+                "spark",
+                HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+            )
+            .unwrap();
+        insert_provider(
+            &mut ctx,
+            "llamacpp-spark",
+            "llama-cpp",
+            HardwareLink::Profile("spark".to_string()),
+        );
+        ui.select_answers.borrow_mut().push_back(0); // Remove together
+
+        HardwareCommands::remove_profile(&mut ctx, "spark", None).unwrap();
+
+        assert!(ctx.config().get_hardware("spark").is_none());
+        assert!(ctx.config().get_provider("llamacpp-spark").is_none());
     }
 
     #[test]

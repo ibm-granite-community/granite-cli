@@ -103,6 +103,18 @@ fn search_match_reason(id: &str, m: &ModelMetadata, q: &str) -> Option<String> {
 
 pub(crate) struct ModelCommands;
 
+/// For a hardware profile other than `local` with no provider linked to
+/// it, the PROVIDERS column reads "none linked". For `local`, it keeps
+/// reading "none" when no provider can run the variant, as it did before
+/// providers were linked.
+fn mark_none_linked(rows: &mut [Vec<String>], hardware_id: &str, on_hardware: &[String]) {
+    if hardware_id != crate::config::hardware::LOCAL_HARDWARE_ID && on_hardware.is_empty() {
+        for row in rows {
+            *row.last_mut().unwrap() = "none linked".to_string();
+        }
+    }
+}
+
 /// Whether every provider type that runs variants of `format` is hosted.
 /// Such a variant states no size because the hosted provider does not
 /// publish one.
@@ -398,6 +410,46 @@ impl ModelCommands {
         rows
     }
 
+    /// The rows `model recommend --hardware <hardware_id>` shows without
+    /// `--providers`: the recommended models, and those whose fit is not
+    /// available. `model recommend` and the TUI Recommend section both build
+    /// their rows here, so they show the same rows for a hardware profile.
+    pub(crate) fn recommend_rows_for_hardware(
+        ctx: &crate::AppContext,
+        filter_type: Option<&ModelType>,
+        wide: bool,
+        hardware_id: &str,
+        hardware: &HardwareProfile,
+    ) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+        let source = ctx.sources().providers();
+        let instances = source.instances();
+        let on_hardware = crate::commands::HardwareCommands::providers_on(ctx, hardware_id);
+        let display: Vec<(String, std::sync::Arc<dyn Provider>)> = instances
+            .iter()
+            .filter(|(id, _)| on_hardware.contains(id))
+            .cloned()
+            .collect();
+        // The providers on this hardware choose the variant. A profile no
+        // provider is linked to yet is judged by every provider, so it
+        // still answers "would this machine do?".
+        let candidates: Vec<&dyn Provider> = if display.is_empty() {
+            instances.iter().map(|(_, p)| &**p).collect()
+        } else {
+            display.iter().map(|(_, p)| &**p).collect()
+        };
+        let mut rows = Self::recommend_rows(
+            filter_type,
+            Some(&candidates),
+            &display,
+            wide,
+            ctx.ui.as_ref(),
+            hardware,
+        );
+        mark_none_linked(&mut rows, hardware_id, &on_hardware);
+        let unavailable = Self::fit_unavailable_rows(filter_type, Some(&candidates), &rows);
+        (rows, unavailable)
+    }
+
     /// Resolves the `--providers` flag against configured providers.
     ///
     /// - `providers_arg` empty: use all configured+enabled providers.
@@ -431,6 +483,8 @@ impl ModelCommands {
         let providers: Option<Vec<&dyn Provider>> = if skip_all {
             None
         } else if providers_arg.is_empty() {
+            // Chosen by `recommend_rows_for_hardware` below; the list only
+            // tells whether any provider is configured.
             Some(instances.iter().map(|(_, p)| &**p).collect())
         } else {
             let unknown: Vec<&str> = providers_arg
@@ -463,24 +517,28 @@ impl ModelCommands {
             )
         };
 
-        let table_rows = Self::recommend_rows(
-            filter_type.as_ref(),
-            providers.as_deref(),
-            &display,
-            wide,
-            ctx.ui.as_ref(),
-            hardware,
-        );
-        // Every configured provider runs on `local`, so only another profile
-        // can have none linked.
-        let mut table_rows = table_rows;
-        if hardware_id != crate::config::hardware::LOCAL_HARDWARE_ID && on_hardware.is_empty() {
-            for row in &mut table_rows {
-                *row.last_mut().unwrap() = "none linked".to_string();
-            }
-        }
-        let unavailable =
-            Self::fit_unavailable_rows(filter_type.as_ref(), providers.as_deref(), &table_rows);
+        let (table_rows, unavailable) = if providers_arg.is_empty() {
+            Self::recommend_rows_for_hardware(
+                ctx,
+                filter_type.as_ref(),
+                wide,
+                hardware_id,
+                hardware,
+            )
+        } else {
+            let mut rows = Self::recommend_rows(
+                filter_type.as_ref(),
+                providers.as_deref(),
+                &display,
+                wide,
+                ctx.ui.as_ref(),
+                hardware,
+            );
+            mark_none_linked(&mut rows, hardware_id, &on_hardware);
+            let unavailable =
+                Self::fit_unavailable_rows(filter_type.as_ref(), providers.as_deref(), &rows);
+            (rows, unavailable)
+        };
         let show_unavailable = || {
             if !unavailable.is_empty() {
                 ctx.ui.table(
@@ -1893,6 +1951,7 @@ mod tests {
         config_obj.providers.insert(
             id.to_string(),
             crate::config::ProviderConfig {
+                hardware: Default::default(),
                 provider_id: id.to_string(),
                 provider_type: provider_type.to_string(),
                 config,
@@ -2160,6 +2219,7 @@ mod tests {
         config.providers.insert(
             "openai".to_string(),
             crate::config::ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "openai".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({ "base_url": "http://localhost:8080" }),
@@ -2357,6 +2417,7 @@ mod tests {
                 provider_id: "my-ollama".to_string(),
                 provider_type: provider_type.to_string(),
                 config: provider_config,
+                hardware: Default::default(),
             },
         );
         config.models.insert(
@@ -2790,6 +2851,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "shared".to_string(),
             crate::config::ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "shared".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({}),
@@ -2997,6 +3059,41 @@ mod tests {
         let (title, _, rows) = &tables[0];
         assert!(title.starts_with("Recommended Models for hardware 'local'"));
         assert!(rows.iter().any(|r| r[5] == "ollama"));
+    }
+
+    #[test]
+    fn variants_are_chosen_from_the_providers_on_the_hardware() {
+        let mut config = config_with_provider("llama-cpp", "llama-cpp", serde_json::json!({}));
+        config.providers.insert(
+            "far-ollama".to_string(),
+            crate::config::ProviderConfig {
+                hardware: Some(crate::config::hardware::HardwareLink::Profile(
+                    "spark".to_string(),
+                )),
+                provider_id: "far-ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        let ctx = ctx_with_config(config);
+
+        ModelCommands::recommend(
+            &ctx,
+            None,
+            &[],
+            false,
+            "local",
+            &generous_hardware_profile(),
+        )
+        .unwrap();
+
+        let tables = tables!(ctx);
+        let (_, _, rows) = &tables[0];
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|r| r[5] == "llama-cpp"),
+            "every row should be one llama-cpp on this machine can run: {rows:?}"
+        );
     }
 
     #[test]
