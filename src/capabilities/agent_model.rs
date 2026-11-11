@@ -126,7 +126,8 @@ impl crate::capabilities::ResolvedCapability for ResolvedAgentModelCapability {
             endpoint_path: endpoint.path().to_string(),
             api_key: provider.api_key().cloned(),
             verify_ssl: provider.verify_ssl(),
-            context_length: Some(configured_model.model.context_length()),
+            context_length: Some(configured_model.model.context_length())
+                .filter(|length| *length > 0),
             custom_headers: provider.custom_headers(),
             supported_reasoning_efforts: configured_model
                 .model
@@ -273,6 +274,39 @@ mod tests {
         assert_eq!(binding.endpoint_path, "/v1/chat/completions");
         assert_eq!(binding.api_type, ApiType::OpenAI);
         assert!(binding.verify_ssl);
+    }
+
+    #[tokio::test]
+    async fn bind_treats_a_zero_context_length_as_unknown() {
+        let inner = AgentModelCapability::new(
+            "my-agent",
+            &serde_json::json!({ "model_id": "granite-3.1-8b-instruct" }),
+        )
+        .unwrap();
+        let cap = ResolvedAgentModelCapability {
+            inner,
+            configured_model: crate::models::ConfiguredModel::for_test(
+                Arc::new(FakeModel::text(vec![ModelFunction::Chat]).with_context_length(0)),
+                Arc::new(ok_provider(
+                    vec![ApiType::OpenAI],
+                    ModelFunction::Chat,
+                    ApiEndpoint::OpenAIChat,
+                )),
+                None,
+            ),
+        };
+
+        let binding = cap
+            .bind(BindingRequest::AgentModel(AgentModelBindingRequest {
+                api_type: ApiType::OpenAI,
+            }))
+            .await
+            .unwrap();
+
+        let Binding::AgentModel(binding) = binding else {
+            panic!("expected AgentModel binding")
+        };
+        assert_eq!(binding.context_length, None);
     }
 
     #[tokio::test]

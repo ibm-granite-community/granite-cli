@@ -299,8 +299,10 @@ a custom profile, and a mode: `auto` or `manual`.
   json` or `markdown`. This needs no prompt, so `setup --auto` works on a
   new machine.
 - **Detection.** In both modes, granite-cli detects the hardware again on
-  the commands that use fit (`model recommend`, `setup`), on the `hardware`
-  commands other than `catalog`, and when the TUI starts. Other commands, such as `launch`, do
+  the commands that estimate fit for `local` (`model recommend`, `setup`),
+  on the `hardware` commands other than `catalog`, and when the TUI starts.
+  `model recommend --hardware` with another profile does not detect, since
+  it does not read `local`. Other commands, such as `launch`, do
   not detect: detection calls NVML, Metal or DXGI, and a launch should not
   change configuration.
 - **When detection differs.** granite-cli never overwrites the saved figures
@@ -387,9 +389,11 @@ headroom: 1.2
 ```
 
 Interactive `hardware setup`, and the setup pane in the TUI, which runs the
-same steps, ask for the factor last. The answer starts as the default for the
-memory kind, and keeping it stores nothing. A run that cannot ask saves the
-default unless `--headroom` is given.
+same steps, ask for the factor last. The answer starts as the profile's
+factor, or the default for the memory kind when it has none, and an answer
+equal to the default stores nothing. A run that cannot ask keeps the
+profile's factor unless `--headroom` is given, and a new profile gets the
+default.
 
 ```
 ? Headroom factor: 1.5
@@ -429,8 +433,10 @@ for its type.
 
 `provider setup` asks for the link. It offers the local hardware profile, the
 configured ones, "not specified", and "create new profile…", which runs the
-same steps as `hardware setup` and links the result. The two commands can
-therefore be used in either order.
+same steps as `hardware setup` and links the result. If the id typed belongs
+to an existing profile and the user declines to replace it, `provider setup`
+stops with an error and saves nothing. The two commands can therefore be used
+in either order.
 
 ```
 $ granite-cli provider setup
@@ -911,16 +917,19 @@ by family and takes `--family`. `setup` takes a catalog id, `custom` or
 `local`, and `--memory` and `--headroom` in scripts; `setup local` takes
 `--auto` or `--manual`. Interactive `setup` asks for the family and then the
 device, skips the second question for a family with one entry, and asks for
-the headroom factor last, starting from the default for the memory kind; a
-run that cannot ask takes the default. `setup` with the id of an existing
+the headroom factor last, starting from the profile's factor or the default
+for the memory kind; a run that cannot ask keeps the profile's factor, and a
+new profile gets the default. `setup` with the id of an existing
 profile other than `local` asks before replacing it and is refused when the
 run cannot ask. `hardware info` shows the headroom factor in use and whether it is the
 default, and `hardware list` names a set factor in NOTES. Updating `local` to
 the detected figures keeps its factor. `setup` refuses a profile id that is
-not a plain name.
+not a plain name. `setup` of a profile other than `local` checks `local`
+after its own questions and flags, just before saving, so a command that
+fails leaves `local` as it was.
 
-The commands that use fit and the `hardware` commands other than `catalog`
-compare detection with the saved local figures, and in manual mode with the
+The commands that estimate fit for `local` and the `hardware` commands
+other than `catalog` compare detection with the saved local figures, and in manual mode with the
 recorded detection. A `local` profile whose recorded detection cannot be read fails
 to load with an error that names `detected`. A difference prompts when the
 run is interactive and warns when it is not, naming `hardware setup local
@@ -946,8 +955,10 @@ on stderr with `--output json` together with the first-use notice; the
 recorded detection, a detection kept for the session, and the factor in
 `hardware info local` and the NOTES column; ids that are not plain names
 refused; an existing id asking before it is replaced, refused when the run
-cannot ask, and replaced without asking when forced; and the default factor
-saved by a run that cannot ask.
+cannot ask, and replaced without asking when forced; and a run that cannot
+ask keeping the profile's factor, `setup local --auto` among them, and
+saving the default for a new profile; and a `setup` of another profile that
+fails leaving `local` unwritten.
 
 **Relevant Context**
 - `src/commands/hardware.rs`, `src/main.rs` (`Commands::Hardware`)
@@ -974,14 +985,18 @@ them, such as "Fit not available (1 model)". An id with no hardware profile offe
 is interactive, from the catalog entry with that id or as a custom profile.
 Otherwise it is an error that lists the configured ids, `local` among them,
 and names the `hardware setup` command with the flags a script needs. An id
-that cannot be a profile id is refused without the offer.
+that cannot be a profile id is refused without the offer. Estimating for a
+profile other than `local` does not detect this machine. Declining to replace
+an existing profile under the id typed while creating one ends the command
+with an error, with nothing estimated.
 
 Tests cover: one model fitting a large hardware profile and not a small one;
 the default giving today's rows; a hosted variant listed with "fit not
 available"; creating a hardware profile from a catalog id with scripted
 answers; an unknown id in a non-interactive run, for a catalog entry with one
-size and with several and for a custom profile; and a reserved or malformed
-id refused.
+size and with several and for a custom profile; a reserved or malformed
+id refused; a configured profile other than `local` used without
+detecting; and a declined replacement while creating a profile.
 
 **Relevant Context**
 - `src/commands/model.rs` (`recommend`, `recommend_rows`)

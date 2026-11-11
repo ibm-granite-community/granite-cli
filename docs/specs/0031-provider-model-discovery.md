@@ -230,10 +230,18 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
 - `parameter_count` = parsed `details.parameter_size` (`8.0B` → 8e9; only if it
   parses as a single number; `26B-A4B` stays `None`).
 - `context_length` and `supported_functions`: `POST /api/show` with
-  `{"model": "<id>"}` per model. N+1 requests, local and cheap. Read
-  `capabilities` (`completion`, `tools`, `vision`, `thinking`, `embedding`) and
-  the `model_info` key ending in `.context_length` (e.g.
-  `llama.context_length`). Older builds without `capabilities` fall back to
+  `{"model": "<id>"}` per model. N+1 requests, up to 8 `/api/show` requests
+  at a time (a fixed limit in the code), so a slow server stays inside the
+  launch-time sync cap for longer lists. Read
+  `capabilities` (`completion`, `tools`, `vision`, `thinking`, `embedding`).
+  `context_length` is the `num_ctx` line of the `parameters` string (the
+  Modelfile `PARAMETER` lines) when the model sets one, since Ollama runs the
+  model with that context. Otherwise it is the `model_info` key ending in
+  `.context_length` (e.g. `llama.context_length`), the trained maximum.
+  Without `num_ctx`, Ollama may allocate less, from its default for the
+  available VRAM. It runs llama-server with `--context-shift`, so a request
+  longer than the loaded context is shifted and does not fail; this is a
+  fallback for machines with less memory. Older builds without `capabilities` fall back to
   `[Chat, ToolCalling]` for `completion` models.
 - `model_type`: `Embedding` when `capabilities` has `embedding`, otherwise
   `Text` (Ollama does not distinguish vision at the type level; the function is
@@ -296,7 +304,13 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
 
 - `id` = `id` (the router uses the alias as the request name).
 - `display_name` = `id` (no separate display name).
-- `model_type` and functions from `architecture.input_modalities`:
+- `--rerank` or `--reranking` in `status.args` does not change the
+  classification: llama-server then also serves `/v1/rerank`, and chat
+  completions stay available. `ModelFunction` has no reranking variant yet
+  (#278).
+- `status.args` containing `--embedding` or `--embeddings` →
+  `ModelType::Embedding`, functions `[Embeddings]`.
+- Otherwise `model_type` and functions from `architecture.input_modalities`:
   - `image` → `ModelType::Vision`, functions `[Chat, ToolCalling, ImageUnderstanding]`;
   - `audio` → `ModelType::Speech`, functions `[Chat, Transcription]` (observed
     on `ibm-granite/granite-4.0-1b-speech-GGUF:Q4_K_M` on the example router);
@@ -304,8 +318,13 @@ No `owned_by`/`created`: none of the three v1 APIs need them.
   The endpoint exposes no tool capability beyond modalities, so `ToolCalling`
   is the same optimistic default as the generic fallback for text/vision.
   Audio drops it: a speech model is not a tool caller.
-- `context_length`, `parameter_count`, `disk_size_bytes`: not in the router
-  list. Leave `None`/0. (`/v1/models` in a single-server build sometimes has
+- `context_length`: the `-c N`, `--ctx-size N`, `-c=N` or `--ctx-size=N`
+  value in `status.args` (the llama-server command line the router runs the
+  model with), last occurrence wins. Absent, malformed or `0` (llama-server's
+  "use the trained context") gives `None`. This is best effort: llama-server
+  options that size the context another way, such as `--fit`, are not read.
+- `parameter_count`, `disk_size_bytes`: not in the router list. Leave
+  `None`/0. (`/v1/models` in a single-server build sometimes has
   `meta.n_ctx_train`/`meta.n_params`; do not depend on it.)
 - `status.value` (`loaded`/`unloaded`/`loading`/`sleeping`/`failed`) is
   informational. In router mode with `models_autoload: true`, unloaded entries
@@ -380,8 +399,8 @@ Sync creates a `custom` model with defaults. No prompt: sync runs from
 | field | default |
 |---|---|
 | `model_type` | `"custom"` |
-| `family` | `display_name` else wire id |
-| `context_length` | reported else `0` (unknown) |
+| `family` | `display_name` else wire id, control characters removed |
+| `context_length` | reported else `0` (unknown; agent-model and sub-agent bindings pass `None` to launchers for `0`) |
 | `size` | reported parameter count else `0` |
 | `model_type` (capability) | inferred else `Text` |
 | `supported_functions` | inferred, else `[Chat, ToolCalling]` |
@@ -599,17 +618,18 @@ path benefits most from parallel listing.
   (`yes` / `-`).
 - `provider info`: `Config: discover_models` already appears via
   `config_fields`; optionally show managed model count from config.
-- `model list`: `NOTES` already exists (`dangling_notes`). Optionally add a
-  `SOURCE` column (`catalog` / `custom` / `discovered`) from
-  `ModelConfig.discovered`.
+- `model list`: `NOTES` already exists (`dangling_notes`). A `SOURCE`
+  column, between `PROVIDER` and `NOTES`, shows `discovered` when
+  `ModelConfig.discovered` is set, `custom` for other entries with
+  `model_type: custom`, and `catalog` otherwise. In terminal output,
+  `discovered` is magenta and `custom` yellow, through `Ui::tint`; other
+  formats carry the text only. `PROVIDER` is the plain provider id in every
+  output format.
 - `model info`: `Config: Discovered from`, `Config: Wire name`.
-- Discovered vs configured models use one marker, `⌕` (U+2315, magnifying
-  glass), defined once as `DISCOVERED_MARK`:
-  - `model list` table: the `PROVIDER` cell of a discovered model is
-    prefixed, e.g. `(⌕) llama-cpp-pgx`; a configured model shows just
-    `llama-cpp-pgx`.
-  - TUI Models view: the marker column shows a magenta `⌕` for discovered
-    models instead of the green `✓` used for other configured models.
+- The TUI Models view marks discovered models with `⌕` (U+2315, magnifying
+  glass), defined as `DISCOVERED_MARK`: the marker column shows a magenta `⌕`
+  for discovered models and the green `✓` for other configured models. The
+  `model list` command shows the same distinction in its `SOURCE` column.
 
 ### Read-only inspection
 
@@ -649,6 +669,18 @@ on.
 - **Wire id contains `/` or `:`** (llama.cpp `org/model:Q4_K_M`, Ollama tags).
   Both are legal in instance ids; `Config::id_to_filename` maps the separator
   and escapes Windows-invalid characters so config file names remain usable.
+- **Instance id too long for a file name.** When the escaped id plus `.yaml`
+  would be longer than 255 bytes, `Config::id_to_filename` cuts the name short
+  and ends it with `~` and a 64-bit FNV-1a hash of the id. The file holds the
+  full id, and loading accepts a file whose name is the id's shortened name.
+- **Wire id or display name contains control characters.** `model list` and
+  `model info` print ids and families as stored, so the plan skips an id with
+  any `char::is_control` character (with a warning that shows it escaped) and
+  drops control characters from the display name before storing it as
+  `family`.
+- **Save fails after a listing.** The report status is `Failed` with the save
+  error, and `added`/`removed` are empty, so the summary does not claim
+  changes that did not reach disk.
 - **Provider reports the same id twice.** First wins; warn.
 - **Ollama `/api/show` fails for one model.** Keep the `/api/tags` entry; the
   next sync retries.
@@ -675,11 +707,12 @@ No test may reach the internet or depend on locally running servers
 Provider parsers (fixture JSON, no network):
 
 - Ollama `/api/tags` + `/api/show`: name/model fallback, parameter size parse,
-  context key, capability mapping, show failure degrades.
+  `num_ctx` before the context key, capability mapping, show failure degrades.
 - LM Studio `/api/v1/models`: `key`, `type` mapping, vision/tools/reasoning,
   `max_context_length`, `params_string` parse.
 - llama.cpp `/models`: the observed router shape; image/audio modalities →
-  vision/transcription; unloaded entries included; no context.
+  vision/transcription; embedding flags in `status.args` → embedding; rerank flags ignored;
+  unloaded entries included; context from `status.args`.
 
 Pure logic (new module, no network):
 

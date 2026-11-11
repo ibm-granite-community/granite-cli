@@ -5746,6 +5746,18 @@ mod tests {
         HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 16.0 })
     }
 
+    /// A model with an OpenRouter variant. It is looked up, since catalog
+    /// updates change which models have one.
+    fn hosted_model_id() -> String {
+        MODEL_REGISTRY
+            .entries()
+            .iter()
+            .filter(|(_, m)| m.variants.iter().any(|v| v.format == "OpenRouter"))
+            .map(|(id, _)| id.to_string())
+            .min()
+            .expect("a model with an OpenRouter variant")
+    }
+
     fn set_for(model: &str, format: &str) -> recommended_config::RecommendedModelSet {
         recommended_config::RecommendedModelSet {
             min_context_length: None,
@@ -5797,7 +5809,8 @@ mod tests {
     #[test]
     fn a_hosted_variant_is_listed_and_not_selected() {
         use crate::config::hardware::HardwareLink;
-        let set = set_for("granite-4.0-h-micro", "OpenRouter");
+        let model = hosted_model_id();
+        let set = set_for(&model, "OpenRouter");
         // The default link for a hosted type. The reason names the missing
         // size, not the missing hardware profile.
         let ctx =
@@ -5807,16 +5820,17 @@ mod tests {
         assert!(resolve_model_set(&set, &test_hardware_profile(), &ids, &ctx).is_none());
         assert_eq!(
             fit_unavailable_candidates(&set, &test_hardware_profile(), &ids, &ctx),
-            vec![
-                "granite-4.0-h-micro on openrouter (OpenRouter): hosted provider doesn't specify size"
-            ]
+            vec![format!(
+                "{model} on openrouter (OpenRouter): hosted provider doesn't specify size"
+            )]
         );
     }
 
     #[test]
     fn a_size_less_variant_on_a_provider_the_user_runs_names_the_missing_size() {
         use crate::config::hardware::HardwareLink;
-        let set = set_for("granite-4.0-h-micro", "OpenRouter");
+        let model = hosted_model_id();
+        let set = set_for(&model, "OpenRouter");
         // openai-compatible can serve the variant and is not hosted, so the
         // reason is the size the variant does not state.
         let ctx = ctx_with_linked_providers(&[(
@@ -5829,7 +5843,9 @@ mod tests {
         assert!(resolve_model_set(&set, &test_hardware_profile(), &ids, &ctx).is_none());
         assert_eq!(
             fit_unavailable_candidates(&set, &test_hardware_profile(), &ids, &ctx),
-            vec!["granite-4.0-h-micro on openai-compatible (OpenRouter): no size"]
+            vec![format!(
+                "{model} on openai-compatible (OpenRouter): no size"
+            )]
         );
     }
 
@@ -5969,7 +5985,7 @@ mod tests {
         // openrouter is found by discovery but not configured yet: setup will
         // add it with its default link, "not specified".
         let ctx = test_ctx();
-        let md = MODEL_REGISTRY.get("granite-4.0-h-micro").unwrap();
+        let md = MODEL_REGISTRY.get(&hosted_model_id()).unwrap();
         let hosted = md
             .variants
             .iter()
@@ -6127,6 +6143,7 @@ mod tests {
 
     #[test]
     fn auto_setup_names_a_candidate_whose_fit_is_not_available() {
+        let model = hosted_model_id();
         use crate::config::hardware::HardwareLink;
         let mut ctx =
             ctx_with_linked_providers(&[("openrouter", "openrouter", HardwareLink::Local)]);
@@ -6138,11 +6155,7 @@ mod tests {
                 launcher: "claude".to_string(),
                 capabilities: vec![recommended_config::RecommendedCapability {
                     capability: "agent-model".to_string(),
-                    models: [(
-                        "model_id".to_string(),
-                        set_for("granite-4.0-h-micro", "OpenRouter"),
-                    )]
-                    .into(),
+                    models: [("model_id".to_string(), set_for(&model, "OpenRouter"))].into(),
                 }],
             },
         );
@@ -6155,16 +6168,18 @@ mod tests {
         assert_eq!(
             *capture.infos.borrow(),
             vec![
-                "Capability 'agent-model' not selected; fit not available for:",
-                "  granite-4.0-h-micro on openrouter (OpenRouter): hosted provider doesn't specify \
-                 size",
-                "Choose a model for these by hand with `granite-cli model setup`.",
+                "Capability 'agent-model' not selected; fit not available for:".to_string(),
+                format!(
+                    "  {model} on openrouter (OpenRouter): hosted provider doesn't specify size"
+                ),
+                "Choose a model for these by hand with `granite-cli model setup`.".to_string(),
             ]
         );
     }
 
     #[test]
     fn auto_setup_names_a_capability_once_for_every_launcher_that_recommends_it() {
+        let model = hosted_model_id();
         use crate::config::hardware::HardwareLink;
         let mut ctx =
             ctx_with_linked_providers(&[("openrouter", "openrouter", HardwareLink::Local)]);
@@ -6177,11 +6192,7 @@ mod tests {
                     launcher: launcher.to_string(),
                     capabilities: vec![recommended_config::RecommendedCapability {
                         capability: "agent-model".to_string(),
-                        models: [(
-                            "model_id".to_string(),
-                            set_for("granite-4.0-h-micro", "OpenRouter"),
-                        )]
-                        .into(),
+                        models: [("model_id".to_string(), set_for(&model, "OpenRouter"))].into(),
                     }],
                 },
             );

@@ -133,6 +133,9 @@ pub(crate) struct AgentModelBinding {
     pub(crate) endpoint_path: String,
     pub(crate) api_key: Option<Secret>,
     pub(crate) verify_ssl: bool,
+    /// Context window when the model reports one. `None` means unknown (the
+    /// model reported no length, or zero), so a launcher omits it rather than
+    /// writing a value its own config rejects.
     pub(crate) context_length: Option<u64>,
     /// Custom headers to be sent with each request to the provider.
     pub(crate) custom_headers: Option<HashMap<String, Secret>>,

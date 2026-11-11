@@ -159,11 +159,13 @@ pub(crate) fn saved_figures(detected: HardwareProfile) -> HardwareProfile {
 }
 
 impl HardwareConfig {
-    /// A `local` profile holding detected figures, in auto mode.
-    pub(crate) fn local_from_detection(detected: HardwareProfile) -> Self {
+    /// A `local` profile holding the figures detection `found`, in auto
+    /// mode. `LocalHardware::detected` is for manual mode only, so it stays
+    /// empty.
+    pub(crate) fn local_from_detection(found: HardwareProfile) -> Self {
         Self::local(LocalHardware {
             mode: LocalMode::Auto,
-            profile: saved_figures(detected),
+            profile: saved_figures(found),
             detected: None,
         })
     }

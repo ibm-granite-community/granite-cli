@@ -4,7 +4,8 @@
 # cannot prompt refuses, the profile files written and removed, and the
 # providers `hardware remove --dependents` takes with them. The
 # fixture's `local` is manual with no recorded detection, so no result here
-# depends on the machine the test runs on.
+# depends on the machine the test runs on. The one step that lets detection
+# write `local` checks only which stream each line goes to.
 # shellcheck source=tests/e2e/lib.sh
 . "$(dirname "$0")/../lib.sh"
 
@@ -98,5 +99,24 @@ expect_rc 0
 expect_no_file "$(hw_dir)/box.yaml"
 expect_no_file "$P/lab.yaml"
 expect_file "$(hw_dir)/spark.yaml"
+
+step "markdown output keeps notices and warnings on stderr"
+fresh
+gcli hardware list -o markdown
+expect_rc 0
+expect_out_contains "## Configured Hardware"
+expect_err_contains "Saved hardware profile 'local' from this machine"
+if grep -qF "Saved hardware profile" "$OUT"; then fail "the notice is on stdout"; else
+    pass "the notice is not on stdout"
+fi
+use_fixture hardware
+sed 's/mode: manual/mode: bogus/' "$E2E_FIXTURES/hardware/hardware/local.yaml" >"$(hw_dir)/local.yaml"
+gcli hardware setup custom --kind discrete --memory 8 --id gpu -o markdown
+expect_rc 0
+expect_out_contains "Hardware profile 'gpu' configured"
+expect_err_contains "Warning: Hardware profile 'local' cannot be read"
+if grep -qF "cannot be read" "$OUT"; then fail "the warning is on stdout"; else
+    pass "the warning is not on stdout"
+fi
 
 finish

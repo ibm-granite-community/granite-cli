@@ -1,5 +1,5 @@
 # Granite Models Catalog
-# Generated: 2026-10-21 17:44:03 UTC
+# Generated: 2026-11-09 20:47:29 UTC
 # Source: HuggingFace ibm-granite organization
 
 - id: granite-3.0-1b-a400m-instruct
@@ -1342,10 +1342,6 @@
       precision: Q4_1
       size_gb: 2.083
       url: "https://lmstudio.ai/models/ibm/granite-4-h-micro"
-    - format: OpenRouter
-      precision: 
-      size_gb: null
-      url: "https://openrouter.ai/ibm-granite/granite-4.0-h-micro"
   description: |
     Granite-4.0-H-Micro is a 3B parameter long-context instruct model finetuned from *Granite-4.0-H-Micro-Base* using a combination of open source instruction datasets with permissive license and internally collected synthetic datasets. This model is developed using a diverse set of techniques with a structured chat format, including supervised finetuning, model alignment using reinforcement learning, and model merging. Granite 4.0 instruct models feature improved *instruction following (IF)* and *tool-calling* capabilities, making them more effective in enterprise applications.
   tags:
@@ -3811,12 +3807,72 @@
     - Decision
     - Guardian
   variants:
+    - format: GGUF
+      precision: Q2_K
+      size_gb: 14.411
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q2_K.gguf"
+    - format: GGUF
+      precision: Q3_K_L
+      size_gb: 18.848
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q3_K_L.gguf"
+    - format: GGUF
+      precision: Q3_K_M
+      size_gb: 17.512
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q3_K_M.gguf"
+    - format: GGUF
+      precision: Q3_K_S
+      size_gb: 15.942
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q3_K_S.gguf"
+    - format: GGUF
+      precision: Q4_0
+      size_gb: 19.721
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q4_0.gguf"
+    - format: GGUF
+      precision: Q4_1
+      size_gb: 21.499
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q4_1.gguf"
+    - format: GGUF
+      precision: Q4_K_M
+      size_gb: 21.036
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q4_K_M.gguf"
+    - format: GGUF
+      precision: Q4_K_S
+      size_gb: 19.867
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q4_K_S.gguf"
+    - format: GGUF
+      precision: Q5_0
+      size_gb: 23.277
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q5_0.gguf"
+    - format: GGUF
+      precision: Q5_1
+      size_gb: 25.056
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q5_1.gguf"
+    - format: GGUF
+      precision: Q5_K_M
+      size_gb: 23.955
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q5_K_M.gguf"
+    - format: GGUF
+      precision: Q5_K_S
+      size_gb: 23.277
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q5_K_S.gguf"
+    - format: GGUF
+      precision: Q6_K
+      size_gb: 27.056
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q6_K.gguf"
+    - format: GGUF
+      precision: Q8_0
+      size_gb: 34.047
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-Q8_0.gguf"
+    - format: GGUF
+      precision: BF16
+      size_gb: 61.108
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b-GGUF/blob/main/granite-switch-4.1-30b-bf16-00001-of-00002.gguf"
     - format: safetensors
       precision: bfloat16
       size_gb: 59.981
       url: "https://huggingface.co/ibm-granite/granite-switch-4.1-30b"
   description: |
-    Granite Switch 4.1 30B is a modular LLM that composes a base model, multiple adapters and an encoder together so that a single hosted endpoint can move between natural-language responses, general and specialized decisions, and speech-to-text.
+    Granite Switch 4.1.1 30B is a modular LLM that composes a base model, multiple adapters and an encoder together so that a single hosted endpoint can move between natural-language responses, general and specialized decisions, and speech-to-text.
   tags:
     - reasoning
     - text
@@ -3844,12 +3900,72 @@
     - Decision
     - Guardian
   variants:
+    - format: GGUF
+      precision: Q2_K
+      size_gb: 4.662
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q2_K.gguf"
+    - format: GGUF
+      precision: Q3_K_L
+      size_gb: 5.927
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q3_K_L.gguf"
+    - format: GGUF
+      precision: Q3_K_M
+      size_gb: 5.475
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q3_K_M.gguf"
+    - format: GGUF
+      precision: Q3_K_S
+      size_gb: 4.954
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q3_K_S.gguf"
+    - format: GGUF
+      precision: Q4_0
+      size_gb: 6.012
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q4_0.gguf"
+    - format: GGUF
+      precision: Q4_1
+      size_gb: 6.51
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q4_1.gguf"
+    - format: GGUF
+      precision: Q4_K_M
+      size_gb: 6.412
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q4_K_M.gguf"
+    - format: GGUF
+      precision: Q4_K_S
+      size_gb: 6.058
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q4_K_S.gguf"
+    - format: GGUF
+      precision: Q5_0
+      size_gb: 7.008
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q5_0.gguf"
+    - format: GGUF
+      precision: Q5_1
+      size_gb: 7.507
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q5_1.gguf"
+    - format: GGUF
+      precision: Q5_K_M
+      size_gb: 7.215
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q5_K_M.gguf"
+    - format: GGUF
+      precision: Q5_K_S
+      size_gb: 7.008
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q5_K_S.gguf"
+    - format: GGUF
+      precision: Q6_K
+      size_gb: 8.067
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q6_K.gguf"
+    - format: GGUF
+      precision: Q8_0
+      size_gb: 10.096
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-Q8_0.gguf"
+    - format: GGUF
+      precision: BF16
+      size_gb: 17.953
+      url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b-GGUF/blob/main/granite-switch-4.1-8b-bf16.gguf"
     - format: safetensors
       precision: bfloat16
       size_gb: 17.554
       url: "https://huggingface.co/ibm-granite/granite-switch-4.1-8b"
   description: |
-    Granite Switch 4.1 8B is a modular LLM that composes a base model, multiple adapters and an encoder together so that a single hosted endpoint can move between natural-language responses, general and specialized decisions, and speech-to-text.
+    Granite Switch 4.1.1 8B is a modular LLM that composes a base model, multiple adapters and an encoder together so that a single hosted endpoint can move between natural-language responses, general and specialized decisions, and speech-to-text.
   tags:
     - general-purpose
     - text

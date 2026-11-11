@@ -148,7 +148,8 @@ macro_rules! declare_sub_agent_basic {
                         endpoint_path: endpoint.path().to_string(),
                         api_key: provider.api_key().cloned(),
                         verify_ssl: provider.verify_ssl(),
-                        context_length: Some(configured_model.model.context_length()),
+                        context_length: Some(configured_model.model.context_length())
+                            .filter(|length| *length > 0),
                         custom_headers: provider.custom_headers(),
                         supported_reasoning_efforts: configured_model.model.supported_reasoning_efforts().to_vec(),
                     },
@@ -326,7 +327,8 @@ macro_rules! declare_sub_agent_full {
                         endpoint_path: endpoint.path().to_string(),
                         api_key: provider.api_key().cloned(),
                         verify_ssl: provider.verify_ssl(),
-                        context_length: Some(configured_model.model.context_length()),
+                        context_length: Some(configured_model.model.context_length())
+                            .filter(|length| *length > 0),
                         custom_headers: provider.custom_headers(),
                         supported_reasoning_efforts: configured_model.model.supported_reasoning_efforts().to_vec(),
                     },
@@ -524,6 +526,33 @@ mod tests {
         assert_eq!(binding.model.base_url, "http://localhost:11434");
         assert_eq!(binding.model.model_name, "granite-3.1-8b-instruct");
         assert_eq!(binding.model.api_type, ApiType::Anthropic);
+    }
+
+    #[tokio::test]
+    async fn bind_treats_a_zero_context_length_as_unknown() {
+        let cap = SubAgentCapability::new(
+            "reviewer",
+            &serde_json::json!({
+                "description": "Reviews code",
+                "prompt": "You are a meticulous code reviewer.",
+                "model_id": "granite-3.1-8b-instruct",
+            }),
+        )
+        .unwrap();
+        let cap = ResolvedSubAgentCapability {
+            inner: cap,
+            configured_model: crate::models::ConfiguredModel::for_test(
+                Arc::new(FakeModel::text(vec![ModelFunction::Chat]).with_context_length(0)),
+                Arc::new(ok_provider()),
+                None,
+            ),
+        };
+
+        let binding = cap.bind(request(ApiType::Anthropic)).await.unwrap();
+        let Binding::SubAgent(binding) = binding else {
+            panic!("expected SubAgent binding")
+        };
+        assert_eq!(binding.model.context_length, None);
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::registry::{ConfigConstructable, ConstructError, NoConfig};
 use crate::utils::ui::backends::plain::PlainOutput;
-use crate::utils::ui::base::{HasUiMetadata, PullHandle, Ui, UiMetadata};
+use crate::utils::ui::base::{HasUiMetadata, PullHandle, Tint, Ui, UiMetadata};
 
 /*-- public --*/
 
@@ -233,6 +233,17 @@ impl Ui for TerminalOutput {
             return PlainOutput.detail_mark(msg);
         }
         format!("{}{}{}", SetForegroundColor(Color::Grey), msg, ResetColor)
+    }
+
+    fn tint(&self, msg: &str, tint: Tint) -> String {
+        if !self.is_tty {
+            return PlainOutput.tint(msg, tint);
+        }
+        let colour = match tint {
+            Tint::Magenta => Color::Magenta,
+            Tint::Yellow => Color::Yellow,
+        };
+        format!("{}{}{}", SetForegroundColor(colour), msg, ResetColor)
     }
 
     fn pull_start(&self, label: &str, total_bytes: Option<u64>) -> PullHandle {
@@ -725,6 +736,30 @@ fn render_rows_with_wrapping(rows: &[Vec<String>], widths: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal(is_tty: bool) -> TerminalOutput {
+        TerminalOutput {
+            is_tty,
+            terminal_width: Some(80),
+            next_pull_handle: AtomicU64::new(0),
+            active_pulls: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn tint_colours_a_label_only_on_a_terminal() {
+        let tinted = terminal(true).tint("discovered", Tint::Magenta);
+        assert_eq!(
+            tinted,
+            format!(
+                "{}discovered{}",
+                SetForegroundColor(Color::Magenta),
+                ResetColor
+            )
+        );
+        assert_eq!(visible_len(&tinted), "discovered".len());
+        assert_eq!(terminal(false).tint("custom", Tint::Yellow), "custom");
+    }
 
     #[test]
     fn wrap_text_short_no_wrapping() {

@@ -36,6 +36,10 @@ pub(crate) struct HardwareSetupArgs {
     /// Replace a profile with the same id without asking, for callers that
     /// have already asked.
     pub(crate) force_overwrite: bool,
+    /// Check `local` against detection before saving a profile other than
+    /// `local`, as the `hardware` commands do. Set by `hardware setup`;
+    /// callers that create a profile on the way leave it off.
+    pub(crate) check_local: bool,
 }
 
 impl HardwareCommands {
@@ -119,9 +123,10 @@ impl HardwareCommands {
 
     /// `hardware setup`: create or change a hardware profile from a catalog
     /// entry, from typed figures (`custom`), or set up `local`. Returns the id
-    /// of the profile saved. `model recommend` and `provider setup` reuse
-    /// these steps to create a profile on the way.
-    pub(crate) fn setup(ctx: &mut AppContext, args: HardwareSetupArgs) -> Result<String> {
+    /// of the profile saved, or `None` when the user declines to replace an
+    /// existing profile. `model recommend` and `provider setup` reuse these
+    /// steps to create a profile on the way.
+    pub(crate) fn setup(ctx: &mut AppContext, args: HardwareSetupArgs) -> Result<Option<String>> {
         let interactive = can_prompt(ctx);
         Self::setup_with(ctx, args, interactive, detect_hardware)
     }
@@ -379,12 +384,15 @@ impl HardwareCommands {
         if picked < links.len() {
             return Ok(links[picked].clone());
         }
+        // Declining to replace a profile under the id typed leaves no new
+        // profile to link.
         let id = Self::setup_with(
             ctx,
             HardwareSetupArgs::default(),
             interactive,
             detect_hardware,
-        )?;
+        )?
+        .ok_or_else(|| anyhow!("no hardware profile to link; hardware setup was skipped"))?;
         Ok(HardwareLink::Profile(id))
     }
 
@@ -436,7 +444,10 @@ impl HardwareCommands {
                     ..Default::default()
                 },
             };
-            id = Self::setup_with(ctx, args, true, || unreachable!("only `local` detects"))?;
+            // Declining to replace a profile under the id typed leaves
+            // nothing to estimate for the id asked about.
+            id = Self::setup_with(ctx, args, true, || unreachable!("only `local` detects"))?
+                .ok_or_else(|| anyhow!("no hardware profile '{id}'; hardware setup was skipped"))?;
         }
         let profile = ctx
             .hardware_profile(&id)
@@ -550,7 +561,7 @@ impl HardwareCommands {
         args: HardwareSetupArgs,
         interactive: bool,
         detect: impl FnOnce() -> HardwareProfile,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let target = match args.target.clone() {
             Some(target) => target,
             None if interactive => choose_target(ctx)?,
@@ -560,12 +571,14 @@ impl HardwareCommands {
             ),
         };
         check_flags(&target, &args)?;
+        // Taken by `setup local`, or by the check of `local` below.
+        let mut detect = Some(detect);
         let mut config = match target.as_str() {
-            LOCAL_HARDWARE_ID => setup_local(ctx, &args, interactive, detect)?,
+            LOCAL_HARDWARE_ID => setup_local(ctx, &args, interactive, detect.take().unwrap())?,
             CUSTOM_HARDWARE_TYPE => {
                 let id = profile_id(ctx, &args, None, interactive)?;
                 if !replace_existing(ctx, &id, args.force_overwrite, interactive)? {
-                    return Ok(id);
+                    return Ok(None);
                 }
                 let profile = typed_figures(ctx, &args, interactive)?;
                 HardwareConfig::custom(&id, profile)
@@ -580,7 +593,7 @@ impl HardwareCommands {
                 let memory = catalog_size(ctx, entry, args.memory, interactive)?;
                 let id = profile_id(ctx, &args, Some(catalog_id), interactive)?;
                 if !replace_existing(ctx, &id, args.force_overwrite, interactive)? {
-                    return Ok(id);
+                    return Ok(None);
                 }
                 HardwareConfig::catalog(&id, catalog_id, memory)
             }
@@ -589,6 +602,11 @@ impl HardwareCommands {
         let kind = config.profile().map_err(anyhow::Error::msg)?.memory_kind();
         let kept = ctx.config().get_hardware(&id).and_then(|h| h.headroom);
         config.headroom = headroom(ctx, args.headroom, kept, kind, interactive)?;
+        // After every question and flag has been checked, so a command that
+        // fails leaves `local` as it was.
+        if let Some(detect) = detect.take().filter(|_| args.check_local) {
+            Self::check_local_or_warn(ctx, detect, interactive);
+        }
         ctx.config_mut().insert_hardware(&id, config)?;
         let summary = ctx
             .hardware_profile(&id)
@@ -598,7 +616,7 @@ impl HardwareCommands {
             &ctx.ui
                 .ok(&format!("✓ Hardware profile '{id}' configured ({summary})")),
         );
-        Ok(id)
+        Ok(Some(id))
     }
 }
 
@@ -750,8 +768,9 @@ fn headroom_label(profile: &HardwareProfile) -> String {
 
 /// The headroom factor to save: `flag` when given; otherwise asked for when
 /// the run is interactive, starting from the factor the profile already has
-/// (`kept`) or the kind's default; otherwise the kind's default. A factor
-/// equal to the kind's default is not saved.
+/// (`kept`) or the kind's default; otherwise `kept`, so a script that
+/// updates a profile, such as `hardware setup local --auto`, leaves its
+/// factor alone. A factor equal to the kind's default is not saved.
 fn headroom(
     ctx: &AppContext,
     flag: Option<f64>,
@@ -770,7 +789,10 @@ fn headroom(
                 .parse::<f64>()
                 .map_err(|_| anyhow!("'{answer}' is not a headroom factor"))?
         }
-        (None, false) => return Ok(None),
+        (None, false) => match kept {
+            Some(factor) => factor,
+            None => return Ok(None),
+        },
     };
     if !factor.is_finite() || factor < 1.0 {
         bail!("the headroom factor must be at least 1.0, got {factor}");
@@ -1097,7 +1119,11 @@ mod tests {
             .unwrap()
     }
 
-    fn setup(ctx: &mut AppContext, args: HardwareSetupArgs, interactive: bool) -> Result<String> {
+    fn setup(
+        ctx: &mut AppContext,
+        args: HardwareSetupArgs,
+        interactive: bool,
+    ) -> Result<Option<String>> {
         HardwareCommands::setup_with(ctx, args, interactive, || panic!("detection must not run"))
     }
 
@@ -1304,7 +1330,7 @@ mod tests {
 
         let id = setup(&mut ctx, HardwareSetupArgs::default(), true).unwrap();
 
-        assert_eq!(id, "studio");
+        assert_eq!(id.as_deref(), Some("studio"));
         assert_eq!(
             ctx.config().get_hardware("studio"),
             Some(&HardwareConfig::catalog("studio", "apple-m4-max", 128.0))
@@ -1425,7 +1451,7 @@ mod tests {
             ..Default::default()
         };
 
-        let id = setup(&mut ctx, args, false).unwrap();
+        let id = setup(&mut ctx, args, false).unwrap().unwrap();
 
         assert_eq!(
             ctx.config().get_hardware(&id),
@@ -1516,7 +1542,10 @@ mod tests {
             id: Some("lab_box-2.a".to_string()),
             ..Default::default()
         };
-        assert_eq!(setup(&mut ctx(&ui), args, false).unwrap(), "lab_box-2.a");
+        assert_eq!(
+            setup(&mut ctx(&ui), args, false).unwrap().as_deref(),
+            Some("lab_box-2.a")
+        );
     }
 
     #[test]
@@ -1592,7 +1621,30 @@ mod tests {
     }
 
     #[test]
-    fn a_run_that_cannot_ask_saves_the_default_headroom_without_the_flag() {
+    fn setup_of_another_profile_checks_local_after_its_own_checks() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx(&ui);
+        let args = |kind: Option<MemoryKind>| HardwareSetupArgs {
+            target: Some(CUSTOM_HARDWARE_TYPE.to_string()),
+            id: Some("box".to_string()),
+            kind,
+            memory: Some(16.0),
+            check_local: true,
+            ..Default::default()
+        };
+
+        HardwareCommands::setup_with(&mut ctx, args(None), false, no_detection).unwrap_err();
+        assert!(ctx.config().get_hardware(LOCAL_HARDWARE_ID).is_none());
+
+        HardwareCommands::setup_with(&mut ctx, args(Some(MemoryKind::Discrete)), false, mac_36)
+            .unwrap();
+        assert!(local(&ctx).profile.same_memory(&mac_36()));
+        assert!(ctx.config().get_hardware("box").is_some());
+    }
+
+    #[test]
+    fn a_run_that_cannot_ask_keeps_the_headroom_without_the_flag() {
         let _home = TestConfigHome::new();
         let ui = Arc::new(CaptureUi::default());
         let mut ctx = ctx(&ui);
@@ -1607,8 +1659,52 @@ mod tests {
 
         setup(&mut ctx, args(None), false).unwrap();
 
-        assert_eq!(ctx.config().get_hardware("spark").unwrap().headroom, None);
+        assert_eq!(
+            ctx.config().get_hardware("spark").unwrap().headroom,
+            Some(1.2)
+        );
         assert!(ui.text_prompts.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_run_that_cannot_ask_saves_the_default_headroom_for_a_new_profile() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx(&ui);
+        let args = HardwareSetupArgs {
+            target: Some("dgx-spark".to_string()),
+            id: Some("spark".to_string()),
+            ..Default::default()
+        };
+
+        setup(&mut ctx, args, false).unwrap();
+
+        assert_eq!(ctx.config().get_hardware("spark").unwrap().headroom, None);
+    }
+
+    #[test]
+    fn setup_local_auto_in_a_script_keeps_the_headroom() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let set = HardwareSetupArgs {
+            target: Some(LOCAL_HARDWARE_ID.to_string()),
+            auto: true,
+            headroom: Some(1.2),
+            ..Default::default()
+        };
+        HardwareCommands::setup_with(&mut ctx, set, false, mac_36).unwrap();
+        let update = HardwareSetupArgs {
+            target: Some(LOCAL_HARDWARE_ID.to_string()),
+            auto: true,
+            ..Default::default()
+        };
+
+        HardwareCommands::setup_with(&mut ctx, update, false, mac_48).unwrap();
+
+        let saved = ctx.config().get_hardware(LOCAL_HARDWARE_ID).unwrap();
+        assert_eq!(saved.headroom, Some(1.2));
+        assert!(local(&ctx).profile.same_memory(&mac_48()));
     }
 
     #[test]
@@ -2105,6 +2201,25 @@ mod tests {
     }
 
     #[test]
+    fn estimating_for_another_profile_does_not_detect_this_machine() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let args = HardwareSetupArgs {
+            target: Some("dgx-spark".to_string()),
+            id: Some("spark".to_string()),
+            ..Default::default()
+        };
+        setup(&mut ctx, args, false).unwrap();
+
+        let (id, p) =
+            HardwareCommands::profile_for_fit_with(&mut ctx, "spark", true, no_detection).unwrap();
+
+        assert_eq!(id, "spark");
+        assert_eq!(p.memory_kind(), MemoryKind::Unified);
+    }
+
+    #[test]
     fn an_unknown_id_in_a_run_that_cannot_ask_lists_the_configured_ids() {
         let _home = TestConfigHome::new();
         let ui = Arc::new(CaptureUi::default());
@@ -2294,6 +2409,46 @@ mod tests {
     }
 
     #[test]
+    fn provider_setup_declining_to_replace_the_typed_id_is_an_error() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let lab = HardwareSetupArgs {
+            target: Some(CUSTOM_HARDWARE_TYPE.to_string()),
+            id: Some("spark".to_string()),
+            kind: Some(MemoryKind::Discrete),
+            memory: Some(24.0),
+            ..Default::default()
+        };
+        setup(&mut ctx, lab, false).unwrap();
+        let spark = HARDWARE_CATALOG
+            .iter()
+            .filter(|e| e.family == "NVIDIA Workstation")
+            .position(|e| e.id == "dgx-spark")
+            .unwrap();
+        // local, spark, not specified, create. Then the family and the
+        // device, the id of the existing profile, and no to replacing it.
+        ui.select_answers
+            .borrow_mut()
+            .extend([3, family_index("NVIDIA Workstation"), spark]);
+        ui.text_answers.borrow_mut().push_back("spark".to_string());
+        ui.confirm_answers.borrow_mut().push_back(false);
+
+        let err =
+            HardwareCommands::choose_link_with(&mut ctx, "llama-cpp", None, true, no_detection)
+                .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "no hardware profile to link; hardware setup was skipped"
+        );
+        assert_eq!(
+            ctx.hardware_profile("spark").unwrap().memory.vram_gb(),
+            Some(24.0)
+        );
+    }
+
+    #[test]
     fn provider_setup_writes_local_first_so_the_question_shows_its_figures() {
         let _home = TestConfigHome::new();
         let ui = Arc::new(CaptureUi::default());
@@ -2445,5 +2600,36 @@ mod tests {
 
         assert!(ctx.config().get_hardware("spark").is_none());
         assert!(ctx.config().get_provider("llamacpp-spark").is_none());
+    }
+
+    #[test]
+    fn declining_to_replace_the_typed_id_is_an_error() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, mac_36());
+        let lab = HardwareSetupArgs {
+            target: Some(CUSTOM_HARDWARE_TYPE.to_string()),
+            id: Some("spark".to_string()),
+            kind: Some(MemoryKind::Discrete),
+            memory: Some(24.0),
+            ..Default::default()
+        };
+        setup(&mut ctx, lab, false).unwrap();
+        // Create from the catalog, type the id of the existing profile, and
+        // decline to overwrite it.
+        ui.confirm_answers.borrow_mut().extend([true, false]);
+        ui.text_answers.borrow_mut().push_back("spark".to_string());
+
+        let err = HardwareCommands::profile_for_fit_with(&mut ctx, "dgx-spark", true, no_detection)
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "no hardware profile 'dgx-spark'; hardware setup was skipped"
+        );
+        assert_eq!(
+            ctx.hardware_profile("spark").unwrap().memory.vram_gb(),
+            Some(24.0)
+        );
     }
 }

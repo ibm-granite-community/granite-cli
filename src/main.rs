@@ -874,15 +874,6 @@ async fn main() {
     }
 }
 
-/// Compares this machine's hardware with the saved `local` profile, as the
-/// other `hardware` commands do, for `hardware setup` of another profile,
-/// which does not use `local`'s figures. See
-/// [`HardwareCommands::check_local_or_warn`].
-fn check_local_hardware(ctx: &mut AppContext) {
-    let can_prompt = HardwareCommands::can_prompt(ctx);
-    HardwareCommands::check_local_or_warn(ctx, utils::hardware::detect_hardware, can_prompt);
-}
-
 fn run_hardware_command(
     ctx: &mut AppContext,
     subcmd: Option<HardwareSubcommands>,
@@ -905,26 +896,21 @@ fn run_hardware_command(
             auto,
             manual,
             headroom,
-        }) => {
-            // `setup local` detects as part of its own steps.
-            if target.as_deref() != Some(config::hardware::LOCAL_HARDWARE_ID) {
-                check_local_hardware(ctx);
-            }
-            HardwareCommands::setup(
-                ctx,
-                commands::hardware::HardwareSetupArgs {
-                    target,
-                    id,
-                    memory,
-                    kind,
-                    auto,
-                    manual,
-                    headroom,
-                    force_overwrite: false,
-                },
-            )
-            .map(|_| ())
-        }
+        }) => HardwareCommands::setup(
+            ctx,
+            commands::hardware::HardwareSetupArgs {
+                target,
+                id,
+                memory,
+                kind,
+                auto,
+                manual,
+                headroom,
+                force_overwrite: false,
+                check_local: true,
+            },
+        )
+        .map(|_| ()),
         Some(HardwareSubcommands::Remove {
             hardware_id,
             dependents,

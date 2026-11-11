@@ -31,6 +31,14 @@ pub(crate) struct UiMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PullHandle(pub(crate) u64);
 
+/// A colour for a label in table output, such as the SOURCE column of
+/// `model list`. Only a backend that writes to a colour terminal applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tint {
+    Magenta,
+    Yellow,
+}
+
 // Generate UiFactory and HasUiMetadata via the existing macro.
 use crate::define_factory;
 define_factory!(Ui, UiMetadata, UiFactory);
@@ -201,6 +209,13 @@ pub(crate) trait Ui: Send + Sync + Any {
 
     /// Apply severity-based markings (e.g. gray) to `msg`.
     fn detail_mark(&self, msg: &str) -> String {
+        msg.to_string()
+    }
+
+    /// Colour `msg` with `tint`. Backends other than a colour terminal
+    /// return `msg` unchanged, so JSON, Markdown and plain output carry the
+    /// text only.
+    fn tint(&self, msg: &str, _tint: Tint) -> String {
         msg.to_string()
     }
 
