@@ -23,7 +23,8 @@ pub(crate) enum SyncStatus {
     Synced,
     /// The provider type cannot list models, or its `discover_models` is off.
     Skipped,
-    /// The provider could not be asked; nothing was written.
+    /// The provider could not be asked, or the configuration could not be
+    /// saved afterwards.
     Failed(String),
 }
 
@@ -51,8 +52,8 @@ pub(crate) struct SyncReport {
     /// Instance ids that had to be namespaced because the natural id was
     /// taken by a different model.
     pub(crate) conflicts: Vec<String>,
-    /// Warnings to show, including dependents of removed models and a failed
-    /// save.
+    /// Warnings to show, including dependents of removed models and reported
+    /// models that were skipped.
     pub(crate) warnings: Vec<String>,
 }
 
@@ -148,13 +149,19 @@ pub(crate) fn remove_discovered(ctx: &mut crate::AppContext, provider_id: &str) 
                 .push(format!("removed '{removed}', still referenced by {names}"));
         }
     }
-    if let Err(error) = ctx.config_mut().apply_model_changes(Vec::new(), &removals) {
-        report.warnings.push(format!(
-            "failed to save removal of discovered models: {error}"
-        ));
+    // A failed save is reported as the status, so the summary printed for a
+    // `Synced` report never counts removals that did not reach disk.
+    match ctx.config_mut().apply_model_changes(Vec::new(), &removals) {
+        Ok(()) => {
+            report.status = SyncStatus::Synced;
+            report.removed = removals;
+        }
+        Err(error) => {
+            report.status = SyncStatus::Failed(format!(
+                "failed to save removal of discovered models: {error}"
+            ));
+        }
     }
-    report.status = SyncStatus::Synced;
-    report.removed = removals;
     report
 }
 
@@ -318,8 +325,8 @@ async fn prepare_one(ctx: &crate::AppContext, provider_id: &str) -> PreparedSync
 
 /// Applies one prepared listing: computes its plan against the configuration
 /// as it now stands, then writes. A save failure keeps the in-memory mutation
-/// and is reported as a warning, matching the rest of the configuration
-/// writes.
+/// and turns the report into [`SyncStatus::Failed`] with empty `added` and
+/// `removed` lists.
 fn apply_prepared(ctx: &mut crate::AppContext, prepared: PreparedSync) -> SyncReport {
     let PreparedSync {
         mut report,
@@ -340,11 +347,18 @@ fn apply_prepared(ctx: &mut crate::AppContext, prepared: PreparedSync) -> SyncRe
 
     let duplicates = discovery::duplicates(&input.reported);
     if !duplicates.is_empty() {
+        // `escape_debug` keeps a control character in a reported id from
+        // reaching the terminal through this warning.
+        let duplicates: Vec<String> = duplicates
+            .iter()
+            .map(|id| id.escape_debug().to_string())
+            .collect();
         report.warnings.push(format!(
             "provider reported duplicate model ids: {}",
             duplicates.join(", ")
         ));
     }
+    report.warnings.extend(plan.skipped.iter().cloned());
     for (_, addition) in &plan.additions {
         report.added.push(addition.model_id.clone());
     }
@@ -368,13 +382,16 @@ fn apply_prepared(ctx: &mut crate::AppContext, prepared: PreparedSync) -> SyncRe
     if plan.is_empty() {
         return report;
     }
+    // A failed save is reported as the status, so `SyncReport::summary` is
+    // not printed with additions and removals that did not reach disk.
     if let Err(error) = ctx
         .config_mut()
         .apply_model_changes(plan.additions, &plan.removals)
     {
-        report
-            .warnings
-            .push(format!("failed to save discovered models: {error}"));
+        report.status = SyncStatus::Failed(format!("failed to save discovered models: {error}"));
+        report.added.clear();
+        report.removed.clear();
+        report.conflicts.clear();
     }
     report
 }
@@ -721,6 +738,65 @@ mod tests {
         let reloaded = Config::new().unwrap();
         assert!(reloaded.get_model("granite:8b").is_some());
         assert!(reloaded.get_model("llama3:8b").is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_saves_a_model_whose_id_is_too_long_for_a_plain_file_name() {
+        let _home = crate::config::TestConfigHome::new();
+        let long_id = "x".repeat(300);
+        let state = std::sync::Arc::new(TestState {
+            tags: std::sync::Mutex::new(serde_json::json!({
+                "models": [
+                    { "name": long_id, "model": long_id },
+                    { "name": "granite:8b", "model": "granite:8b" }
+                ]
+            })),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let base_url = discovery_server(state.clone()).await;
+        let mut ctx = crate::AppContext::new(
+            config_with_ollama("p", &base_url, true),
+            Arc::new(CaptureUi::default()),
+        );
+
+        let reports = sync_providers(&mut ctx, &["p".to_string()]).await;
+        assert_eq!(reports[0].status, SyncStatus::Synced);
+        assert_eq!(reports[0].added.len(), 2, "{:?}", reports[0].added);
+
+        let reloaded = Config::new().unwrap();
+        assert!(reloaded.get_model("granite:8b").is_some());
+        assert!(reloaded.get_model(&long_id).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_save_is_reported_as_failed_without_counts() {
+        let home = crate::config::TestConfigHome::new();
+        let state = std::sync::Arc::new(TestState {
+            tags: std::sync::Mutex::new(serde_json::json!({
+                "models": [{ "name": "granite:8b", "model": "granite:8b" }]
+            })),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let base_url = discovery_server(state.clone()).await;
+        let mut ctx = crate::AppContext::new(
+            config_with_ollama("p", &base_url, true),
+            Arc::new(CaptureUi::default()),
+        );
+
+        home.make_unwritable();
+        let reports = sync_providers(&mut ctx, &["p".to_string()]).await;
+        home.make_writable();
+
+        assert!(
+            matches!(&reports[0].status, SyncStatus::Failed(error) if error.contains("failed to save")),
+            "{:?}",
+            reports[0].status
+        );
+        assert!(reports[0].added.is_empty());
+        assert!(reports[0].removed.is_empty());
     }
 
     #[tokio::test]

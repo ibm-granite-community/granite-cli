@@ -254,6 +254,27 @@ struct OllamaShowResponse {
     capabilities: Vec<String>,
     #[serde(default)]
     model_info: HashMap<String, serde_json::Value>,
+    /// The model's Modelfile `PARAMETER` lines, one `<name> <value>` per line.
+    #[serde(default)]
+    parameters: String,
+}
+
+/// How many `POST /api/show` requests `list_models` keeps in flight.
+const MAX_CONCURRENT_SHOWS: usize = 8;
+
+/// The `num_ctx` value in an `/api/show` `parameters` string, when set and
+/// greater than zero. Ollama serves a model with that context size.
+fn num_ctx_from_parameters(parameters: &str) -> Option<u64> {
+    parameters.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("num_ctx") {
+            return None;
+        }
+        fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    })
 }
 
 impl ConfigConstructable for OllamaProvider {
@@ -366,30 +387,50 @@ impl Provider for OllamaProvider {
             .await
             .map_err(|e| ProviderError::Other(format!("invalid Ollama /api/tags response: {e}")))?;
 
-        let mut models = Vec::new();
-        for tag in tags.models {
-            let id = if tag.name.is_empty() {
-                tag.model
-            } else {
-                tag.name
-            };
-            if id.is_empty() {
-                continue;
-            }
+        let tagged: Vec<(String, OllamaModelTag)> = tags
+            .models
+            .into_iter()
+            .filter_map(|tag| {
+                let id = if tag.name.is_empty() {
+                    tag.model.clone()
+                } else {
+                    tag.name.clone()
+                };
+                (!id.is_empty()).then_some((id, tag))
+            })
+            .collect();
 
-            // `/api/show` is the only source for context and capabilities;
-            // a failure leaves the `/api/tags` entry usable.
-            let shown = self.show_model(&id).await;
+        // `/api/show` is the only source for context and capabilities; a
+        // failure leaves the `/api/tags` entry usable. Up to
+        // MAX_CONCURRENT_SHOWS requests run at once so a slow server does not
+        // take one round trip per model in sequence. `buffered` yields the
+        // results in the order of `tagged`.
+        let ids: Vec<String> = tagged.iter().map(|(id, _)| id.clone()).collect();
+        let shown_all: Vec<Option<OllamaShowResponse>> = futures_util::stream::iter(ids)
+            .map(|id| async move { self.show_model(&id).await })
+            .buffered(MAX_CONCURRENT_SHOWS)
+            .collect()
+            .await;
+
+        let mut models = Vec::new();
+        for ((id, tag), shown) in tagged.into_iter().zip(shown_all) {
             let capabilities = shown
                 .as_ref()
                 .map(|s| s.capabilities.as_slice())
                 .unwrap_or_default();
+            // A `num_ctx` in the Modelfile parameters is the context Ollama
+            // runs the model with, so agents are told to stay within it.
+            // Without it, the trained maximum from `model_info` is stored.
+            // Ollama may allocate less by default, and its llama-server
+            // `--context-shift` keeps longer requests from failing.
             let context_length = shown.as_ref().and_then(|s| {
-                s.model_info
-                    .iter()
-                    .filter(|(key, _)| key.ends_with(".context_length"))
-                    .filter_map(|(_, value)| value.as_u64())
-                    .max()
+                num_ctx_from_parameters(&s.parameters).or_else(|| {
+                    s.model_info
+                        .iter()
+                        .filter(|(key, _)| key.ends_with(".context_length"))
+                        .filter_map(|(_, value)| value.as_u64())
+                        .max()
+                })
             });
             let is_embedding = capabilities.iter().any(|c| c == "embedding");
             let supported_functions = if capabilities.is_empty() {
@@ -883,6 +924,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn num_ctx_from_parameters_reads_the_num_ctx_line() {
+        assert_eq!(
+            num_ctx_from_parameters("stop \"<|im_end|>\"\nnum_ctx    8192\ntemperature 0.7"),
+            Some(8192)
+        );
+        assert_eq!(num_ctx_from_parameters("temperature 0.7"), None);
+        assert_eq!(num_ctx_from_parameters(""), None);
+        assert_eq!(num_ctx_from_parameters("num_ctx 0"), None);
+        assert_eq!(num_ctx_from_parameters("num_ctx lots"), None);
+    }
+
     async fn discovery_server(show_status_failure: bool) -> String {
         use axum::{
             Json, Router,
@@ -901,6 +954,11 @@ mod tests {
                             "parameter_size": "8.0B",
                             "quantization_level": "Q4_K_M"
                         }
+                    },
+                    {
+                        "name": "granite4:8b-32k",
+                        "model": "granite4:8b-32k",
+                        "details": { "family": "granite", "parameter_size": "8.0B" }
                     },
                     {
                         "name": "nomic-embed-text:latest",
@@ -922,6 +980,14 @@ mod tests {
                 return Json(serde_json::json!({
                     "capabilities": ["embedding"],
                     "model_info": { "nomic_bert.context_length": 2048 }
+                }))
+                .into_response();
+            }
+            if model.starts_with("granite4:8b-32k") {
+                return Json(serde_json::json!({
+                    "capabilities": ["completion", "tools"],
+                    "model_info": { "granite.context_length": 131072 },
+                    "parameters": "stop                           \"<|end_of_text|>\"\nnum_ctx                        32768\ntemperature                    0"
                 }))
                 .into_response();
             }
@@ -956,10 +1022,14 @@ mod tests {
         )
         .unwrap();
         let models = provider.list_models().await.unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
 
         let chat = models.iter().find(|m| m.id == "granite4:8b").unwrap();
         assert_eq!(chat.context_length, Some(131072));
+
+        // `num_ctx` in the Modelfile parameters wins over the trained maximum.
+        let tuned = models.iter().find(|m| m.id == "granite4:8b-32k").unwrap();
+        assert_eq!(tuned.context_length, Some(32768));
         assert_eq!(chat.parameter_count, Some(8_000_000_000));
         assert_eq!(chat.disk_size_bytes, Some(4_900_000_000));
         assert!(chat.supported_functions.contains(&ModelFunction::Chat));
@@ -994,13 +1064,89 @@ mod tests {
         )
         .unwrap();
         let models = provider.list_models().await.unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         let chat = models.iter().find(|m| m.id == "granite4:8b").unwrap();
         assert_eq!(chat.context_length, None);
         assert_eq!(
             chat.supported_functions,
             vec![ModelFunction::Chat, ModelFunction::ToolCalling]
         );
+    }
+
+    #[derive(Default)]
+    struct SlowShowState {
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    #[tokio::test]
+    async fn list_models_runs_show_requests_concurrently_and_keeps_order() {
+        use axum::extract::State;
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        // `/api/tags` lists `m6` first, and `/api/show` answers `m6` last
+        // (each model sleeps 20 ms times its number). Each model's context
+        // length is 1000 times its number, so the assertion below fails if a
+        // response is paired with the wrong `/api/tags` entry.
+        const NAMES: [&str; 6] = ["m6", "m5", "m4", "m3", "m2", "m1"];
+
+        async fn tags() -> Json<serde_json::Value> {
+            let models: Vec<serde_json::Value> = NAMES
+                .iter()
+                .map(|name| serde_json::json!({ "name": name, "model": name }))
+                .collect();
+            Json(serde_json::json!({ "models": models }))
+        }
+
+        async fn show(
+            State(state): State<Arc<SlowShowState>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            state.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            let model = body["model"].as_str().unwrap_or_default().to_string();
+            let index: u64 = model.trim_start_matches('m').parse().unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(20 * index)).await;
+            state.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "capabilities": ["completion"],
+                "model_info": { "x.context_length": 1000 * index }
+            }))
+        }
+
+        let state = Arc::new(SlowShowState::default());
+        let app = Router::new()
+            .route("/api/tags", get(tags))
+            .route("/api/show", post(show))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = OllamaProvider::new(
+            "test",
+            &serde_json::json!({ "base_url": format!("http://{addr}") }),
+        )
+        .unwrap();
+        let models = provider.list_models().await.unwrap();
+
+        assert!(
+            state.max_in_flight.load(Ordering::SeqCst) > 1,
+            "/api/show requests did not overlap"
+        );
+        let got: Vec<(String, Option<u64>)> = models
+            .iter()
+            .map(|m| (m.id.clone(), m.context_length))
+            .collect();
+        // `list_models` returns models sorted by id.
+        let want: Vec<(String, Option<u64>)> =
+            (1..=6).map(|i| (format!("m{i}"), Some(1000 * i))).collect();
+        assert_eq!(got, want);
     }
 
     #[tokio::test]
