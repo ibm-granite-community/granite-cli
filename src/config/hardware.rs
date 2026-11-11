@@ -44,8 +44,8 @@ pub(crate) struct HardwareConfig {
     pub(crate) config: serde_json::Value,
 }
 
-/// Whether granite-cli detects the local hardware again on the commands that
-/// read fit.
+/// Whether `local` follows detection (`auto`) or keeps figures the user chose
+/// for this machine (`manual`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum LocalMode {
@@ -53,89 +53,24 @@ pub(crate) enum LocalMode {
     Manual,
 }
 
-/// What `local` saves in `config`: its mode and its figures.
+/// What `local` saves in `config`: its mode, its figures, and in manual mode
+/// the detected figures the saved ones were kept over.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LocalHardware {
     pub(crate) mode: LocalMode,
     #[serde(flatten)]
     pub(crate) profile: HardwareProfile,
+    /// In manual mode, what detection read when the user kept the saved
+    /// figures. The same detection is not asked about again; a different
+    /// one, such as on another machine, is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) detected: Option<HardwareProfile>,
 }
-
-impl HardwareConfig {
-    /// A `local` profile holding detected figures, in auto mode.
-    pub(crate) fn local_from_detection(detected: HardwareProfile) -> Self {
-        let local = LocalHardware {
-            mode: LocalMode::Auto,
-            profile: saved_figures(detected),
-        };
-        Self {
-            hardware_id: LOCAL_HARDWARE_ID.to_string(),
-            hardware_type: LOCAL_HARDWARE_ID.to_string(),
-            memory: None,
-            headroom: None,
-            config: serde_json::to_value(local).expect("LocalHardware serializes to JSON"),
-        }
-    }
-
-    /// A custom profile holding figures the user typed.
-    // Created by `hardware setup custom`, which a later sub-task of spec 0027
-    // adds.
-    #[allow(dead_code)]
-    pub(crate) fn custom(hardware_id: &str, profile: HardwareProfile) -> Self {
-        Self {
-            hardware_id: hardware_id.to_string(),
-            hardware_type: CUSTOM_HARDWARE_TYPE.to_string(),
-            memory: None,
-            headroom: None,
-            config: serde_json::to_value(profile).expect("HardwareProfile serializes to JSON"),
-        }
-    }
-
-    /// A profile for catalog entry `catalog_id` at `memory_gb`.
-    // Created by `hardware setup`, which a later sub-task of spec 0027 adds.
-    #[allow(dead_code)]
-    pub(crate) fn catalog(hardware_id: &str, catalog_id: &str, memory_gb: f64) -> Self {
-        Self {
-            hardware_id: hardware_id.to_string(),
-            hardware_type: catalog_id.to_string(),
-            memory: Some(memory_gb),
-            headroom: None,
-            config: serde_json::Value::Null,
-        }
-    }
-
-    /// The figures this profile stands for: read from the catalog for a
-    /// catalog profile, from `config` for custom and local ones, with the
-    /// profile's headroom factor. Fails with the reason when they cannot be
-    /// found or cannot give an estimate.
-    pub(crate) fn profile(&self) -> Result<HardwareProfile, String> {
-        let mut profile = match self.hardware_type.as_str() {
-            LOCAL_HARDWARE_ID => {
-                serde_json::from_value::<LocalHardware>(self.config.clone())
-                    .map_err(|e| format!("the saved figures cannot be read: {e}"))?
-                    .profile
-            }
-            CUSTOM_HARDWARE_TYPE => serde_json::from_value::<HardwareProfile>(self.config.clone())
-                .map_err(|e| format!("the saved figures cannot be read: {e}"))?,
-            catalog_id => catalog_profile(catalog_id, self.memory)?,
-        };
-        profile.check_figures()?;
-        if let Some(factor) = self.headroom {
-            if !factor.is_finite() || factor < 1.0 {
-                return Err(format!("headroom must be at least 1.0, got {factor}"));
-            }
-            profile.headroom = Some(factor);
-        }
-        Ok(profile)
-    }
-}
-
-/*-- private --*/
 
 /// Detected figures as `local` saves them: memory rounded to 0.01 GB.
 /// Detection reads some figures as 32-bit floats, which would otherwise be
 /// saved as values like `51.84001159667969`.
-fn saved_figures(detected: HardwareProfile) -> HardwareProfile {
+pub(crate) fn saved_figures(detected: HardwareProfile) -> HardwareProfile {
     let round = |gb: f64| (gb * 100.0).round() / 100.0;
     let memory = match detected.memory {
         Memory::Discrete { vram_gb, ram_gb } => Memory::Discrete {
@@ -152,6 +87,104 @@ fn saved_figures(detected: HardwareProfile) -> HardwareProfile {
     };
     HardwareProfile { memory, ..detected }
 }
+
+impl HardwareConfig {
+    /// A `local` profile holding the figures detection `found`, in auto
+    /// mode. `LocalHardware::detected` is for manual mode only, so it stays
+    /// empty.
+    pub(crate) fn local_from_detection(found: HardwareProfile) -> Self {
+        Self::local(LocalHardware {
+            mode: LocalMode::Auto,
+            profile: saved_figures(found),
+            detected: None,
+        })
+    }
+
+    /// A `local` profile holding `settings`.
+    pub(crate) fn local(settings: LocalHardware) -> Self {
+        Self {
+            hardware_id: LOCAL_HARDWARE_ID.to_string(),
+            hardware_type: LOCAL_HARDWARE_ID.to_string(),
+            memory: None,
+            headroom: None,
+            config: serde_json::to_value(settings).expect("LocalHardware serializes to JSON"),
+        }
+    }
+
+    /// The saved settings of a `local` profile, or `None` for any other
+    /// profile and for one that cannot be read.
+    pub(crate) fn local_settings(&self) -> Option<LocalHardware> {
+        if self.hardware_type != LOCAL_HARDWARE_ID {
+            return None;
+        }
+        self.read_local().ok()
+    }
+
+    /// The saved settings of a `local` profile, or why they cannot be read.
+    /// The recorded detection is read on its own, so an error in it names
+    /// `detected`.
+    pub(crate) fn read_local(&self) -> Result<LocalHardware, String> {
+        let mut config = self.config.clone();
+        let detected = config
+            .as_object_mut()
+            .and_then(|fields| fields.remove("detected"));
+        let mut local: LocalHardware = serde_json::from_value(config)
+            .map_err(|e| format!("the saved figures cannot be read: {e}"))?;
+        local.detected =
+            match detected {
+                None | Some(serde_json::Value::Null) => None,
+                Some(detected) => Some(serde_json::from_value(detected).map_err(|e| {
+                    format!("the recorded detection (`detected`) cannot be read: {e}")
+                })?),
+            };
+        Ok(local)
+    }
+
+    /// A custom profile holding figures the user typed.
+    pub(crate) fn custom(hardware_id: &str, profile: HardwareProfile) -> Self {
+        Self {
+            hardware_id: hardware_id.to_string(),
+            hardware_type: CUSTOM_HARDWARE_TYPE.to_string(),
+            memory: None,
+            headroom: None,
+            config: serde_json::to_value(profile).expect("HardwareProfile serializes to JSON"),
+        }
+    }
+
+    /// A profile for catalog entry `catalog_id` at `memory_gb`.
+    pub(crate) fn catalog(hardware_id: &str, catalog_id: &str, memory_gb: f64) -> Self {
+        Self {
+            hardware_id: hardware_id.to_string(),
+            hardware_type: catalog_id.to_string(),
+            memory: Some(memory_gb),
+            headroom: None,
+            config: serde_json::Value::Null,
+        }
+    }
+
+    /// The figures this profile stands for: read from the catalog for a
+    /// catalog profile, from `config` for custom and local ones, with the
+    /// profile's headroom factor. Fails with the reason when they cannot be
+    /// found or cannot give an estimate.
+    pub(crate) fn profile(&self) -> Result<HardwareProfile, String> {
+        let mut profile = match self.hardware_type.as_str() {
+            LOCAL_HARDWARE_ID => self.read_local()?.profile,
+            CUSTOM_HARDWARE_TYPE => serde_json::from_value::<HardwareProfile>(self.config.clone())
+                .map_err(|e| format!("the saved figures cannot be read: {e}"))?,
+            catalog_id => catalog_profile(catalog_id, self.memory)?,
+        };
+        profile.check_figures()?;
+        if let Some(factor) = self.headroom {
+            if !factor.is_finite() || factor < 1.0 {
+                return Err(format!("headroom must be at least 1.0, got {factor}"));
+            }
+            profile.headroom = Some(factor);
+        }
+        Ok(profile)
+    }
+}
+
+/*-- private --*/
 
 fn catalog_profile(catalog_id: &str, memory: Option<f64>) -> Result<HardwareProfile, String> {
     let entry = hardware_catalog::find(catalog_id)
@@ -317,6 +350,18 @@ mod tests {
         assert_eq!(
             serde_yaml::to_string(&config).unwrap(),
             "hardware_id: studio\ntype: apple-m4-max\nmemory: 128.0\nheadroom: 1.2\n"
+        );
+    }
+
+    #[test]
+    fn a_local_profile_with_an_unreadable_detection_names_it() {
+        let mut local = HardwareConfig::local_from_detection(discrete(24.0));
+        local.config["mode"] = serde_json::json!("manual");
+        local.config["detected"] = serde_json::json!({ "memory_kind": "discrete" });
+        let err = local.profile().unwrap_err();
+        assert!(
+            err.starts_with("the recorded detection (`detected`) cannot be read:"),
+            "{err}"
         );
     }
 

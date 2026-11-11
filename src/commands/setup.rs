@@ -17,7 +17,7 @@ use crate::dependency::{Configured, Requirement};
 use crate::launchers::LAUNCHER_REGISTRY;
 use crate::models::{ContextFit, MODEL_REGISTRY, ModelFunction, ModelMetadata, ModelVariant};
 use crate::providers::{HealthStatus, PROVIDER_REGISTRY, Provider};
-use crate::utils::hardware::{HardwareProfile, detect_hardware};
+use crate::utils::hardware::HardwareProfile;
 
 use_channel!("SETUP");
 
@@ -1206,15 +1206,16 @@ impl SetupCommands {
 
     /// Run the interactive wizard.
     async fn run_wizard(ctx: &mut crate::AppContext, pull: Option<bool>) -> Result<()> {
-        let ui = &*ctx.ui;
-        ui.info("=== granite-cli Setup Wizard ===\n");
-        ui.info("Discovering available components...\n");
+        ctx.ui.info("=== granite-cli Setup Wizard ===\n");
 
-        // Detected once and threaded through the selection phases (not just
-        // discovery) so `select_capabilities` can resolve recommended
-        // capabilities against the same hardware profile discovery used,
-        // rather than re-detecting (and potentially disagreeing).
-        let hardware = detect_hardware();
+        // Read once and threaded through the selection phases (not just
+        // discovery) so `select_capabilities` resolves recommended
+        // capabilities against the same hardware profile discovery used.
+        let can_prompt = crate::commands::HardwareCommands::can_prompt(ctx);
+        let hardware = crate::commands::HardwareCommands::local_for_fit(ctx, can_prompt)?;
+
+        let ui = &*ctx.ui;
+        ui.info("Discovering available components...\n");
         let discovery = Discover::run_with_hardware(ctx, &hardware).await;
 
         if discovery.recommendations.is_empty()
@@ -1321,7 +1322,9 @@ impl SetupCommands {
 
     /// Run auto mode — detect, configure everything with defaults.
     async fn run_auto(ctx: &mut crate::AppContext, pull: Option<bool>) -> Result<()> {
-        Self::run_auto_with_hardware(ctx, &detect_hardware(), pull).await
+        // `setup --auto` never prompts, so a hardware difference is a warning.
+        let hardware = crate::commands::HardwareCommands::local_for_fit(ctx, false)?;
+        Self::run_auto_with_hardware(ctx, &hardware, pull).await
     }
 
     /// Hardware-aware variant of `run_auto` for testability.
@@ -3842,6 +3845,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_wizard_with_empty_config_shows_info() {
+        // The wizard saves the local hardware profile.
+        let _home = crate::config::TestConfigHome::new();
         let mut ctx = test_ctx();
         let _ = SetupCommands::run(&mut ctx, false, Some(false)).await;
         // Wizard should complete without error even with no recommendations

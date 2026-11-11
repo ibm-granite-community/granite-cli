@@ -913,8 +913,6 @@ impl Config {
 
     /// Removes a hardware profile. `local` describes the machine granite-cli
     /// runs on and cannot be removed.
-    // Called by `hardware remove`, which a later sub-task of spec 0027 adds.
-    #[allow(dead_code)]
     pub(crate) fn remove_hardware(&mut self, id: &str) -> Result<()> {
         if id == hardware::LOCAL_HARDWARE_ID {
             anyhow::bail!("hardware profile '{id}' describes this machine and cannot be removed");

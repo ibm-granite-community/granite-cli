@@ -1,0 +1,6 @@
+hardware_id: local
+type: local
+config:
+  mode: manual
+  memory_kind: system
+  ram_gb: 32.0

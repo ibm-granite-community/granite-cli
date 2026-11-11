@@ -161,6 +161,21 @@ pub(crate) trait Ui: Send + Sync + Any {
     /// Warning message.
     fn warn(&self, msg: &str);
 
+    /// Warning about the run, as opposed to its result, which must not end up
+    /// in output a script reads. Backends that write their result to stdout
+    /// (JSON, markdown) send it to stderr; the others treat it as `warn`.
+    /// Those two backends do not go through `warn`, so a crate-wide way of
+    /// silencing warnings has to cover this method as well.
+    fn warn_stderr(&self, msg: &str) {
+        self.warn(msg);
+    }
+
+    /// Notice about the run, routed like [`Ui::warn_stderr`]; the backends
+    /// that do not override it treat it as `info`.
+    fn info_stderr(&self, msg: &str) {
+        self.info(msg);
+    }
+
     /// Error message. Implementations should route this to stderr.
     fn error(&self, msg: &str);
 
@@ -326,8 +341,12 @@ pub(crate) mod tests {
         pub(crate) statuses: RefCell<Vec<(String, bool, String)>>,
         pub(crate) infos: RefCell<Vec<String>>,
         pub(crate) warns: RefCell<Vec<String>>,
+        /// msg for each warn_stderr() call
+        pub(crate) stderr_warns: RefCell<Vec<String>>,
+        /// msg for each info_stderr() call
+        pub(crate) stderr_infos: RefCell<Vec<String>>,
         pub(crate) errors: RefCell<Vec<String>>,
-        oks: RefCell<Vec<String>>,
+        pub(crate) oks: RefCell<Vec<String>>,
         warn_marks: RefCell<Vec<String>>,
         error_marks: RefCell<Vec<String>>,
         detail_marks: RefCell<Vec<String>>,
@@ -415,6 +434,14 @@ pub(crate) mod tests {
 
         fn warn(&self, msg: &str) {
             self.warns.borrow_mut().push(msg.to_string());
+        }
+
+        fn warn_stderr(&self, msg: &str) {
+            self.stderr_warns.borrow_mut().push(msg.to_string());
+        }
+
+        fn info_stderr(&self, msg: &str) {
+            self.stderr_infos.borrow_mut().push(msg.to_string());
         }
 
         fn error(&self, msg: &str) {

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Which of a profile's memory figures holds the model. Discrete and unified
 /// memory are read from `vram_gb`, the memory the accelerator can address;
 /// system memory from `ram_gb`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum MemoryKind {
     /// A card with its own VRAM, such as an RTX 4090.
@@ -18,6 +18,15 @@ pub(crate) enum MemoryKind {
 }
 
 impl MemoryKind {
+    /// The name the configuration and the commands use for this kind.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            MemoryKind::Discrete => "discrete",
+            MemoryKind::Unified => "unified",
+            MemoryKind::System => "system",
+        }
+    }
+
     /// The factor the estimator divides this kind's figure by when a profile
     /// sets none.
     pub(crate) fn default_headroom(self) -> f64 {
@@ -149,6 +158,25 @@ impl HardwareProfile {
         self.memory.model_memory_gb() / self.headroom()
     }
 
+    /// The memory in a few words, such as "unified 51.8 GB": the kind and the
+    /// figure that kind names.
+    pub(crate) fn memory_summary(&self) -> String {
+        format!(
+            "{} {:.1} GB",
+            self.memory_kind().name(),
+            self.memory.model_memory_gb()
+        )
+    }
+
+    /// Whether `other` states the same memory: the same kind and the same
+    /// figure for that kind, to the 0.1 GB `memory_summary` shows. Other
+    /// figures are not compared, so a RAM change on a machine with a discrete
+    /// GPU, or a changed CPU count, is not a hardware difference.
+    pub(crate) fn same_memory(&self, other: &HardwareProfile) -> bool {
+        let tenths = |p: &HardwareProfile| (p.memory.model_memory_gb() * 10.0).round() as i64;
+        self.memory_kind() == other.memory_kind() && tenths(self) == tenths(other)
+    }
+
     /// Why this profile cannot give an estimate, if it cannot: a memory
     /// figure that is not a positive, finite number.
     pub(crate) fn check_figures(&self) -> Result<(), String> {
@@ -208,7 +236,7 @@ impl TryFrom<StoredProfile> for HardwareProfile {
             (MemoryKind::Discrete | MemoryKind::Unified, None, _) => {
                 return Err(format!(
                     "a {} hardware profile must state vram_gb",
-                    kind_name(kind)
+                    kind.name()
                 ));
             }
             (MemoryKind::System, Some(_), _) => {
@@ -224,14 +252,6 @@ impl TryFrom<StoredProfile> for HardwareProfile {
             machine: stored.machine,
             headroom: None,
         })
-    }
-}
-
-fn kind_name(kind: MemoryKind) -> &'static str {
-    match kind {
-        MemoryKind::Discrete => "discrete",
-        MemoryKind::Unified => "unified",
-        MemoryKind::System => "system",
     }
 }
 

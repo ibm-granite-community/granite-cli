@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::config::HardwareConfig;
 use crate::config::hardware::LOCAL_HARDWARE_ID;
-use crate::utils::hardware::{HardwareProfile, MemoryKind};
+use crate::utils::hardware::HardwareProfile;
 
 /*-- public --*/
 
@@ -87,9 +87,6 @@ impl AppContext {
     /// The figures of hardware profile `id`, looked up on the first ask and
     /// kept until configuration is written. Fails with the reason when `id`
     /// is not configured or its figures cannot be found.
-    // Read by the commands that estimate fit, which later sub-tasks of spec
-    // 0027 point at configured hardware profiles.
-    #[allow(dead_code)]
     pub(crate) fn hardware_profile(&self, id: &str) -> Result<HardwareProfile, String> {
         let mut held = self.hardware.lock().unwrap();
         held.entry(id.to_string())
@@ -103,9 +100,6 @@ impl AppContext {
     /// Writes the `local` hardware profile from `detect` when there is none,
     /// and says so in one line. Does nothing when `local` exists. `detect` is
     /// a parameter so tests never read the machine they run on.
-    // Called by the commands that estimate fit, which a later sub-task of
-    // spec 0027 adds.
-    #[allow(dead_code)]
     pub(crate) fn ensure_local_hardware(
         &mut self,
         detect: impl FnOnce() -> HardwareProfile,
@@ -114,10 +108,13 @@ impl AppContext {
             return Ok(());
         }
         let local = HardwareConfig::local_from_detection(detect());
-        let summary = describe(&local.profile().map_err(anyhow::Error::msg)?);
+        let summary = local
+            .profile()
+            .map_err(anyhow::Error::msg)?
+            .memory_summary();
         self.config_mut()
             .insert_hardware(LOCAL_HARDWARE_ID, local)?;
-        self.ui.info(&format!(
+        self.ui.info_stderr(&format!(
             "Saved hardware profile '{LOCAL_HARDWARE_ID}' from this machine: {summary}"
         ));
         Ok(())
@@ -127,18 +124,6 @@ impl AppContext {
         *self.sources.lock().unwrap() = None;
         self.hardware.lock().unwrap().clear();
     }
-}
-
-/*-- private --*/
-
-/// A profile's memory in a few words, such as "unified 51.8 GB".
-fn describe(profile: &HardwareProfile) -> String {
-    let kind = match profile.memory_kind() {
-        MemoryKind::Discrete => "discrete",
-        MemoryKind::Unified => "unified",
-        MemoryKind::System => "system",
-    };
-    format!("{kind} {:.1} GB", profile.memory.model_memory_gb())
 }
 
 /*-- tests --*/
@@ -179,7 +164,7 @@ mod tests {
 
         assert_eq!(ctx.hardware_profile(LOCAL_HARDWARE_ID), Ok(detected()));
         assert_eq!(
-            *ui.infos.borrow(),
+            *ui.stderr_infos.borrow(),
             vec!["Saved hardware profile 'local' from this machine: unified 51.8 GB".to_string()]
         );
         // Saved, so the next run finds it.
@@ -193,12 +178,12 @@ mod tests {
         let ui = Arc::new(CaptureUi::default());
         let mut ctx = ctx(ui.clone());
         ctx.ensure_local_hardware(detected).unwrap();
-        ui.infos.borrow_mut().clear();
+        ui.stderr_infos.borrow_mut().clear();
 
         ctx.ensure_local_hardware(|| panic!("detection must not run"))
             .unwrap();
 
-        assert!(ui.infos.borrow().is_empty());
+        assert!(ui.stderr_infos.borrow().is_empty());
         assert_eq!(ctx.hardware_profile(LOCAL_HARDWARE_ID), Ok(detected()));
     }
 
