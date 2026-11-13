@@ -1,5 +1,7 @@
 // Standard
 use std::collections::{HashMap, HashSet};
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 
 // Third Party
@@ -210,8 +212,8 @@ pub(crate) async fn run_command(
         // This must only fire under WSL -- on native Windows the working_dir
         // set above is already a proper Windows path and must not be replaced.
         #[cfg(windows)]
-        if crate::config::Config::is_wsl() {
-            if let Some(drive) = binary_fallback.parent().and_then(|p| {
+        if crate::config::Config::is_wsl()
+            && let Some(drive) = binary_fallback.parent().and_then(|p| {
                 p.to_str().and_then(|s| {
                     let chars: Vec<char> = s.chars().collect();
                     if chars.len() >= 2 && chars[1] == ':' {
@@ -220,9 +222,9 @@ pub(crate) async fn run_command(
                         None
                     }
                 })
-            }) {
-                spawn_cmd.current_dir(drive);
-            }
+            })
+        {
+            spawn_cmd.current_dir(drive);
         }
 
         let mut child = match spawn_cmd.spawn() {
@@ -233,13 +235,7 @@ pub(crate) async fn run_command(
                 if let Some(193) = e.raw_os_error() {
                     let mut shell = std::process::Command::new("cmd.exe");
                     shell.arg("/C");
-                    // Build the full command string for cmd.exe
-                    let mut cmd_str = String::new();
-                    cmd_str.push_str(&binary_fallback.to_string_lossy());
-                    for arg in &args_fallback {
-                        cmd_str.push(' ');
-                        cmd_str.push_str(arg);
-                    }
+                    let cmd_str = windows_cmd_line(&binary_fallback, &args_fallback);
                     shell.arg(&cmd_str);
                     for binding in &overlay_fallback {
                         shell.env(&binding.key, &binding.value);
@@ -253,6 +249,53 @@ pub(crate) async fn run_command(
         Ok(child.wait()?)
     })
     .await?
+}
+
+/// Build the command string used by the Windows `cmd.exe /C` fallback.
+///
+/// `Command::args` preserves each argument as a separate value, but `/C`
+/// receives one command string. Quote arguments using the Windows argv rules
+/// so JSON values such as Claude Code's `--agents` payload survive the extra
+/// shell parsing step.
+#[cfg(windows)]
+fn windows_cmd_line(binary: &Path, args: &[String]) -> String {
+    let mut values = Vec::with_capacity(args.len() + 1);
+    values.push(quote_windows_arg(&binary.to_string_lossy()));
+    values.extend(args.iter().map(|arg| quote_windows_arg(arg)));
+    values.join(" ")
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && !arg.chars().any(|ch| {
+            ch.is_whitespace() || matches!(ch, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')')
+        })
+    {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 /// Resolve a command and run it, capturing stdout/stderr into returned strings.
@@ -316,8 +359,8 @@ pub(crate) async fn run_command_captured(
             // This must only fire under WSL -- on native Windows the working_dir
             // set above is already a proper Windows path and must not be replaced.
             #[cfg(windows)]
-            if crate::config::Config::is_wsl() {
-                if let Some(drive) = binary_fallback.parent().and_then(|p| {
+            if crate::config::Config::is_wsl()
+                && let Some(drive) = binary_fallback.parent().and_then(|p| {
                     p.to_str().and_then(|s| {
                         let chars: Vec<char> = s.chars().collect();
                         if chars.len() >= 2 && chars[1] == ':' {
@@ -326,9 +369,9 @@ pub(crate) async fn run_command_captured(
                             None
                         }
                     })
-                }) {
-                    spawn_cmd.current_dir(drive);
-                }
+                })
+            {
+                spawn_cmd.current_dir(drive);
             }
 
             let output = match spawn_cmd.output() {
@@ -339,13 +382,7 @@ pub(crate) async fn run_command_captured(
                     if let Some(193) = e.raw_os_error() {
                         let mut shell = std::process::Command::new("cmd.exe");
                         shell.arg("/C");
-                        // Build the full command string for cmd.exe
-                        let mut cmd_str = String::new();
-                        cmd_str.push_str(&binary_fallback.to_string_lossy());
-                        for arg in &args_fallback {
-                            cmd_str.push(' ');
-                            cmd_str.push_str(arg);
-                        }
+                        let cmd_str = windows_cmd_line(&binary_fallback, &args_fallback);
                         shell.arg(&cmd_str);
                         for binding in &overlay_fallback {
                             shell.env(&binding.key, &binding.value);
@@ -847,6 +884,24 @@ pub(crate) mod tests {
 
         let status = run_command(binary, &[], &args, &ctx, &ui).await.unwrap();
         assert!(status.success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_fallback_quotes_json_arguments_as_single_values() {
+        let command = windows_cmd_line(
+            &PathBuf::from(r"C:\Program Files\Claude\claude.exe"),
+            &[
+                "--agents".to_string(),
+                r#"{"reviewer":{"description":"Reviews code","prompt":"Say \"hi\""}}"#.to_string(),
+                "--help".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            command,
+            r#""C:\Program Files\Claude\claude.exe" --agents "{\"reviewer\":{\"description\":\"Reviews code\",\"prompt\":\"Say \\\"hi\\\"\"}}" --help"#
+        );
     }
 
     #[cfg(unix)]
