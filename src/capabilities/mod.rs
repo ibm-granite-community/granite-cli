@@ -13,6 +13,7 @@ use_channel!("CAPBL");
 pub(crate) static CAPABILITY_REGISTRY: LazyLock<base::CapabilityFactory> = LazyLock::new(|| {
     let mut factory = base::CapabilityFactory::new();
     factory.register::<agent_model::AgentModelCapability>("agent-model");
+    factory.register::<model_provider::ModelProviderCapability>("model-provider");
     factory.register::<speech_to_text::SpeechToTextCapability>("speech-to-text");
     factory.register::<vision_mcp::VisionMCPCapability>("vision-mcp");
     factory.register::<mcp_server::McpServerCapability>("mcp-server");
@@ -144,9 +145,11 @@ pub(crate) use crate::providers::ApiType;
 pub(crate) use base::{
     AgentModelBinding, AgentModelBindingRequest, Binding, BindingRequest, BindingType, Capability,
     CapabilityInfo, CapabilityMetadata, Dependency, KnownSubAgent, McpBinding, McpBindingRequest,
-    McpTransportKind, ResolvedCapability, SubAgentBinding, SubAgentBindingRequest, ToolName,
-    VoiceInputBinding, VoiceInputBindingRequest,
+    McpTransportKind, ModelProviderBindingRequest, ModelProviderEntry, ResolvedCapability,
+    SubAgentBinding, SubAgentBindingRequest, ToolName, VoiceInputBinding, VoiceInputBindingRequest,
 };
+#[cfg(test)]
+pub(crate) use base::{ModelProviderBinding, ModelProviderModel};
 
 mod requirement;
 #[cfg(test)]
@@ -154,6 +157,8 @@ pub(crate) use requirement::ShellCommandRequirement;
 pub(crate) use requirement::{ModelRequirement, ProviderRequirement};
 
 mod agent_model;
+
+mod model_provider;
 
 mod speech_to_text;
 
@@ -347,6 +352,10 @@ mod tests {
         ) -> anyhow::Result<crate::models::ConfiguredModel> {
             self.asked.lock().unwrap().push(model_id.to_string());
             anyhow::bail!("recorded")
+        }
+
+        fn configured_ids(&self) -> Vec<String> {
+            Vec::new()
         }
     }
 

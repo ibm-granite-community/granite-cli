@@ -296,6 +296,7 @@ binding_type_blurb() {
     case "$1" in
         AgentModel)  printf '%s' "passes a model's connection details directly to the launcher" ;;
         Mcp)         printf '%s' "exposes the capability as an MCP server the launcher can call" ;;
+        ModelProvider) printf '%s' "populates the launcher's model provider config with one entry per granite-cli provider, routed through the local proxy" ;;
         SubAgent)    printf '%s' "exposes the capability as a named sub-agent the launcher can delegate to" ;;
         VoiceInput)  printf '%s' "passes a transcription model's connection details to the launcher's voice input mode" ;;
         *)           printf '%s' "" ;;

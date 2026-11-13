@@ -1,0 +1,13 @@
+model_id: discovered-unknown-context
+model_type: custom
+provider_id: ollama
+variant: null
+discovered:
+  provider_id: ollama
+  provider_model_id: discovered-unknown-context
+config:
+  family: Discovered Unknown Context
+  context_length: 0
+  supported_functions:
+  - Chat
+  - ToolCalling

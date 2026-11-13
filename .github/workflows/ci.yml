@@ -127,6 +127,12 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.9.1
 
+      # The pi launcher's local end-to-end test runs the real Pi binary
+      # against the models.json granite-cli generates, because Pi's own
+      # schema is what decides whether that file is accepted.
+      - name: Install Pi
+        run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
       # Start Ollama using Docker Compose. --wait returns once the service's
       # health check passes, and fails if it does not within the timeout.
       # Docker and Docker Compose are pre-installed on GitHub-hosted runners.

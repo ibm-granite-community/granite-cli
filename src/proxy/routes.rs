@@ -58,7 +58,9 @@ pub(crate) fn register_proxy_routes(
 /// the one declaration of an instance's outbound names that the validator's
 /// walk and the remove-time scan also read. A capability whose type is
 /// unknown, or whose required dependency holds no id, names nothing here and
-/// is reported by the check that runs before a launch reaches this.
+/// is reported by the check that runs before a launch reaches this. A
+/// capability that declares `Dependency::Models` names every configured
+/// model, so all of them get a route.
 fn model_ids_named_by(config: &crate::config::Config, capability_ids: &[String]) -> Vec<String> {
     use crate::config::validation::{RefKind, Validatable};
 
@@ -67,11 +69,75 @@ fn model_ids_named_by(config: &crate::config::Config, capability_ids: &[String])
         let Some(cc) = config.get_capability(capability_id) else {
             continue;
         };
-        for (kind, id) in cc.refs() {
-            if kind == RefKind::Model && !ids.iter().any(|seen| seen == id) {
-                ids.push(id.to_string());
+        for (kind, id) in cc.refs(config) {
+            if kind == RefKind::Model && !ids.contains(&id) {
+                ids.push(id);
             }
         }
     }
     ids
+}
+
+/*-- tests --*/
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CapabilityConfig, Config, ModelConfig, ProviderConfig};
+
+    fn config_with(capability: Option<CapabilityConfig>) -> Config {
+        let mut config = Config::default();
+        config.providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        for id in ["b-model", "a-model"] {
+            config.models.insert(
+                id.to_string(),
+                ModelConfig {
+                    discovered: None,
+                    model_id: id.to_string(),
+                    model_type: "custom".to_string(),
+                    provider_id: "ollama".to_string(),
+                    variant: None,
+                    config: serde_json::json!({
+                        "family": "Test",
+                        "supported_functions": ["Chat"],
+                    }),
+                },
+            );
+        }
+        if let Some(capability) = capability {
+            config.capabilities.insert("models".to_string(), capability);
+        }
+        config
+    }
+
+    #[test]
+    fn a_models_capability_names_every_configured_model() {
+        let config = config_with(Some(CapabilityConfig {
+            capability_id: "models".to_string(),
+            capability_type: "model-provider".to_string(),
+            config: serde_json::json!({}),
+        }));
+
+        let ids = model_ids_named_by(&config, &["models".to_string()]);
+        assert_eq!(ids, vec!["a-model".to_string(), "b-model".to_string()]);
+    }
+
+    #[test]
+    fn a_capability_with_one_model_names_only_that_one() {
+        let config = config_with(Some(CapabilityConfig {
+            capability_id: "chat".to_string(),
+            capability_type: "agent-model".to_string(),
+            config: serde_json::json!({ "model_id": "a-model" }),
+        }));
+
+        let ids = model_ids_named_by(&config, &["models".to_string()]);
+        assert_eq!(ids, vec!["a-model".to_string()]);
+    }
 }
