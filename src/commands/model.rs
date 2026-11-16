@@ -1077,6 +1077,26 @@ impl ModelCommands {
         model_id: &str,
         policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
     ) -> Result<()> {
+        Self::remove_checked(ctx, model_id, policy, true)
+    }
+
+    /// [`Self::remove`] for a model discovered by a provider that is being
+    /// removed. The model skips the discovery check: no sync can add it back
+    /// once its provider is gone.
+    pub(crate) fn remove_with_provider(
+        ctx: &mut crate::AppContext,
+        model_id: &str,
+        policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
+    ) -> Result<()> {
+        Self::remove_checked(ctx, model_id, policy, false)
+    }
+
+    fn remove_checked(
+        ctx: &mut crate::AppContext,
+        model_id: &str,
+        policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
+        check_discovery: bool,
+    ) -> Result<()> {
         if ctx.config().get_model(model_id).is_none() {
             anyhow::bail!("No model configured with id '{model_id}'. Nothing to remove.");
         }
@@ -1086,10 +1106,11 @@ impl ModelCommands {
         // by the next sync. Turning discovery off, or naming the discovered
         // policy, is the explicit escape hatch. If the provider cannot be
         // built, no sync can re-add the model, so allow the removal there too.
-        let remove_discovered = matches!(
-            policy,
-            Some(crate::commands::shared::remediation::DependentsPolicy::Discovered)
-        );
+        let remove_discovered = !check_discovery
+            || matches!(
+                policy,
+                Some(crate::commands::shared::remediation::DependentsPolicy::Discovered)
+            );
         let discovered = ctx
             .config()
             .get_model(model_id)
@@ -1102,12 +1123,14 @@ impl ModelCommands {
                 .map(|provider| provider.discover_models())
                 .unwrap_or(false);
             if discovery_on && !remove_discovered {
+                let provider = &discovered.provider_id;
                 anyhow::bail!(
-                    "Model '{model_id}' is managed by provider '{}', which has model discovery on. \
-                     Remove it at the provider instead: turn discovery off (provider setup {}), or \
-                     remove the provider. Re-running with discovery on would only discover it again.",
-                    discovered.provider_id,
-                    discovered.provider_id
+                    "Model '{model_id}' was discovered from provider '{provider}', which has \
+                     discovery on, so the next sync would add it back.\n  \
+                     To remove only this model, turn discovery off with \
+                     `granite-cli provider setup {provider}`, then remove it.\n  \
+                     To remove the provider and all its models: \
+                     `granite-cli provider remove {provider} --dependents cascade`."
                 );
             }
         }
@@ -2382,7 +2405,15 @@ mod tests {
         let mut ctx = ctx_with_discovered_model(true);
         let error = ModelCommands::remove(&mut ctx, "managed", None)
             .expect_err("a managed model must not be removable while discovery is on");
-        assert!(error.to_string().contains("managed by provider"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "Model 'managed' was discovered from provider 'my-ollama', which has discovery on, \
+             so the next sync would add it back.\n  \
+             To remove only this model, turn discovery off with \
+             `granite-cli provider setup my-ollama`, then remove it.\n  \
+             To remove the provider and all its models: \
+             `granite-cli provider remove my-ollama --dependents cascade`."
+        );
         assert!(ctx.config().get_model("managed").is_some());
     }
 

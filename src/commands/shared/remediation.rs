@@ -1148,6 +1148,24 @@ mod tests {
     }
 
     #[test]
+    fn cascade_removes_the_discovered_models_of_a_provider_with_discovery_on() {
+        let _home = crate::config::TestConfigHome::new();
+        // With discovery on, `model remove` alone refuses `managed`.
+        let mut ctx = ctx_provider_with_discovered_and_user_models();
+        ctx.config_mut().providers.get_mut("ollama").unwrap().config =
+            serde_json::json!({ "discover_models": true });
+        assert!(ModelCommands::remove(&mut ctx, "managed", None).is_err());
+        *capture(&ctx).interactive.borrow_mut() = Some(false);
+
+        ProviderCommands::remove(&mut ctx, "ollama", Some(DependentsPolicy::Cascade)).unwrap();
+
+        assert!(ctx.config().get_provider("ollama").is_none());
+        assert!(ctx.config().get_model("managed").is_none());
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_none());
+        assert!(ctx.config().get_capability("chat").is_none());
+    }
+
+    #[test]
     fn removing_with_discovered_removes_discovered_models_and_leaves_other_dependents() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_provider_with_discovered_and_user_models();

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # `model remove` with and without `--dependents refuse|leave|cascade` on a
-# model that a capability uses.
+# model that a capability uses, and `provider remove --dependents cascade` on
+# a provider with discovered models.
 # shellcheck source=tests/e2e/lib.sh
 . "$(dirname "$0")/../lib.sh"
 
@@ -51,5 +52,19 @@ gcli model remove spare -o json
 expect_rc 0
 expect_no_file "$M/spare.yaml"
 expect_file "$M/granite-4.2-3b.yaml"
+
+step "provider remove --dependents cascade: removes the models the provider discovered, with discovery on"
+use_fixture model-provider
+printf 'provider_id: ollama\ntype: ollama\nconfig:\n  base_url: http://127.0.0.1:9\n  discover_models: true\n' >"$P/ollama.yaml"
+gcli model remove discovered-unknown-context --dependents cascade -o json
+expect_rc 1
+expect_json 'messages("error") | any(contains("which has discovery on, so the next sync would add it back"))' "refuses a model the provider manages"
+expect_file "$M/discovered-unknown-context.yaml"
+gcli provider remove ollama --dependents cascade -o json
+expect_rc 0
+expect_no_file "$P/ollama.yaml"
+expect_no_file "$M/discovered-unknown-context.yaml"
+expect_no_file "$M/granite-4.2-3b.yaml"
+expect_no_file "$M/granite-4.2-8b.yaml"
 
 finish
