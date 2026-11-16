@@ -50,8 +50,9 @@ Two terms are used throughout:
   llama.cpp on a Spark.
 - **Hosted provider**: a third-party service such as OpenRouter
   (`ProviderType::Hosted`), whose hardware the user does not know. An
-  openai-compatible provider is not treated as hosted: it usually points at
-  a server the user runs, such as vLLM.
+  openai-compatible provider is generic (`ProviderType::Generic`): it speaks
+  an API that many servers offer, and usually points at a server the user
+  runs, such as vLLM. It is not treated as hosted.
 
 ## Use Cases
 

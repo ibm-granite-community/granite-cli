@@ -424,8 +424,13 @@ impl std::fmt::Display for ModelFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ProviderType {
+    /// A service that runs the models for the user, such as OpenRouter.
     Hosted,
+    /// A server the user runs, such as Ollama.
     Local,
+    /// A client for an API that many servers speak, hosted or run by the
+    /// user, such as an OpenAI-compatible endpoint.
+    Generic,
 }
 
 impl std::fmt::Display for ProviderType {
@@ -433,6 +438,7 @@ impl std::fmt::Display for ProviderType {
         match self {
             ProviderType::Hosted => write!(f, "Hosted"),
             ProviderType::Local => write!(f, "Local"),
+            ProviderType::Generic => write!(f, "Generic"),
         }
     }
 }

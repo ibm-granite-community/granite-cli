@@ -48,15 +48,13 @@ pub(crate) enum HardwareLink {
 
 impl HardwareLink {
     /// What `provider setup` offers first for a provider of `provider_type`:
-    /// `local` for a provider the user runs, "not specified" for a hosted
-    /// one. An openai-compatible provider is registered as hosted, but it
-    /// points at any server that speaks the API, often one the user runs
-    /// (vLLM, a llama.cpp server), so it is treated as one the user runs.
+    /// "not specified" for a hosted one, `local` for any other. A generic
+    /// provider, such as openai-compatible, often points at a server the
+    /// user runs (vLLM, a llama.cpp server), so it gets `local`.
     pub(crate) fn default_for(provider_type: &str) -> Self {
-        let hosted = provider_type != OPENAI_COMPATIBLE_TYPE
-            && crate::providers::PROVIDER_REGISTRY
-                .get(provider_type)
-                .is_some_and(|p| p.provider_type == crate::providers::ProviderType::Hosted);
+        let hosted = crate::providers::PROVIDER_REGISTRY
+            .get(provider_type)
+            .is_some_and(|p| p.provider_type == crate::providers::ProviderType::Hosted);
         if hosted {
             Self::Unspecified
         } else {
@@ -255,9 +253,6 @@ impl HardwareConfig {
 }
 
 /*-- private --*/
-
-/// The provider type that reaches any OpenAI-compatible server.
-const OPENAI_COMPATIBLE_TYPE: &str = "openai-compatible";
 
 fn catalog_profile(catalog_id: &str, memory: Option<f64>) -> Result<HardwareProfile, String> {
     let entry = hardware_catalog::find(catalog_id)
@@ -474,13 +469,13 @@ mod tests {
     }
 
     #[test]
-    fn a_hosted_provider_defaults_to_not_specified_and_a_local_one_to_local() {
+    fn a_hosted_provider_defaults_to_not_specified_and_any_other_to_local() {
         assert_eq!(
             HardwareLink::default_for("openrouter"),
             HardwareLink::Unspecified
         );
         assert_eq!(HardwareLink::default_for("ollama"), HardwareLink::Local);
-        // Registered as hosted, but usually a server the user runs.
+        // Generic: often a server the user runs.
         assert_eq!(
             HardwareLink::default_for("openai-compatible"),
             HardwareLink::Local
