@@ -2517,8 +2517,9 @@ impl SetupCommands {
 
     /// Saves each provider in `selected_providers` that is not configured
     /// yet, with the default config for its type, in id order. The wizard
-    /// asks which hardware each runs on (`ask_hardware`); `setup --auto`
-    /// gives each the default for its type. An id already configured, by a
+    /// asks which hardware each runs on (`ask_hardware`), and for its base
+    /// URL when the answer is not the default link for its type; `setup
+    /// --auto` gives each the default link for its type. An id already configured, by a
     /// previous session or an escape-hatch wizard earlier in this run, is
     /// left alone.
     fn configure_new_providers(
@@ -2547,11 +2548,27 @@ impl SetupCommands {
                 default_config["base_url"] = base_url.clone().into();
             }
 
+            let default_link = crate::config::hardware::HardwareLink::default_for(provider_id);
             let hardware = if ask_hardware {
                 crate::commands::HardwareCommands::choose_link(ctx, provider_id, None)?
             } else {
-                crate::config::hardware::HardwareLink::default_for(provider_id)
+                default_link.clone()
             };
+            // The address was found at, or defaults to, one on this
+            // machine. A provider linked elsewhere most likely runs at
+            // another address.
+            if hardware != default_link
+                && let Some(base_url) = default_config["base_url"].as_str()
+            {
+                let base_url = ui.text(
+                    &format!(
+                        "Base URL of '{provider_id}' (hardware: {})",
+                        String::from(hardware.clone())
+                    ),
+                    base_url,
+                )?;
+                default_config["base_url"] = base_url.into();
+            }
             let provider_config = crate::config::ProviderConfig {
                 provider_id: provider_id.clone(),
                 provider_type: provider_id.to_string(),
@@ -5739,6 +5756,78 @@ mod tests {
             );
         }
         crate::AppContext::new(config, Arc::new(CaptureUi::default()))
+    }
+
+    /// A context with `local` and `spark` configured, and a discovery that
+    /// found llama-cpp running at `http://localhost:8080`.
+    fn wizard_with_llama_cpp_found() -> (crate::AppContext, Arc<CaptureUi>, DiscoveryResult) {
+        let mut config = Config::default();
+        config.hardware.insert(
+            crate::config::hardware::LOCAL_HARDWARE_ID.to_string(),
+            crate::config::HardwareConfig::local_from_detection(small_local()),
+        );
+        config.hardware.insert(
+            "spark".to_string(),
+            crate::config::HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+        );
+        let capture = Arc::new(CaptureUi::default());
+        let ctx = crate::AppContext::new(config, capture.clone());
+        let discovery = DiscoveryResult {
+            recommendations: vec![Recommendation::Provider {
+                provider_type: "llama-cpp",
+                provider_name: "llama.cpp".to_string(),
+                health_healthy: true,
+                health_error: None,
+                discovered_base_url: Some("http://localhost:8080".to_string()),
+            }],
+            all_model_candidates: vec![],
+            configured_provider_ids: vec![],
+            configured_model_ids: vec![],
+            configured_launcher_ids: vec![],
+            configured_capability_ids: vec![],
+        };
+        (ctx, capture, discovery)
+    }
+
+    #[test]
+    fn the_wizard_asks_for_the_address_of_a_provider_linked_to_other_hardware() {
+        use crate::config::hardware::HardwareLink;
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, capture, discovery) = wizard_with_llama_cpp_found();
+        capture.select_answers.borrow_mut().push_back(1); // spark
+        capture
+            .text_answers
+            .borrow_mut()
+            .push_back("http://spark:8080".to_string());
+        let selected: HashSet<String> = ["llama-cpp".to_string()].into();
+
+        SetupCommands::configure_new_providers(&mut ctx, &discovery, &selected, true).unwrap();
+
+        let provider = ctx.config().get_provider("llama-cpp").unwrap();
+        assert_eq!(
+            provider.hardware,
+            Some(HardwareLink::Profile("spark".to_string()))
+        );
+        assert_eq!(provider.config["base_url"], "http://spark:8080");
+        let prompts = capture.text_prompts.borrow();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].1, "http://localhost:8080");
+    }
+
+    #[test]
+    fn the_wizard_keeps_the_found_address_of_a_provider_on_its_default_link() {
+        use crate::config::hardware::HardwareLink;
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, capture, discovery) = wizard_with_llama_cpp_found();
+        capture.select_answers.borrow_mut().push_back(0); // local
+        let selected: HashSet<String> = ["llama-cpp".to_string()].into();
+
+        SetupCommands::configure_new_providers(&mut ctx, &discovery, &selected, true).unwrap();
+
+        let provider = ctx.config().get_provider("llama-cpp").unwrap();
+        assert_eq!(provider.hardware, Some(HardwareLink::Local));
+        assert_eq!(provider.config["base_url"], "http://localhost:8080");
+        assert!(capture.text_prompts.borrow().is_empty());
     }
 
     /// A machine too small for granite-4.2-30b.

@@ -475,8 +475,16 @@ removing it.
 
 The setup wizard asks which hardware each provider it adds runs on as soon as
 the providers are chosen, before it ranks models for them, and offers "create
-new profile…" there. Today the wizard only finds providers at their default
-local addresses, so this matters once the wizard can add a provider by hand.
+new profile…" there. The wizard finds providers at their local addresses, so
+when the answer is not the default link for the provider's type, it also asks
+for the provider's base URL, defaulting to the address it found.
+
+```
+$ granite-cli setup
+...
+? Hardware this provider runs on: spark
+? Base URL of 'llama-cpp' (hardware: spark): http://spark:8080
+```
 
 ### How setup and recommend estimate fit
 
@@ -1064,7 +1072,8 @@ available are not selected automatically; when a recommended capability does
 not resolve, `setup --auto` names it once, with them grouped by model and
 provider, and a note. `setup --auto` and the wizard share this logic. The
 wizard asks which hardware each provider it adds runs on before it ranks
-models, offering "create new profile…". Before it ranks models it offers to
+models, offering "create new profile…", and asks for the base URL when the
+answer is not the default link for the type. Before it ranks models it offers to
 repair each configured provider's broken link, and its variant list names
 the hardware profile when it is not `local`. A model that fits as well on several providers is bound
 to one on `local`.
@@ -1075,7 +1084,8 @@ a size and a provider without a hardware profile each named and not selected;
 the variant a model is bound to coming from the provider it fits best on, and
 from the provider on `local` on a tie; a capability recommended by two
 launchers named once; the wizard's repair of a broken link; the wizard
-ranking models for the hardware chosen for a new provider; and the
+asking for the base URL of a provider linked to other hardware, and keeping
+the address it found for a provider on the default link; and the
 existing setup tests passing with every provider on `local`.
 
 **Relevant Context**
