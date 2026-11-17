@@ -174,6 +174,12 @@ impl base::ModelLookup for ModelSource {
             self.provider_model_id(model_id),
         ))
     }
+
+    fn configured_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.configs.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
 }
 
 /// A model that resolves and does not meet what the capability asking for it

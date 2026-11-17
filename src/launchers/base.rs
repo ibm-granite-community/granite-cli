@@ -520,6 +520,41 @@ pub(crate) struct EnvBinding {
     pub(crate) value: String,
 }
 
+/// The URL a launcher writes where the session proxy would listen, for a
+/// generated config it can only show under `--dry-run` (no proxy is running
+/// then). The port is deliberately not a real one: a config written with it
+/// would not accidentally talk to something else.
+pub(crate) const DRY_RUN_PROXY_URL: &str = "http://127.0.0.1:<session-proxy>";
+
+/// The base URL a provider entry should carry so its traffic reaches the
+/// session proxy, which forwards it to the model's real provider.
+///
+/// `endpoint_path` is the dialect's chat operation (e.g.
+/// `/v1/chat/completions`). The operation is dropped and the version prefix
+/// kept, because a client appends only the operation to its base URL. Under
+/// `--dry-run` the proxy is not running, so the placeholder in
+/// [`DRY_RUN_PROXY_URL`] is used and the printed config stays informative.
+pub(crate) fn proxied_base_url(ctx: &LaunchContext, endpoint_path: &str) -> String {
+    let root = ctx
+        .model_proxy
+        .as_ref()
+        .map(|handle| handle.local_base_url.clone())
+        .unwrap_or_else(|| DRY_RUN_PROXY_URL.to_string());
+    base_url_for_endpoint(&root, endpoint_path)
+}
+
+/// Appends `endpoint_path`'s API version prefix (e.g. `/v1`) to `root`, with
+/// the operation itself dropped.
+pub(crate) fn base_url_for_endpoint(root: &str, endpoint_path: &str) -> String {
+    let root = root.trim_end_matches('/');
+    let prefix = endpoint_path
+        .strip_suffix("/chat/completions")
+        .or_else(|| endpoint_path.strip_suffix("/messages"))
+        .or_else(|| endpoint_path.strip_suffix("/api/chat"))
+        .unwrap_or("");
+    format!("{root}{prefix}")
+}
+
 /*-- resolve, then bind -------------------------------------------------------*/
 
 /// Why a launcher of this type cannot carry `capability`'s MCP server, or

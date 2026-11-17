@@ -215,7 +215,7 @@ impl CapabilityCommands {
                 Dependency::Model { config_key, .. } | Dependency::Provider { config_key, .. } => {
                     Some(config_key.as_str())
                 }
-                Dependency::ExternalTool { .. } => None,
+                Dependency::ExternalTool { .. } | Dependency::Models => None,
             })
             .collect();
         if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") {
@@ -278,6 +278,9 @@ impl CapabilityCommands {
                         );
                     }
                 }
+                // The capability exposes the whole model collection; there
+                // is no single slot to pick here.
+                Dependency::Models => {}
             }
         }
 
