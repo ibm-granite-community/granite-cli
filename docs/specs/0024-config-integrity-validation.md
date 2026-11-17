@@ -570,21 +570,43 @@ the other two both delete something. It reports what was kept and succeeds
 rather than failing: the user made a deliberate choice, and a script never
 reaches it, since a session with nobody to ask does not prompt.
 
+The prompt lists everything that removing them together would take: the
+direct dependents and, at every further level, what depends on those. It is
+the one question for the whole chain. The reference graph runs launcher to
+capability to model to provider, so the chain is at most that deep.
+
 ```
-⚠ Removing model 'granite-3.1-8b-instruct' will break:
-  - capability 'chat' (agent-model)
+⚠ Other instances depend on model 'granite-3.1-8b-instruct':
+  - capability 'chat'
+  - launcher 'claude'
 
 ? What would you like to do?
-  [1] Remove model 'granite-3.1-8b-instruct' and capability 'chat' together
+  [1] Remove model 'granite-3.1-8b-instruct' and the 2 instances listed above
 > [2] Cancel, keep model 'granite-3.1-8b-instruct'
   [3] Remove only model 'granite-3.1-8b-instruct', fix the rest later
 ```
 
-Removing the dependents goes through their own removal commands, so anything
-depending on *them* gets the same question in turn. Removing a model the user
-agrees to take a capability with will ask again about the launcher enabling
-that capability. The reference graph runs launcher to capability to model to
-provider, so the questions are bounded by its depth.
+The whole chain is worked out before anything is printed or removed, and an
+instance reached on two paths is listed once. Everything in the plan is then
+removed without asking again, dependents before what they depend on, and each
+removal prints its own line (`Launcher 'claude' removed.`).
+
+When a removal leaves instances in place that point at something removed, by
+the third answer or by `--dependents leave` or `--dependents discovered`, one
+section lists each of them with the removed instance that breaks it, and the
+setup command for each kind left broken:
+
+```
+⚠ These stay, and will not work until fixed:
+  - capability 'chat' (agent-model): its model 'granite-3.1-8b-instruct' is removed
+  Fix it with `granite-cli capability setup <type> --id <id>`.
+Model 'granite-3.1-8b-instruct' removed.
+```
+
+A listed instance shows its type when the type differs from its id, since
+setup takes the type. `--dependents cascade` prints the plan as
+`Removing model 'granite-3.1-8b-instruct' and what depends on it:` followed by
+the same list the prompt shows, and has no section of instances left broken.
 
 Tests cover: a model with one dependent capability producing the right final
 configuration for each of the three outcomes, including the non-interactive

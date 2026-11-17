@@ -661,6 +661,24 @@ dependents of those) in place. It is also the explicit escape hatch for
 removing a discovered model directly while its provider still has discovery
 on.
 
+The removal prints one plan for the whole chain: the discovered models it
+removes, then each instance it leaves in place with the removed instance that
+breaks it, and the setup command for each kind left broken:
+
+```
+Removing provider 'ollama' and the models discovered from it:
+  - model 'llama3:8b'
+⚠ These stay, and will not work until fixed:
+  - model 'granite-4.2-8b': its provider 'ollama' is removed
+  - capability 'chat' (agent-model): its model 'llama3:8b' is removed
+  Fix them with `granite-cli model setup <type> --id <id>` and `granite-cli capability setup <type> --id <id>`.
+Model 'llama3:8b' removed.
+Provider 'ollama' removed.
+```
+
+A capability that pointed at a removed discovered model is listed there and
+left in place, and so is anything depending on it.
+
 ## Edge cases
 
 - **User model with the same id as a reported model.** Covered by the wire-name

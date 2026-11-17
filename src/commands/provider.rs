@@ -427,48 +427,14 @@ impl ProviderCommands {
             anyhow::bail!("No provider configured with id '{provider_id}'. Nothing to remove.");
         }
 
-        // Anything pointing at it would be stranded by this removal.
-        match crate::commands::shared::remediation::confirm_removal(
+        // The models this provider discovered go with it, also while its
+        // discovery is on: no sync can add them back once it is gone.
+        crate::commands::shared::remediation::remove_with_dependents(
             ctx,
             RefKind::Provider,
             provider_id,
             policy,
-        )? {
-            crate::commands::shared::remediation::Removal::Cancel => {
-                ctx.ui.info(&format!("Keeping provider '{provider_id}'."));
-                return Ok(());
-            }
-            crate::commands::shared::remediation::Removal::Proceed { with } => {
-                // The models this provider discovered go with it, also while
-                // its discovery is on.
-                for (kind, id) in with {
-                    let discovered_here = kind == RefKind::Model
-                        && ctx
-                            .config()
-                            .get_model(&id)
-                            .and_then(|model| model.discovered.as_ref())
-                            .is_some_and(|d| d.provider_id == provider_id);
-                    if discovered_here {
-                        crate::commands::model::ModelCommands::remove_with_provider(
-                            ctx, &id, policy,
-                        )?;
-                    } else {
-                        crate::commands::shared::remediation::remove_all(
-                            ctx,
-                            &[(kind, id)],
-                            policy,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        if let Err(e) = ctx.config_mut().remove_provider(provider_id) {
-            ctx.ui
-                .warn(&format!("failed to persist provider removal: {e}"));
-        }
-        ctx.ui.info(&format!("Provider '{provider_id}' removed."));
-        Ok(())
+        )
     }
 
     async fn check_provider_health(

@@ -3,9 +3,9 @@
 //!
 //! [`remediate`] offers a fix for one broken reference at a time, until what
 //! the caller named validates or the user stops accepting fixes.
-//! [`confirm_removal`] runs before a removal and reports what points at the
-//! instance about to be deleted, so the user can take those with it, cancel,
-//! or leave them.
+//! [`remove_with_dependents`] works out what a removal takes with it and what
+//! it leaves broken, over the whole chain of dependents, prints that once,
+//! and then removes it.
 //!
 //! Reconfigure and remove run the instance's own setup and removal commands,
 //! the ones a user would run by hand. Un-enabling is the one repair applied
@@ -111,48 +111,48 @@ pub(crate) enum DependentsPolicy {
     Leave,
 }
 
-/// What a removal should do about the instances pointing at what is being
-/// removed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Removal {
-    /// Go ahead, taking these instances with it. Empty when nothing pointed
-    /// at the target, or when the user chose to strand what did.
-    Proceed { with: Vec<(RefKind, String)> },
-    /// Leave everything alone.
-    Cancel,
-}
-
-/// Asks what to do about the instances that point at `(kind, id)` before a
-/// removal strands them.
+/// Removes `(kind, id)` and applies `policy` to the instances that depend on
+/// it, directly or through each other.
+///
+/// The whole chain is worked out before anything is printed or removed:
+/// which instances go with the target, and which stay and break because
+/// something they point at is removed. The plan is printed once, and then
+/// everything in it is removed, dependents before what they depend on, each
+/// with its own "removed" line.
 ///
 /// `policy` is `Some(DependentsPolicy::...)` when a `--dependents` flag was
 /// given, or `None` to fall back to the session's default:
 ///
-/// - `Some(Refuse)`: fails immediately with a non-zero exit if anything
-///   depends on the target. Nothing is removed or printed beyond the error.
-/// - `Some(Cascade)`: removes the target and all dependents automatically,
-///   reporting what will be removed before doing so.
-/// - `Some(Discovered)`: removes the target and any dependents that provider
-///   discovery created, reporting what will be removed and what will be left
-///   broken. It never removes a catalog or hand-made model.
-/// - `Some(Leave)`: removes only the target; warns about what was left
-///   broken. Same as the old non-interactive fallback.
-/// - `None`, interactive session: prompts the user with three choices.
+/// - `Some(Refuse)`: fails if anything depends on the target. Nothing is
+///   removed or printed beyond the error.
+/// - `Some(Cascade)`: removes the target and every instance that depends on
+///   it, at every level.
+/// - `Some(Discovered)`: removes the target and the models provider discovery
+///   created among its dependents, and leaves every other dependent in place.
+///   It never removes a catalog or hand-made model.
+/// - `Some(Leave)`: removes only the target and leaves its dependents in
+///   place.
+/// - `None`, interactive session: lists everything that depends on the
+///   target and asks one question for the whole chain: remove it all,
+///   cancel, or remove only the target.
 /// - `None`, non-interactive session (`--output json` / `--output markdown`,
-///   or no terminal to ask on): fails with a non-zero exit, like `Refuse`,
-///   with an error that names the four policies.
-pub(crate) fn confirm_removal(
-    ctx: &crate::AppContext,
+///   or no terminal to ask on): fails like `Refuse`, with an error that names
+///   the policies.
+///
+/// A model in the chain that was discovered by a provider with discovery on
+/// is refused, as `model remove` refuses it, unless that provider is removed
+/// in the same chain or the policy is `Discovered`. The caller checks the
+/// target itself.
+pub(crate) fn remove_with_dependents(
+    ctx: &mut crate::AppContext,
     kind: RefKind,
     id: &str,
     policy: Option<DependentsPolicy>,
-) -> Result<Removal> {
-    let stranded = dependents(kind, id, ctx.config());
-    if stranded.is_empty() {
-        return Ok(Removal::Proceed { with: stranded });
-    }
+) -> Result<()> {
+    let has_dependents = !dependents(kind, id, ctx.config()).is_empty();
 
-    match policy {
+    let plan = match policy {
+        _ if !has_dependents => plan_removal(ctx, kind, id, Take::Nothing),
         Some(DependentsPolicy::Refuse) | None if !ctx.ui.is_interactive() => {
             anyhow::bail!(
                 "Cannot remove {kind} '{id}' because other configured instances depend on it. \
@@ -166,140 +166,32 @@ pub(crate) fn confirm_removal(
             );
         }
         Some(DependentsPolicy::Cascade) => {
-            ctx.ui
-                .warn(&format!("Removing {kind} '{id}' and its dependents:"));
-            for (dependent_kind, dependent_id) in &stranded {
-                let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
-                    .map(|t| format!(" ({t})"))
-                    .unwrap_or_default();
-                ctx.ui.info(&format!(
-                    "  - {dependent_kind} '{dependent_id}'{type_suffix}"
-                ));
-            }
-            return Ok(Removal::Proceed { with: stranded });
+            let plan = plan_removal(ctx, kind, id, Take::All);
+            check_discovery(ctx, &plan)?;
+            report(ctx, &plan);
+            plan
         }
         Some(DependentsPolicy::Discovered) => {
-            let (discovered, left): (Vec<_>, Vec<_>) =
-                stranded.iter().cloned().partition(|(kind, dependent_id)| {
-                    *kind == RefKind::Model
-                        && ctx
-                            .config()
-                            .get_model(dependent_id)
-                            .is_some_and(|model| model.discovered.is_some())
-                });
-
-            if discovered.is_empty() {
-                ctx.ui.warn(&format!("Removing {kind} '{id}' will break:"));
-                for (dependent_kind, dependent_id) in &left {
-                    let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
-                        .map(|t| format!(" ({t})"))
-                        .unwrap_or_default();
-                    ctx.ui.info(&format!(
-                        "  - {dependent_kind} '{dependent_id}'{type_suffix}"
-                    ));
-                }
-                ctx.ui.warn(&format!(
-                    "Removing only {kind} '{id}'. What depended on it needs fixing."
-                ));
-                return Ok(Removal::Proceed { with: Vec::new() });
-            }
-
-            ctx.ui.warn(&format!(
-                "Removing {kind} '{id}' and its discovered models:"
-            ));
-            for (dependent_kind, dependent_id) in &discovered {
-                let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
-                    .map(|t| format!(" ({t})"))
-                    .unwrap_or_default();
-                ctx.ui.info(&format!(
-                    "  - {dependent_kind} '{dependent_id}'{type_suffix}"
-                ));
-            }
-            if !left.is_empty() {
-                ctx.ui.warn("Leaving other dependents in place:");
-                for (dependent_kind, dependent_id) in &left {
-                    let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
-                        .map(|t| format!(" ({t})"))
-                        .unwrap_or_default();
-                    ctx.ui.info(&format!(
-                        "  - {dependent_kind} '{dependent_id}'{type_suffix}"
-                    ));
-                }
-                ctx.ui.warn(&format!(
-                    "What was left after removing {kind} '{id}' needs fixing."
-                ));
-            }
-            return Ok(Removal::Proceed { with: discovered });
+            let plan = plan_removal(ctx, kind, id, Take::Discovered);
+            report(ctx, &plan);
+            plan
         }
         Some(DependentsPolicy::Leave) => {
-            ctx.ui.warn(&format!("Removing {kind} '{id}' will break:"));
-            for (dependent_kind, dependent_id) in &stranded {
-                let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
-                    .map(|t| format!(" ({t})"))
-                    .unwrap_or_default();
-                ctx.ui.info(&format!(
-                    "  - {dependent_kind} '{dependent_id}'{type_suffix}"
-                ));
+            let plan = plan_removal(ctx, kind, id, Take::Nothing);
+            report(ctx, &plan);
+            plan
+        }
+        None => match ask(ctx, kind, id)? {
+            Some(plan) => plan,
+            None => {
+                ctx.ui.info(&format!("Keeping {kind} '{id}'."));
+                return Ok(());
             }
-            ctx.ui.warn(&format!(
-                "Removing only {kind} '{id}'. What depended on it needs fixing."
-            ));
-            return Ok(Removal::Proceed { with: Vec::new() });
-        }
-        None => {
-            ctx.ui.warn(&format!("Removing {kind} '{id}' will break:"));
-            for (dependent_kind, dependent_id) in &stranded {
-                let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
-                    .map(|t| format!(" ({t})"))
-                    .unwrap_or_default();
-                ctx.ui.info(&format!(
-                    "  - {dependent_kind} '{dependent_id}'{type_suffix}"
-                ));
-            }
-        }
-    }
-
-    // Only reachable when policy is None and the session is interactive.
-
-    let together = match stranded.as_slice() {
-        [(dependent_kind, dependent_id)] => {
-            format!("Remove {kind} '{id}' and {dependent_kind} '{dependent_id}' together")
-        }
-        _ => format!(
-            "Remove {kind} '{id}' and the {} instances that depend on it",
-            stranded.len()
-        ),
+        },
     };
-    let items = vec![
-        together,
-        format!("Cancel, keep {kind} '{id}'"),
-        format!("Remove only {kind} '{id}', fix the rest later"),
-    ];
 
-    // Cancelling is the default: this is the destructive prompt, and the
-    // other two answers both delete something.
-    match ctx.ui.select("What would you like to do?", &items, 1)? {
-        0 => Ok(Removal::Proceed { with: stranded }),
-        2 => Ok(Removal::Proceed { with: Vec::new() }),
-        _ => Ok(Removal::Cancel),
-    }
-}
-
-/// Removes each instance through its own removal command, so anything
-/// depending on *them* gets the same question in turn.
-///
-/// `policy` is threaded down so that second-level dependents are also
-/// removed automatically when the original call used `--dependents cascade`.
-/// Under `--dependents discovered`, each removal applies the same filter, so
-/// a non-discovered capability or launcher reached through a removed
-/// discovered model is left in place rather than cascaded.
-pub(crate) fn remove_all(
-    ctx: &mut crate::AppContext,
-    ids: &[(RefKind, String)],
-    policy: Option<DependentsPolicy>,
-) -> Result<()> {
-    for (kind, id) in ids {
-        remove(ctx, *kind, id, policy)?;
+    for (kind, id) in plan.with.iter().chain(std::iter::once(&plan.target)) {
+        delete(ctx, *kind, id);
     }
     Ok(())
 }
@@ -770,6 +662,314 @@ fn disable(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
     Ok(())
 }
 
+/// Which dependents of a removed instance are removed with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Take {
+    /// Every dependent, at every level (`cascade`).
+    All,
+    /// Only the models provider discovery created (`discovered`).
+    Discovered,
+    /// None of them (`leave`, or no dependents at all).
+    Nothing,
+}
+
+impl Take {
+    fn takes(self, kind: RefKind, id: &str, config: &Config) -> bool {
+        match self {
+            Take::All => true,
+            Take::Nothing => false,
+            Take::Discovered => {
+                kind == RefKind::Model
+                    && config
+                        .get_model(id)
+                        .is_some_and(|model| model.discovered.is_some())
+            }
+        }
+    }
+}
+
+/// What a removal takes with it and what it leaves broken, worked out over
+/// the whole chain before anything is removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemovalPlan {
+    target: (RefKind, String),
+    take: Take,
+    /// Removed with the target, each listed once, in the order they are
+    /// removed: an instance comes before anything it depends on.
+    with: Vec<(RefKind, String)>,
+    /// Left in place although something they point at is removed, each listed
+    /// once, sorted by kind and id.
+    left: Vec<Stranded>,
+}
+
+/// An instance a removal leaves in place, and the removed instances it points
+/// at, which are why it stops working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stranded {
+    kind: RefKind,
+    id: String,
+    removed: Vec<(RefKind, String)>,
+}
+
+impl RemovalPlan {
+    /// What is removed with the target, sorted by kind and id for display.
+    fn shown(&self) -> Vec<&(RefKind, String)> {
+        let mut shown: Vec<_> = self.with.iter().collect();
+        shown.sort_by(|a, b| rank(a.0).cmp(&rank(b.0)).then(a.1.cmp(&b.1)));
+        shown
+    }
+}
+
+/// Works out the whole removal of `(kind, id)`: follows dependents level by
+/// level, removes those `take` takes, and records those it leaves together
+/// with the removed instances they point at. An instance reached on two paths
+/// is listed once.
+fn plan_removal(ctx: &crate::AppContext, kind: RefKind, id: &str, take: Take) -> RemovalPlan {
+    fn visit(
+        node: &(RefKind, String),
+        take: Take,
+        config: &Config,
+        seen: &mut Vec<(RefKind, String)>,
+        order: &mut Vec<(RefKind, String)>,
+        left: &mut Vec<Stranded>,
+    ) {
+        for dependent in dependents(node.0, &node.1, config) {
+            if take.takes(dependent.0, &dependent.1, config) {
+                if !seen.contains(&dependent) {
+                    seen.push(dependent.clone());
+                    visit(&dependent, take, config, seen, order, left);
+                }
+            } else if let Some(stranded) = left
+                .iter_mut()
+                .find(|s| s.kind == dependent.0 && s.id == dependent.1)
+            {
+                stranded.removed.push(node.clone());
+            } else {
+                left.push(Stranded {
+                    kind: dependent.0,
+                    id: dependent.1,
+                    removed: vec![node.clone()],
+                });
+            }
+        }
+        // After its dependents, so it is removed after them.
+        order.push(node.clone());
+    }
+
+    let config = ctx.config();
+    let target = (kind, id.to_string());
+    let mut seen = vec![target.clone()];
+    let mut order = Vec::new();
+    let mut left = Vec::new();
+    visit(&target, take, config, &mut seen, &mut order, &mut left);
+
+    order.retain(|node| node != &target);
+    left.retain(|s| !seen.iter().any(|(k, i)| *k == s.kind && *i == s.id));
+    for stranded in &mut left {
+        stranded
+            .removed
+            .sort_by(|a, b| rank(a.0).cmp(&rank(b.0)).then(a.1.cmp(&b.1)));
+        stranded.removed.dedup();
+    }
+    left.sort_by(|a, b| rank(a.kind).cmp(&rank(b.kind)).then(a.id.cmp(&b.id)));
+
+    RemovalPlan {
+        target,
+        take,
+        with: order,
+        left,
+    }
+}
+
+/// Refuses a plan that removes a model a provider with discovery on would add
+/// back, the same check `model remove` makes on its target. A model goes
+/// without the check when its provider is removed in the same plan, or when
+/// the plan follows the `discovered` policy, which names such models
+/// explicitly.
+fn check_discovery(ctx: &crate::AppContext, plan: &RemovalPlan) -> Result<()> {
+    if plan.take == Take::Discovered {
+        return Ok(());
+    }
+    let removed_providers: Vec<&str> = plan
+        .with
+        .iter()
+        .chain(std::iter::once(&plan.target))
+        .filter(|(kind, _)| *kind == RefKind::Provider)
+        .map(|(_, id)| id.as_str())
+        .collect();
+    for (_, model_id) in plan.with.iter().filter(|(k, _)| *k == RefKind::Model) {
+        let discovered_by = ctx
+            .config()
+            .get_model(model_id)
+            .and_then(|model| model.discovered.as_ref())
+            .map(|discovered| discovered.provider_id.as_str());
+        if discovered_by.is_some_and(|provider| !removed_providers.contains(&provider)) {
+            ModelCommands::refuse_while_discovery_on(ctx, model_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Prints the plan: what is removed with the target, then what stays and
+/// will not work, with the commands that fix it. Prints nothing when the
+/// target goes alone and breaks nothing.
+fn report(ctx: &crate::AppContext, plan: &RemovalPlan) {
+    let (kind, id) = &plan.target;
+    if !plan.with.is_empty() {
+        ctx.ui.info(&match plan.take {
+            Take::Discovered => {
+                format!("Removing {kind} '{id}' and the models discovered from it:")
+            }
+            _ => format!("Removing {kind} '{id}' and what depends on it:"),
+        });
+        for (kind, id) in plan.shown() {
+            ctx.ui.info(&format!("  - {kind} '{id}'"));
+        }
+    }
+    report_left(ctx, plan);
+}
+
+/// The part of the plan that breaks something: each instance left in place,
+/// why it stops working, and one setup command per kind to fix it. The type is
+/// shown when it differs from the id, since setup takes the type.
+fn report_left(ctx: &crate::AppContext, plan: &RemovalPlan) {
+    if plan.left.is_empty() {
+        return;
+    }
+    ctx.ui.warn("These stay, and will not work until fixed:");
+    for stranded in &plan.left {
+        let type_suffix = type_name(stranded.kind, &stranded.id, ctx.config())
+            .filter(|type_name| *type_name != stranded.id)
+            .map(|type_name| format!(" ({type_name})"))
+            .unwrap_or_default();
+        ctx.ui.info(&format!(
+            "  - {} '{}'{type_suffix}: {}",
+            stranded.kind,
+            stranded.id,
+            reason(&stranded.removed)
+        ));
+    }
+
+    let mut kinds: Vec<RefKind> = plan.left.iter().map(|s| s.kind).collect();
+    kinds.dedup();
+    let commands: Vec<String> = kinds
+        .iter()
+        .map(|kind| format!("`granite-cli {kind} setup <type> --id <id>`"))
+        .collect();
+    ctx.ui.info(&format!(
+        "  Fix {} with {}.",
+        if plan.left.len() == 1 { "it" } else { "them" },
+        join_and(&commands)
+    ));
+}
+
+/// Why an instance left in place stops working: the removed instances it
+/// points at, grouped by kind, such as "its provider 'ollama' is removed".
+fn reason(removed: &[(RefKind, String)]) -> String {
+    let mut parts = Vec::new();
+    let mut rest = removed;
+    while let Some((kind, _)) = rest.first() {
+        let count = rest.iter().take_while(|(k, _)| k == kind).count();
+        let (group, tail) = rest.split_at(count);
+        let ids: Vec<String> = group.iter().map(|(_, id)| format!("'{id}'")).collect();
+        parts.push(match ids.as_slice() {
+            [one] => format!("its {kind} {one} is removed"),
+            _ => format!("its {} {} are removed", plural(*kind), join_and(&ids)),
+        });
+        rest = tail;
+    }
+    parts.join("; ")
+}
+
+/// Asks one question for the whole chain, after listing everything that
+/// depends on the target. Returns the plan for the answer, or `None` when
+/// the user cancels.
+fn ask(ctx: &crate::AppContext, kind: RefKind, id: &str) -> Result<Option<RemovalPlan>> {
+    let all = plan_removal(ctx, kind, id, Take::All);
+    ctx.ui
+        .warn(&format!("Other instances depend on {kind} '{id}':"));
+    for (dependent_kind, dependent_id) in all.shown() {
+        ctx.ui
+            .info(&format!("  - {dependent_kind} '{dependent_id}'"));
+    }
+
+    let together = match all.with.as_slice() {
+        [(dependent_kind, dependent_id)] => {
+            format!("Remove {kind} '{id}' and {dependent_kind} '{dependent_id}' together")
+        }
+        with => format!(
+            "Remove {kind} '{id}' and the {} instances listed above",
+            with.len()
+        ),
+    };
+    let items = vec![
+        together,
+        format!("Cancel, keep {kind} '{id}'"),
+        format!("Remove only {kind} '{id}', fix the rest later"),
+    ];
+
+    // Cancelling is the default: this is the destructive prompt, and the
+    // other two answers both delete something.
+    match ctx.ui.select("What would you like to do?", &items, 1)? {
+        0 => {
+            check_discovery(ctx, &all)?;
+            Ok(Some(all))
+        }
+        2 => {
+            let only = plan_removal(ctx, kind, id, Take::Nothing);
+            report_left(ctx, &only);
+            Ok(Some(only))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Deletes one instance from the configuration and reports it. A failure to
+/// persist is reported and does not stop the rest of the plan, since the
+/// in-memory configuration has already changed.
+fn delete(ctx: &mut crate::AppContext, kind: RefKind, id: &str) {
+    let (saved, name) = match kind {
+        RefKind::Launcher => (ctx.config_mut().remove_launcher(id), "Launcher"),
+        RefKind::Capability => (ctx.config_mut().remove_capability(id), "Capability"),
+        RefKind::Model => (ctx.config_mut().remove_model(id), "Model"),
+        RefKind::Provider => (ctx.config_mut().remove_provider(id), "Provider"),
+    };
+    if let Err(e) = saved {
+        ctx.ui
+            .warn(&format!("failed to persist {kind} removal: {e}"));
+    }
+    ctx.ui.info(&format!("{name} '{id}' removed."));
+}
+
+/// The order kinds are listed in: what is depended on before what depends
+/// on it.
+fn rank(kind: RefKind) -> u8 {
+    match kind {
+        RefKind::Provider => 0,
+        RefKind::Model => 1,
+        RefKind::Capability => 2,
+        RefKind::Launcher => 3,
+    }
+}
+
+fn plural(kind: RefKind) -> &'static str {
+    match kind {
+        RefKind::Launcher => "launchers",
+        RefKind::Capability => "capabilities",
+        RefKind::Model => "models",
+        RefKind::Provider => "providers",
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 fn remove(
     ctx: &mut crate::AppContext,
     kind: RefKind,
@@ -1082,8 +1282,19 @@ mod tests {
         assert!(prompts(&ctx).is_empty());
         assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_none());
         assert!(ctx.config().get_capability("chat").is_some());
-        let warns = capture(&ctx).warns.borrow().clone();
-        assert!(warns.iter().any(|w| w.contains("will break")), "{warns:?}");
+        assert_eq!(
+            capture(&ctx).warns.borrow().clone(),
+            vec!["These stay, and will not work until fixed:"]
+        );
+        let infos = capture(&ctx).infos.borrow().clone();
+        assert_eq!(
+            infos,
+            vec![
+                "  - capability 'chat' (agent-model): its model 'granite-3.1-8b-instruct' is removed",
+                "  Fix it with `granite-cli capability setup <type> --id <id>`.",
+                "Model 'granite-3.1-8b-instruct' removed.",
+            ]
+        );
     }
 
     #[test]
@@ -1180,16 +1391,24 @@ mod tests {
         assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_some());
         assert!(ctx.config().get_capability("chat").is_some());
 
-        let warns = capture(&ctx).warns.borrow().clone();
-        assert!(
-            warns.iter().any(|w| w.contains("discovered models")),
-            "{warns:?}"
+        // One plan for the whole chain: the model's own removal does not
+        // print a second one.
+        assert_eq!(
+            capture(&ctx).warns.borrow().clone(),
+            vec!["These stay, and will not work until fixed:"]
         );
-        assert!(
-            warns
-                .iter()
-                .any(|w| w.contains("Leaving other dependents in place")),
-            "{warns:?}"
+        assert_eq!(
+            capture(&ctx).infos.borrow().clone(),
+            vec![
+                "Removing provider 'ollama' and the models discovered from it:",
+                "  - model 'managed'",
+                "  - model 'granite-3.1-8b-instruct': its provider 'ollama' is removed",
+                "  - capability 'chat' (agent-model): its model 'managed' is removed",
+                "  Fix them with `granite-cli model setup <type> --id <id>` and \
+                 `granite-cli capability setup <type> --id <id>`.",
+                "Model 'managed' removed.",
+                "Provider 'ollama' removed.",
+            ]
         );
     }
 
@@ -1236,6 +1455,8 @@ mod tests {
             "got: {err}"
         );
         assert!(prompts(&ctx).is_empty());
+        assert!(capture(&ctx).infos.borrow().is_empty());
+        assert!(capture(&ctx).warns.borrow().is_empty());
         assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_some());
         assert!(ctx.config().get_capability("chat").is_some());
     }
@@ -1264,6 +1485,247 @@ mod tests {
         CapabilityCommands::remove(&mut ctx, "chat", Some(DependentsPolicy::Refuse)).unwrap();
 
         assert!(ctx.config().get_capability("chat").is_none());
+    }
+
+    /// provider `ollama` <- model `granite-3.1-8b-instruct` <- capability
+    /// `chat` <- launcher `claude`: three levels of dependents.
+    fn ctx_three_levels() -> crate::AppContext {
+        let mut ctx = ctx_with_a_dangling_model_ref();
+        ctx.config_mut()
+            .capabilities
+            .get_mut("chat")
+            .unwrap()
+            .config = serde_json::json!({ "model_id": "granite-3.1-8b-instruct" });
+        ctx
+    }
+
+    fn pair(kind: RefKind, id: &str) -> (RefKind, String) {
+        (kind, id.to_string())
+    }
+
+    #[test]
+    fn a_cascade_plan_covers_every_level_and_removes_dependents_first() {
+        let ctx = ctx_three_levels();
+
+        let plan = plan_removal(&ctx, RefKind::Provider, "ollama", Take::All);
+
+        assert_eq!(
+            plan.with,
+            vec![
+                pair(RefKind::Launcher, "claude"),
+                pair(RefKind::Capability, "chat"),
+                pair(RefKind::Model, "granite-3.1-8b-instruct"),
+            ]
+        );
+        assert_eq!(
+            plan.shown(),
+            vec![
+                &pair(RefKind::Model, "granite-3.1-8b-instruct"),
+                &pair(RefKind::Capability, "chat"),
+                &pair(RefKind::Launcher, "claude"),
+            ]
+        );
+        assert!(plan.left.is_empty());
+    }
+
+    #[test]
+    fn a_cascade_prints_one_plan_for_every_level() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_three_levels();
+
+        ProviderCommands::remove(&mut ctx, "ollama", Some(DependentsPolicy::Cascade)).unwrap();
+
+        assert!(capture(&ctx).warns.borrow().is_empty());
+        assert_eq!(
+            capture(&ctx).infos.borrow().clone(),
+            vec![
+                "Removing provider 'ollama' and what depends on it:",
+                "  - model 'granite-3.1-8b-instruct'",
+                "  - capability 'chat'",
+                "  - launcher 'claude'",
+                "Launcher 'claude' removed.",
+                "Capability 'chat' removed.",
+                "Model 'granite-3.1-8b-instruct' removed.",
+                "Provider 'ollama' removed.",
+            ]
+        );
+        assert!(ctx.config().launchers.is_empty());
+        assert!(ctx.config().capabilities.is_empty());
+        assert!(ctx.config().models.is_empty());
+        assert!(ctx.config().providers.is_empty());
+    }
+
+    #[test]
+    fn a_discovered_plan_records_what_stays_and_why() {
+        let ctx = ctx_provider_with_discovered_and_user_models();
+
+        let plan = plan_removal(&ctx, RefKind::Provider, "ollama", Take::Discovered);
+
+        assert_eq!(plan.with, vec![pair(RefKind::Model, "managed")]);
+        assert_eq!(
+            plan.left,
+            vec![
+                Stranded {
+                    kind: RefKind::Model,
+                    id: "granite-3.1-8b-instruct".to_string(),
+                    removed: vec![pair(RefKind::Provider, "ollama")],
+                },
+                Stranded {
+                    kind: RefKind::Capability,
+                    id: "chat".to_string(),
+                    removed: vec![pair(RefKind::Model, "managed")],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_leave_plan_removes_only_the_target_and_lists_its_direct_dependents() {
+        let ctx = ctx_three_levels();
+
+        let plan = plan_removal(&ctx, RefKind::Provider, "ollama", Take::Nothing);
+
+        assert!(plan.with.is_empty());
+        // The capability and launcher still resolve their own references, so
+        // only the model is listed.
+        assert_eq!(
+            plan.left,
+            vec![Stranded {
+                kind: RefKind::Model,
+                id: "granite-3.1-8b-instruct".to_string(),
+                removed: vec![pair(RefKind::Provider, "ollama")],
+            }]
+        );
+    }
+
+    #[test]
+    fn an_instance_reached_on_two_paths_is_planned_once() {
+        // `claude` enables two capabilities on the same model, so a cascade
+        // from the model reaches it through each.
+        let mut ctx = ctx_three_levels();
+        ctx.config_mut().capabilities.insert(
+            "vision".to_string(),
+            CapabilityConfig {
+                capability_id: "vision".to_string(),
+                capability_type: "agent-model".to_string(),
+                config: serde_json::json!({ "model_id": "granite-3.1-8b-instruct" }),
+            },
+        );
+        ctx.config_mut()
+            .launchers
+            .get_mut("claude")
+            .unwrap()
+            .enabled_capabilities
+            .push("vision".to_string());
+
+        let plan = plan_removal(&ctx, RefKind::Model, "granite-3.1-8b-instruct", Take::All);
+
+        assert_eq!(
+            plan.with
+                .iter()
+                .filter(|node| **node == pair(RefKind::Launcher, "claude"))
+                .count(),
+            1,
+            "{:?}",
+            plan.with
+        );
+        assert_eq!(plan.with[0], pair(RefKind::Launcher, "claude"));
+        assert_eq!(plan.with.len(), 3, "{:?}", plan.with);
+    }
+
+    #[test]
+    fn a_reason_groups_removed_instances_of_one_kind() {
+        assert_eq!(
+            reason(&[pair(RefKind::Provider, "ollama")]),
+            "its provider 'ollama' is removed"
+        );
+        assert_eq!(
+            reason(&[
+                pair(RefKind::Capability, "chat"),
+                pair(RefKind::Capability, "vision"),
+            ]),
+            "its capabilities 'chat' and 'vision' are removed"
+        );
+    }
+
+    #[test]
+    fn an_interactive_removal_asks_one_question_for_the_whole_chain() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_three_levels();
+        answer(&ctx, &[0]);
+
+        ProviderCommands::remove(&mut ctx, "ollama", None).unwrap();
+
+        let prompts = prompts(&ctx);
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(
+            prompts[0].1,
+            vec![
+                "Remove provider 'ollama' and the 3 instances listed above",
+                "Cancel, keep provider 'ollama'",
+                "Remove only provider 'ollama', fix the rest later",
+            ]
+        );
+        assert_eq!(
+            capture(&ctx).warns.borrow().clone(),
+            vec!["Other instances depend on provider 'ollama':"]
+        );
+        assert!(ctx.config().launchers.is_empty());
+        assert!(ctx.config().capabilities.is_empty());
+        assert!(ctx.config().models.is_empty());
+        assert!(ctx.config().providers.is_empty());
+    }
+
+    #[test]
+    fn removing_only_the_target_interactively_reports_what_stays() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_three_levels();
+        answer(&ctx, &[2]);
+
+        ProviderCommands::remove(&mut ctx, "ollama", None).unwrap();
+
+        assert_eq!(prompts(&ctx).len(), 1);
+        assert_eq!(
+            capture(&ctx).warns.borrow().clone(),
+            vec![
+                "Other instances depend on provider 'ollama':",
+                "These stay, and will not work until fixed:",
+            ]
+        );
+        assert!(ctx.config().get_provider("ollama").is_none());
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_some());
+    }
+
+    #[test]
+    fn a_cascade_refuses_a_model_another_provider_would_add_back() {
+        let _home = crate::config::TestConfigHome::new();
+        // `managed` uses `ollama` but was discovered by `other`, whose
+        // discovery is on, so removing `ollama` does not stop the sync.
+        let mut ctx = ctx_provider_with_discovered_and_user_models();
+        ctx.config_mut().providers.insert(
+            "other".to_string(),
+            ProviderConfig {
+                provider_id: "other".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({ "discover_models": true }),
+            },
+        );
+        ctx.config_mut()
+            .models
+            .get_mut("managed")
+            .unwrap()
+            .discovered
+            .as_mut()
+            .unwrap()
+            .provider_id = "other".to_string();
+
+        let err = ProviderCommands::remove(&mut ctx, "ollama", Some(DependentsPolicy::Cascade))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("discovery on"), "got: {err}");
+        assert!(ctx.config().get_provider("ollama").is_some());
+        assert!(ctx.config().get_model("managed").is_some());
+        assert!(ctx.config().get_capability("chat").is_some());
     }
 
     #[tokio::test]
