@@ -82,7 +82,7 @@ impl Discover {
         ctx: &crate::AppContext,
         profile: &HardwareProfile,
     ) -> DiscoveryResult {
-        let providers = Self::discover_providers(ctx).await;
+        let providers = Self::discover_providers(ctx, None).await;
         Self::run_with_providers(ctx, profile, providers).await
     }
 
@@ -137,7 +137,15 @@ impl Discover {
 
     // -- Provider discovery --------------------------------------------------
 
-    async fn discover_providers(ctx: &crate::AppContext) -> (Vec<Recommendation>, Vec<String>) {
+    /// Health-checks every provider type that is not configured, at its
+    /// default base URLs, or, for a type the user runs, at those URLs with
+    /// the host replaced by `host` when one is given. Hosted types are
+    /// checked at their own URLs. Returns a recommendation per type, with
+    /// the first URL that answered, and the configured provider ids.
+    async fn discover_providers(
+        ctx: &crate::AppContext,
+        host: Option<&str>,
+    ) -> (Vec<Recommendation>, Vec<String>) {
         let configured_ids: HashSet<&str> =
             ctx.config().providers.keys().map(|s| s.as_str()).collect();
         let mut configured: Vec<String> = Vec::new();
@@ -150,8 +158,15 @@ impl Discover {
             }
 
             let default_config = PROVIDER_REGISTRY.default_config(provider_type);
+            let runs_on_hardware =
+                crate::config::hardware::HardwareLink::default_for(provider_type)
+                    == crate::config::hardware::HardwareLink::Local;
+            let base_urls = match host {
+                Some(host) if runs_on_hardware => base_urls_at(&metadata.default_base_urls, host),
+                _ => metadata.default_base_urls.clone(),
+            };
             let (discovered_base_url, health_error) =
-                first_healthy_base_url(&metadata.default_base_urls, |base_url| {
+                first_healthy_base_url(&base_urls, |base_url| {
                     let mut config = default_config.clone();
                     async move {
                         if !config.is_object() {
@@ -839,16 +854,47 @@ fn matching_catalog_ids(m: &recommended_config::StringMatch) -> Vec<String> {
 }
 
 /// The hardware link of provider `provider_id`: its saved link when it is
-/// configured, otherwise the default for its type, which is the link setup
-/// gives a provider it adds under its type's name.
+/// configured, otherwise the link setup gives a provider it adds under its
+/// type's name. That is the hardware the user named in the wizard for a
+/// type the user runs, and the default for its type otherwise: `local`, or
+/// "not specified" for a hosted type.
 fn provider_link(
     provider_id: &str,
     ctx: &crate::AppContext,
 ) -> crate::config::hardware::HardwareLink {
-    match ctx.config().get_provider(provider_id) {
-        Some(pc) => pc.hardware_link(),
-        None => crate::config::hardware::HardwareLink::default_for(provider_id),
+    use crate::config::hardware::HardwareLink;
+    if let Some(pc) = ctx.config().get_provider(provider_id) {
+        return pc.hardware_link();
     }
+    match (HardwareLink::default_for(provider_id), ctx.setup_link()) {
+        (HardwareLink::Local, Some(link)) => link.clone(),
+        (default, _) => default,
+    }
+}
+
+/// The host in the base URL of the first configured provider, by id, that
+/// is linked to `link`, when `link` names a hardware profile.
+fn known_host(
+    link: &crate::config::hardware::HardwareLink,
+    ctx: &crate::AppContext,
+) -> Option<String> {
+    if !matches!(link, crate::config::hardware::HardwareLink::Profile(_)) {
+        return None;
+    }
+    let mut providers: Vec<&crate::config::ProviderConfig> = ctx
+        .config()
+        .providers
+        .values()
+        .filter(|pc| pc.hardware_link() == *link)
+        .collect();
+    providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+    providers.into_iter().find_map(|pc| {
+        let base_url = pc.config.get("base_url")?.as_str()?;
+        url::Url::parse(base_url)
+            .ok()?
+            .host_str()
+            .map(str::to_string)
+    })
 }
 
 /// Whether provider `provider_id`, configured or about to be added under
@@ -944,6 +990,30 @@ where
     }
 
     (None, Some(failures.join("; ")))
+}
+
+/// `base_urls` with the host of each replaced by `host`, keeping scheme,
+/// port and path, in order and without repeats. A URL that does not parse,
+/// or whose host cannot be `host`, is left out.
+fn base_urls_at(base_urls: &[String], host: &str) -> Vec<String> {
+    let mut at: Vec<String> = Vec::new();
+    for base_url in base_urls {
+        let Ok(mut url) = url::Url::parse(base_url) else {
+            continue;
+        };
+        if url.set_host(Some(host)).is_err() {
+            continue;
+        }
+        // `Url` adds a trailing slash to a bare origin; the defaults have none.
+        let mut moved = url.to_string();
+        if !base_url.ends_with('/') && moved.ends_with('/') {
+            moved.pop();
+        }
+        if !at.contains(&moved) {
+            at.push(moved);
+        }
+    }
+    at
 }
 
 /// The providers setup resolves models against: the healthy ones discovery
@@ -1426,9 +1496,15 @@ impl SetupCommands {
         // hardware each is linked to.
         Self::repair_provider_links(ctx, can_prompt).await?;
 
-        let ui = &*ctx.ui;
+        let ui = std::sync::Arc::clone(&ctx.ui);
         ui.info("Discovering available components...\n");
-        let discovery = Discover::run_with_hardware(ctx, &hardware).await;
+        // Providers are probed once the user has named the hardware and
+        // host they run on, below; this pass finds the launchers.
+        let mut configured_providers: Vec<String> =
+            ctx.config().providers.keys().cloned().collect();
+        configured_providers.sort();
+        let discovery =
+            Discover::run_with_providers(ctx, &hardware, (Vec::new(), configured_providers)).await;
 
         if discovery.recommendations.is_empty()
             && discovery.configured_provider_ids.is_empty()
@@ -1445,22 +1521,29 @@ impl SetupCommands {
         // Phase 1: Launchers selection (show all detected launchers)
         let selected_launchers = Self::select_launchers(ctx, &discovery).await?;
 
-        // Phase 2: Capabilities selection (filtered by what the selected
+        // Phase 2: The hardware and host to run models on. Providers of the
+        // types the user runs are probed at that host, and models are ranked
+        // on that hardware in the formats the providers found can run.
+        let host = Self::select_target(ctx)?;
+        ui.info(&format!("\nLooking for providers on {host}...\n"));
+        let providers = Discover::discover_providers(ctx, Some(&host)).await;
+        let discovery = Discover::run_with_providers(ctx, &hardware, providers).await;
+
+        // Phase 3: Capabilities selection (filtered by what the selected
         // launchers can actually bind, pre-selected only where a
-        // recommendation actually resolves on this hardware)
+        // recommendation actually resolves on that hardware)
         let selected_caps =
             Self::select_capabilities(ctx, &discovery, &selected_launchers, &hardware).await?;
 
-        // Phase 3: Models selection (filtered by capability requirements)
+        // Phase 4: Models selection (filtered by capability requirements)
         let selected_models =
             Self::select_models(ctx, &discovery, &selected_caps, &selected_launchers).await?;
 
-        // Phase 4: Providers selection (only healthy, filtered by model compatibility)
+        // Phase 5: Providers selection (those found, filtered by model
+        // compatibility). Each new provider is saved with the hardware named
+        // in phase 2 and the address it was found at.
         let selected_providers = Self::select_providers(ctx, &discovery, &selected_models).await?;
-        // Each new provider is saved with the hardware it runs on now, so
-        // the variants below are ranked and noted for that hardware, and
-        // each model is bound to the provider it fits best on.
-        Self::configure_new_providers(ctx, &discovery, &selected_providers, true)?;
+        Self::configure_new_providers(ctx, &discovery, &selected_providers);
 
         // Phase 4.5: Variant selection (limited to formats the selected
         // providers can actually run, with a VRAM estimate at full context)
@@ -1512,7 +1595,6 @@ impl SetupCommands {
             &selected_variants,
             &resolved_capability_models,
             &recommended_capability_types_by_launcher,
-            true,
         )
         .await?;
 
@@ -1596,7 +1678,6 @@ impl SetupCommands {
             &selection.variants,
             &selection.resolved_capability_models,
             &selection.recommended_capability_types_by_launcher,
-            false,
         )
         .await?;
 
@@ -1768,6 +1849,29 @@ impl SetupCommands {
     }
 
     /*-- Selection phases ----------------------------------------------------*/
+
+    /// Asks which hardware to run models on, then the host name or IP
+    /// address of that hardware, and records the hardware as the link each
+    /// new provider of a type the user runs gets in this run. Returns the
+    /// host. The host is offered from a provider already linked to that
+    /// hardware, and is `localhost` otherwise.
+    fn select_target(ctx: &mut crate::AppContext) -> Result<String> {
+        let link = crate::commands::HardwareCommands::choose_target(ctx)?;
+        let default = known_host(&link, ctx).unwrap_or_else(|| "localhost".to_string());
+        let host = loop {
+            let answer = ctx
+                .ui
+                .text("Host name or IP address of that hardware", &default)?;
+            let answer = answer.trim().to_string();
+            if url::Host::parse(&answer).is_ok() {
+                break answer;
+            }
+            ctx.ui
+                .warn(&format!("'{answer}' is not a host name or IP address."));
+        };
+        ctx.set_setup_link(link);
+        Ok(host)
+    }
 
     async fn select_capabilities(
         ctx: &mut crate::AppContext,
@@ -2516,18 +2620,17 @@ impl SetupCommands {
     }
 
     /// Saves each provider in `selected_providers` that is not configured
-    /// yet, with the default config for its type, in id order. The wizard
-    /// asks which hardware each runs on (`ask_hardware`), and for its base
-    /// URL when the answer is not the default link for its type; `setup
-    /// --auto` gives each the default link for its type. An id already configured, by a
+    /// yet, with the default config for its type, the address discovery
+    /// found it at, and the link `provider_link` gives it: the hardware the
+    /// user named in the wizard for a type the user runs, otherwise the
+    /// default for its type. In id order. An id already configured, by a
     /// previous session or an escape-hatch wizard earlier in this run, is
     /// left alone.
     fn configure_new_providers(
         ctx: &mut crate::AppContext,
         discovery: &DiscoveryResult,
         selected_providers: &HashSet<String>,
-        ask_hardware: bool,
-    ) -> Result<()> {
+    ) {
         let ui = std::sync::Arc::clone(&ctx.ui);
         let mut provider_ids: Vec<&String> = selected_providers.iter().collect();
         provider_ids.sort();
@@ -2548,32 +2651,11 @@ impl SetupCommands {
                 default_config["base_url"] = base_url.clone().into();
             }
 
-            let default_link = crate::config::hardware::HardwareLink::default_for(provider_id);
-            let hardware = if ask_hardware {
-                crate::commands::HardwareCommands::choose_link(ctx, provider_id, None)?
-            } else {
-                default_link.clone()
-            };
-            // The address was found at, or defaults to, one on this
-            // machine. A provider linked elsewhere most likely runs at
-            // another address.
-            if hardware != default_link
-                && let Some(base_url) = default_config["base_url"].as_str()
-            {
-                let base_url = ui.text(
-                    &format!(
-                        "Base URL of '{provider_id}' (hardware: {})",
-                        String::from(hardware.clone())
-                    ),
-                    base_url,
-                )?;
-                default_config["base_url"] = base_url.into();
-            }
             let provider_config = crate::config::ProviderConfig {
                 provider_id: provider_id.clone(),
                 provider_type: provider_id.to_string(),
                 config: default_config,
-                hardware: Some(hardware),
+                hardware: Some(provider_link(provider_id, ctx)),
             };
 
             if ctx
@@ -2586,7 +2668,6 @@ impl SetupCommands {
                 ));
             }
         }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2607,17 +2688,14 @@ impl SetupCommands {
         // capability_type present for *some* launcher but not this one must
         // NOT be enabled here even if the binding type matches.
         recommended_capability_types_by_launcher: &HashMap<String, HashSet<String>>,
-        // The wizard asks which hardware each provider it adds runs on;
-        // `setup --auto` gives each the default for its type.
-        ask_hardware: bool,
     ) -> Result<()> {
         // A handle, not a borrow of `ctx`: writing configuration below takes
         // `ctx` mutably, and a borrow of its `ui` field would still be live.
         let ui = std::sync::Arc::clone(&ctx.ui);
 
         // Configure providers first. The wizard has already saved the ones
-        // it selected, with their hardware, so this adds only what is left.
-        Self::configure_new_providers(ctx, discovery, selected_providers, ask_hardware)?;
+        // it selected, so this adds only what is left.
+        Self::configure_new_providers(ctx, discovery, selected_providers);
 
         // Configure launchers
         for launcher_id in selected_launchers {
@@ -3263,14 +3341,14 @@ mod tests {
     #[tokio::test]
     async fn discover_providers_skips_configured() {
         let ctx = ctx_with_provider("ollama", "ollama", serde_json::json!({}));
-        let (_, configured) = Discover::discover_providers(&ctx).await;
+        let (_, configured) = Discover::discover_providers(&ctx, None).await;
         assert!(configured.contains(&"ollama".to_string()));
     }
 
     #[tokio::test]
     async fn discover_providers_recommends_unconfigured() {
         let ctx = test_ctx();
-        let (recommendations, _) = Discover::discover_providers(&ctx).await;
+        let (recommendations, _) = Discover::discover_providers(&ctx, None).await;
         let provider_recs: Vec<_> = recommendations
             .iter()
             .filter(|r| matches!(r, Recommendation::Provider { .. }))
@@ -4070,7 +4148,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap();
@@ -4136,7 +4213,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &recommended_capability_types_by_launcher,
-            false,
         )
         .await
         .unwrap();
@@ -5097,7 +5173,6 @@ mod tests {
             &selected_variants,
             &HashMap::new(),
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap_err();
@@ -5167,7 +5242,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap();
@@ -5212,7 +5286,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap();
@@ -5264,7 +5337,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap();
@@ -5310,7 +5382,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap();
@@ -5445,7 +5516,6 @@ mod tests {
             &HashMap::new(),
             &resolved,
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap();
@@ -5593,7 +5663,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap();
@@ -5707,7 +5776,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            false,
         )
         .await
         .unwrap();
@@ -5790,18 +5858,21 @@ mod tests {
     }
 
     #[test]
-    fn the_wizard_asks_for_the_address_of_a_provider_linked_to_other_hardware() {
+    fn the_wizard_saves_a_found_provider_on_the_hardware_named_with_the_address_found() {
         use crate::config::hardware::HardwareLink;
         let _home = crate::config::TestConfigHome::new();
-        let (mut ctx, capture, discovery) = wizard_with_llama_cpp_found();
-        capture.select_answers.borrow_mut().push_back(1); // spark
-        capture
-            .text_answers
-            .borrow_mut()
-            .push_back("http://spark:8080".to_string());
+        let (mut ctx, capture, mut discovery) = wizard_with_llama_cpp_found();
+        if let Recommendation::Provider {
+            discovered_base_url,
+            ..
+        } = &mut discovery.recommendations[0]
+        {
+            *discovered_base_url = Some("http://spark:8080".to_string());
+        }
+        ctx.set_setup_link(HardwareLink::Profile("spark".to_string()));
         let selected: HashSet<String> = ["llama-cpp".to_string()].into();
 
-        SetupCommands::configure_new_providers(&mut ctx, &discovery, &selected, true).unwrap();
+        SetupCommands::configure_new_providers(&mut ctx, &discovery, &selected);
 
         let provider = ctx.config().get_provider("llama-cpp").unwrap();
         assert_eq!(
@@ -5809,25 +5880,143 @@ mod tests {
             Some(HardwareLink::Profile("spark".to_string()))
         );
         assert_eq!(provider.config["base_url"], "http://spark:8080");
-        let prompts = capture.text_prompts.borrow();
-        assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0].1, "http://localhost:8080");
+        assert!(capture.select_prompts.borrow().is_empty());
+        assert!(capture.text_prompts.borrow().is_empty());
     }
 
     #[test]
-    fn the_wizard_keeps_the_found_address_of_a_provider_on_its_default_link() {
+    fn auto_setup_saves_a_found_provider_on_its_default_link() {
         use crate::config::hardware::HardwareLink;
         let _home = crate::config::TestConfigHome::new();
-        let (mut ctx, capture, discovery) = wizard_with_llama_cpp_found();
-        capture.select_answers.borrow_mut().push_back(0); // local
+        let (mut ctx, _capture, discovery) = wizard_with_llama_cpp_found();
         let selected: HashSet<String> = ["llama-cpp".to_string()].into();
 
-        SetupCommands::configure_new_providers(&mut ctx, &discovery, &selected, true).unwrap();
+        SetupCommands::configure_new_providers(&mut ctx, &discovery, &selected);
 
         let provider = ctx.config().get_provider("llama-cpp").unwrap();
         assert_eq!(provider.hardware, Some(HardwareLink::Local));
         assert_eq!(provider.config["base_url"], "http://localhost:8080");
-        assert!(capture.text_prompts.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_wizard_records_the_hardware_named_and_returns_the_host() {
+        use crate::config::hardware::HardwareLink;
+        let (mut ctx, capture, _) = wizard_with_llama_cpp_found();
+        capture.select_answers.borrow_mut().push_back(1); // spark
+        capture
+            .text_answers
+            .borrow_mut()
+            .push_back(" spark.lan ".to_string());
+
+        let host = SetupCommands::select_target(&mut ctx).unwrap();
+
+        assert_eq!(host, "spark.lan");
+        assert_eq!(
+            ctx.setup_link(),
+            Some(&HardwareLink::Profile("spark".to_string()))
+        );
+        let selects = capture.select_prompts.borrow();
+        assert_eq!(selects[0].0, "Hardware to run models on");
+        let texts = capture.text_prompts.borrow();
+        assert_eq!(texts[0].1, "localhost");
+    }
+
+    #[test]
+    fn the_wizard_offers_the_host_of_a_provider_already_on_that_hardware() {
+        use crate::config::hardware::HardwareLink;
+        let (mut ctx, capture, _) = wizard_with_llama_cpp_found();
+        ctx.config_mut().providers.insert(
+            "lab".to_string(),
+            crate::config::ProviderConfig {
+                provider_id: "lab".to_string(),
+                provider_type: "llama-cpp".to_string(),
+                config: serde_json::json!({ "base_url": "http://spark.lan:8080" }),
+                hardware: Some(HardwareLink::Profile("spark".to_string())),
+            },
+        );
+        capture.select_answers.borrow_mut().push_back(1); // spark
+
+        let host = SetupCommands::select_target(&mut ctx).unwrap();
+
+        assert_eq!(host, "spark.lan");
+        assert_eq!(capture.text_prompts.borrow()[0].1, "spark.lan");
+    }
+
+    #[test]
+    fn the_wizard_asks_again_for_a_host_that_is_not_one() {
+        let (mut ctx, capture, _) = wizard_with_llama_cpp_found();
+        capture.select_answers.borrow_mut().push_back(0); // local
+        capture
+            .text_answers
+            .borrow_mut()
+            .extend(["http://spark".to_string(), "spark".to_string()]);
+
+        let host = SetupCommands::select_target(&mut ctx).unwrap();
+
+        assert_eq!(host, "spark");
+        assert_eq!(capture.text_prompts.borrow().len(), 2);
+        assert_eq!(
+            *capture.warns.borrow(),
+            vec!["'http://spark' is not a host name or IP address.".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_new_provider_the_user_runs_gets_the_hardware_named_in_the_wizard() {
+        use crate::config::hardware::HardwareLink;
+        let spark = HardwareLink::Profile("spark".to_string());
+        let mut ctx = ctx_with_linked_providers(&[("lab", "llama-cpp", HardwareLink::Local)]);
+        assert_eq!(provider_link("ollama", &ctx), HardwareLink::Local);
+
+        ctx.set_setup_link(spark.clone());
+
+        assert_eq!(provider_link("ollama", &ctx), spark);
+        assert_eq!(provider_link("openrouter", &ctx), HardwareLink::Unspecified);
+        assert_eq!(provider_link("lab", &ctx), HardwareLink::Local);
+    }
+
+    #[test]
+    fn default_base_urls_are_moved_to_the_host_named() {
+        let urls = vec![
+            "http://localhost:8080".to_string(),
+            "http://127.0.0.1:8080".to_string(),
+            "http://localhost:1234/v1".to_string(),
+        ];
+
+        assert_eq!(
+            base_urls_at(&urls, "spark.lan"),
+            vec![
+                "http://spark.lan:8080".to_string(),
+                "http://spark.lan:1234/v1".to_string(),
+            ]
+        );
+        assert_eq!(
+            base_urls_at(&urls, "192.168.1.20"),
+            vec![
+                "http://192.168.1.20:8080".to_string(),
+                "http://192.168.1.20:1234/v1".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wizard_ranks_models_on_the_hardware_named() {
+        use crate::config::hardware::HardwareLink;
+        let recommends_30b = |d: &DiscoveryResult| {
+            d.recommendations.iter().any(|r| {
+                matches!(r, Recommendation::Model { model_id, .. } if model_id == "granite-4.2-30b")
+            })
+        };
+        let (mut ctx, _, _) = wizard_with_llama_cpp_found();
+        let providers = providers_with_healthy(&ctx, &["ollama"]);
+        let on_local = Discover::run_with_providers(&ctx, &small_local(), providers).await;
+        assert!(!recommends_30b(&on_local));
+
+        ctx.set_setup_link(HardwareLink::Profile("spark".to_string()));
+        let providers = providers_with_healthy(&ctx, &["ollama"]);
+        let on_spark = Discover::run_with_providers(&ctx, &small_local(), providers).await;
+
+        assert!(recommends_30b(&on_spark));
     }
 
     /// A machine too small for granite-4.2-30b.
