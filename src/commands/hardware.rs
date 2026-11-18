@@ -286,6 +286,19 @@ impl HardwareCommands {
         Self::choose_link_with(ctx, provider_type, current, interactive, detect_hardware)
     }
 
+    /// Asks which hardware the servers the setup wizard looks for run on,
+    /// with the choices of [`Self::choose_link`], starting on `local`.
+    pub(crate) fn choose_target(ctx: &mut AppContext) -> Result<HardwareLink> {
+        let interactive = can_prompt(ctx);
+        Self::ask_link(
+            ctx,
+            "Hardware to run models on",
+            HardwareLink::Local,
+            interactive,
+            detect_hardware,
+        )
+    }
+
     /// Whether this run can ask the user something: the output backend is
     /// interactive, which for terminal and plain output means stdin and
     /// stderr are terminals (see [`crate::utils::ui::base::Ui::is_interactive`]).
@@ -445,6 +458,25 @@ impl HardwareCommands {
         detect: impl FnOnce() -> HardwareProfile,
     ) -> Result<HardwareLink> {
         let default = current.unwrap_or_else(|| HardwareLink::default_for(provider_type));
+        Self::ask_link(
+            ctx,
+            "Hardware this provider runs on",
+            default,
+            interactive,
+            detect,
+        )
+    }
+
+    /// Asks `question` with the choices of [`Self::choose_link`], starting
+    /// on `default`, and returns `default` without asking when the run is
+    /// not `interactive`.
+    fn ask_link(
+        ctx: &mut AppContext,
+        question: &str,
+        default: HardwareLink,
+        interactive: bool,
+        detect: impl FnOnce() -> HardwareProfile,
+    ) -> Result<HardwareLink> {
         if !interactive {
             return Ok(default);
         }
@@ -475,9 +507,7 @@ impl HardwareCommands {
         items.push("not specified (fit cannot be estimated)".to_string());
         items.push("create new profile…".to_string());
         let default_index = links.iter().position(|l| *l == default).unwrap_or(0);
-        let picked = ctx
-            .ui
-            .select("Hardware this provider runs on", &items, default_index)?;
+        let picked = ctx.ui.select(question, &items, default_index)?;
         if picked < links.len() {
             return Ok(links[picked].clone());
         }

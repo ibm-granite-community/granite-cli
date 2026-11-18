@@ -461,10 +461,9 @@ off and never remove anything themselves.
 `discover_models` is true**:
 
 ```
-Model 'llama3:8b' is managed by provider 'ollama', which has model discovery
-on. Remove it at the provider instead: turn discovery off (provider setup
-ollama), or remove the provider. Re-running with discovery on would only
-discover it again.
+Model 'llama3:8b' was discovered from provider 'ollama', which has discovery on, so the next sync would add it back.
+  To remove only this model, turn discovery off with `granite-cli provider setup ollama`, then remove it.
+  To remove the provider and all its models: `granite-cli provider remove ollama --dependents cascade`.
 ```
 
 - The check is `Provider::discover_models()` on the configured provider
@@ -475,6 +474,9 @@ discover it again.
   it fails, removal is allowed: no sync can re-add it.
 - The guard is in the `model remove` command, not in `Config::remove_model`.
   Sync calls the config layer directly.
+- `provider remove --dependents cascade` removes the models the provider
+  discovered, also while its discovery is on, since no sync can add them back
+  once the provider is gone.
 - `model setup` on a discovered model is allowed and preserves
   `ModelConfig.discovered` (copy it from `existing_config` like the variant).
   It refuses to change `provider_id`, since that would leave the model owned by

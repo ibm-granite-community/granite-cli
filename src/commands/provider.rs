@@ -396,7 +396,27 @@ impl ProviderCommands {
                 return Ok(());
             }
             crate::commands::shared::remediation::Removal::Proceed { with } => {
-                crate::commands::shared::remediation::remove_all(ctx, &with, policy)?;
+                // The models this provider discovered go with it, also while
+                // its discovery is on.
+                for (kind, id) in with {
+                    let discovered_here = kind == RefKind::Model
+                        && ctx
+                            .config()
+                            .get_model(&id)
+                            .and_then(|model| model.discovered.as_ref())
+                            .is_some_and(|d| d.provider_id == provider_id);
+                    if discovered_here {
+                        crate::commands::model::ModelCommands::remove_with_provider(
+                            ctx, &id, policy,
+                        )?;
+                    } else {
+                        crate::commands::shared::remediation::remove_all(
+                            ctx,
+                            &[(kind, id)],
+                            policy,
+                        )?;
+                    }
+                }
             }
         }
 

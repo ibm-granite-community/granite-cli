@@ -155,6 +155,7 @@ To regenerate it after adding a launcher or capability, run `scripts/update-capa
 | Capability | Type | `claude` | `bob` | `bobide` | `pi` | `opencode` | `hermes` | `goose` | `openclaw` | `codex` |
 |---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `agent-model` | Agent Model Binding | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `model-provider` | Model Provider | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | `speech-to-text` | Speech To Text | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
 | `vision-mcp` | Vision MCP Server | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `mcp-server` | MCP Server | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -168,6 +169,7 @@ To regenerate it after adding a launcher or capability, run `scripts/update-capa
 | Capability | Description |
 |---|---|
 | `agent-model` | Surfaces a configured model's connection details (base URL, model name, auth, TLS) to a launched agent. |
+| `model-provider` | Surfaces every configured chat model as one launcher provider entry per granite-cli provider, routed through the local granite-cli proxy. |
 | `speech-to-text` | Surfaces a transcription model's connection details to a launched agent's voice input mode. |
 | `vision-mcp` | Exposes a vision-language model as an MCP server (compare/analyze images) for a launched coding agent to call. |
 | `mcp-server` | Registers any MCP server (stdio, Streamable HTTP or SSE) with a launched coding agent. |
@@ -181,6 +183,7 @@ To regenerate it after adding a launcher or capability, run `scripts/update-capa
 - **Mcp** — exposes the capability as an MCP server the launcher can call
 - **SubAgent** — exposes the capability as a named sub-agent the launcher can delegate to
 - **VoiceInput** — passes a transcription model's connection details to the launcher's voice input mode
+- **ModelProvider** — populates the launcher's model provider config with one entry per granite-cli provider, routed through the local proxy
 
 <!-- capability-table-end -->
 

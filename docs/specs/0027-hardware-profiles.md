@@ -473,17 +473,25 @@ fit.
 `hardware remove` lists the providers that use a hardware profile before
 removing it.
 
-The setup wizard asks which hardware each provider it adds runs on as soon as
-the providers are chosen, before it ranks models for them, and offers "create
-new profile…" there. The wizard finds providers at their local addresses, so
-when the answer is not the default link for the provider's type, it also asks
-for the provider's base URL, defaulting to the address it found.
+Right after the launchers, the setup wizard asks which hardware to run
+models on, offering "create new profile…", and the host name or IP address
+of that hardware. The host defaults to `localhost`, or to the host of a
+provider already linked to that profile. The wizard then looks for providers
+of the types the user runs at that host, on their default ports, and for
+hosted providers at their own addresses, and ranks models on that hardware
+in the formats the providers found can run. Capabilities, models, providers
+and variants follow. Each provider the wizard adds of a type the user runs
+is linked to that hardware and saved with the address it was found at. The
+host itself is not saved anywhere else. A provider on another host, or on a
+port other than its default, is added with "Configure a different
+provider…".
 
 ```
 $ granite-cli setup
 ...
-? Hardware this provider runs on: spark
-? Base URL of 'llama-cpp' (hardware: spark): http://spark:8080
+? Hardware to run models on: spark
+? Host name or IP address of that hardware: spark.lan
+Looking for providers on spark.lan...
 ```
 
 ### How setup and recommend estimate fit
@@ -1071,9 +1079,10 @@ checked against the context that fits on that hardware. Variants with no fit
 available are not selected automatically; when a recommended capability does
 not resolve, `setup --auto` names it once, with them grouped by model and
 provider, and a note. `setup --auto` and the wizard share this logic. The
-wizard asks which hardware each provider it adds runs on before it ranks
-models, offering "create new profile…", and asks for the base URL when the
-answer is not the default link for the type. Before it ranks models it offers to
+wizard asks which hardware to run models on and its host before it ranks
+models, offering "create new profile…", looks for providers at that host,
+and links each provider it adds of a type the user runs to that hardware,
+with the address it was found at. Before it ranks models it offers to
 repair each configured provider's broken link, and its variant list names
 the hardware profile when it is not `local`. A model that fits as well on several providers is bound
 to one on `local`.
@@ -1084,13 +1093,19 @@ a size and a provider without a hardware profile each named and not selected;
 the variant a model is bound to coming from the provider it fits best on, and
 from the provider on `local` on a tie; a capability recommended by two
 launchers named once; the wizard's repair of a broken link; the wizard
-asking for the base URL of a provider linked to other hardware, and keeping
-the address it found for a provider on the default link; and the
+recording the hardware named and returning the host, offering the host of a
+provider already on that hardware, and asking again for a value that is not
+a host; default base URLs moved to the host named; a new provider of a type
+the user runs linked to the hardware named, and a hosted one not; models
+ranked on the hardware named; a provider the wizard adds saved with that
+link and the address found, and one `setup --auto` adds with its type's
+default link; and the
 existing setup tests passing with every provider on `local`.
 
 **Relevant Context**
 - `src/commands/setup.rs` (`resolve_model_set`, `rank_variants_among`,
-  `run_auto_with_hardware`, `select_variants`)
+  `run_auto_with_hardware`, `select_variants`, `select_target`,
+  `discover_providers`)
 
 **Status** — `[x]` done
 
