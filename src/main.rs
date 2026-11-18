@@ -155,6 +155,15 @@ enum HardwareSubcommands {
     Remove {
         /// Hardware profile id
         hardware_id: String,
+
+        /// How to handle the providers linked to this hardware profile.
+        /// `cascade` removes them too; `refuse` aborts with a non-zero exit;
+        /// `leave` removes only this profile and leaves the providers' links
+        /// broken. Omitting the flag prompts when the run can ask; otherwise,
+        /// when providers are linked, it aborts with a non-zero exit that
+        /// names the policies.
+        #[arg(long, value_name = "POLICY")]
+        dependents: Option<DependentsPolicy>,
     },
 }
 
@@ -902,9 +911,10 @@ fn run_hardware_command(
             },
         )
         .map(|_| ()),
-        Some(HardwareSubcommands::Remove { hardware_id }) => {
-            HardwareCommands::remove(ctx, &hardware_id)
-        }
+        Some(HardwareSubcommands::Remove {
+            hardware_id,
+            dependents,
+        }) => HardwareCommands::remove(ctx, &hardware_id, dependents),
     }
 }
 
@@ -965,7 +975,9 @@ async fn run_provider_command(
     match subcmd {
         ProviderSubcommands::Catalog { wide } => ProviderCommands::catalog(ctx, wide),
         ProviderSubcommands::List => ProviderCommands::list(ctx),
-        ProviderSubcommands::Info { provider_id } => ProviderCommands::info(ctx, &provider_id),
+        ProviderSubcommands::Info { provider_id } => {
+            ProviderCommands::info(ctx, &provider_id).await
+        }
         ProviderSubcommands::Setup {
             provider_type,
             instance_id,

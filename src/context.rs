@@ -31,6 +31,10 @@ pub(crate) struct AppContext {
     /// provider the sources hand out points at it, which is why setting it
     /// discards them.
     model_proxy: Option<crate::proxy::ProxyHandle>,
+    /// The hardware the setup wizard gives each provider it adds of a type
+    /// the user runs, once the user has named it. `None` outside the wizard,
+    /// where a new provider gets its type's default link.
+    setup_link: Option<crate::config::hardware::HardwareLink>,
 }
 
 impl AppContext {
@@ -44,7 +48,20 @@ impl AppContext {
             sources: std::sync::Mutex::new(None),
             hardware: std::sync::Mutex::new(HashMap::new()),
             model_proxy: None,
+            setup_link: None,
         }
+    }
+
+    /// The hardware the setup wizard gives each provider it adds of a type
+    /// the user runs, when the user has named it in this run.
+    pub(crate) fn setup_link(&self) -> Option<&crate::config::hardware::HardwareLink> {
+        self.setup_link.as_ref()
+    }
+
+    /// Records the hardware the setup wizard gives each provider it adds of
+    /// a type the user runs.
+    pub(crate) fn set_setup_link(&mut self, link: crate::config::hardware::HardwareLink) {
+        self.setup_link = Some(link);
     }
 
     /// The configuration as it now stands.
