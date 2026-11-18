@@ -31,6 +31,10 @@ enum Recommendation {
         health_healthy: bool,
         health_error: Option<String>,
         discovered_base_url: Option<String>,
+        /// The models the provider serves at `discovered_base_url`, as its
+        /// listing reports them. Empty when it was not asked, cannot list
+        /// models, or the listing failed.
+        served_models: Vec<crate::providers::ProviderModel>,
     },
     Model {
         model_id: String,
@@ -189,12 +193,50 @@ impl Discover {
                 health_healthy: discovered_base_url.is_some(),
                 health_error,
                 discovered_base_url,
+                served_models: Vec::new(),
             });
         }
 
         configured.sort();
         recommendations.sort_by_key(display_name);
         (recommendations, configured)
+    }
+
+    /// Asks each provider in `recommendations` that answered its health
+    /// check which models it serves, at the address it answered on, and
+    /// records them in its `served_models`. A provider whose type cannot
+    /// list models, or whose listing fails, keeps an empty list.
+    async fn list_served_models(recommendations: &mut [Recommendation]) {
+        for rec in recommendations {
+            let Recommendation::Provider {
+                provider_type,
+                discovered_base_url: Some(base_url),
+                served_models,
+                ..
+            } = rec
+            else {
+                continue;
+            };
+            let mut config = PROVIDER_REGISTRY.default_config(provider_type);
+            if !config.is_object() {
+                continue;
+            }
+            config["base_url"] = base_url.clone().into();
+            let Ok(provider) = PROVIDER_REGISTRY.construct(provider_type, provider_type, &config)
+            else {
+                continue;
+            };
+            if !provider.discover_models() {
+                continue;
+            }
+            match provider.list_models().await {
+                Ok(models) => *served_models = models,
+                Err(error) => alog_channel!(
+                    MessageLevel::Debug,
+                    "Listing the models '{provider_type}' serves failed: {error}"
+                ),
+            }
+        }
     }
 
     async fn run_health_check(
@@ -540,24 +582,7 @@ impl Revaluator {
         recommendations: &'a [Recommendation],
         selected_cap_types: &HashSet<String>,
     ) -> Vec<&'a Recommendation> {
-        // Collect all model requirements from selected capabilities
-        let all_requirements: Vec<ModelRequirement> = selected_cap_types
-            .iter()
-            .filter_map(|cap_type| CAPABILITY_REGISTRY.get(cap_type))
-            .flat_map(|m| {
-                m.dependencies
-                    .iter()
-                    .filter_map(|d| match d {
-                        Dependency::Model {
-                            requirement,
-                            resolved_id: None,
-                            ..
-                        } => Some(requirement.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let all_requirements = model_requirements(selected_cap_types);
 
         if all_requirements.is_empty() {
             // No model requirements — show all model recommendations
@@ -933,6 +958,180 @@ fn construct_provider(
         }
     }
     .ok()
+}
+
+/// A model a provider found by the wizard serves, which is no catalog model,
+/// picked by the user: the provider and the name it serves the model under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServedPick {
+    provider_id: String,
+    wire_id: String,
+}
+
+/// What the providers found by the wizard serve, split by whether each
+/// listed model is a catalog model.
+#[derive(Default)]
+struct ServedModels<'a> {
+    /// Catalog model id -> each provider serving it and the variant it
+    /// serves, in provider id order.
+    catalog: HashMap<String, Vec<(String, ModelVariant)>>,
+    /// The listed models that are no catalog model, as (provider id, model),
+    /// in provider id then listing order.
+    others: Vec<(String, &'a crate::providers::ProviderModel)>,
+}
+
+impl ServedModels<'_> {
+    /// The variant of catalog model `model_id` one of `providers` serves,
+    /// with that provider, the first by provider id.
+    fn served_variant(
+        &self,
+        model_id: &str,
+        providers: &HashSet<String>,
+    ) -> Option<&(String, ModelVariant)> {
+        self.catalog
+            .get(model_id)?
+            .iter()
+            .find(|(provider_id, _)| providers.contains(provider_id))
+    }
+}
+
+/// The models the providers in `discovery` serve. A listed model is catalog
+/// model M in variant V when the provider can run V and serves it under
+/// `wire_name` for M and V, the name sync matches a configured model by. So
+/// a catalog model written in that variant is not added again by sync.
+fn served_models(discovery: &DiscoveryResult) -> ServedModels<'_> {
+    let mut listings: Vec<(&str, &Vec<crate::providers::ProviderModel>)> = discovery
+        .recommendations
+        .iter()
+        .filter_map(|rec| match rec {
+            Recommendation::Provider {
+                provider_type,
+                served_models,
+                ..
+            } if !served_models.is_empty() => Some((*provider_type, served_models)),
+            _ => None,
+        })
+        .collect();
+    listings.sort_by_key(|(provider_id, _)| *provider_id);
+
+    // In id order, so a name two catalog models share goes to the same one
+    // on every run.
+    let mut catalog_entries: Vec<(&str, ModelMetadata)> =
+        MODEL_REGISTRY.entries().into_iter().collect();
+    catalog_entries.sort_by_key(|(model_id, _)| *model_id);
+    let mut served = ServedModels::default();
+    for (provider_id, listed) in listings {
+        let default_config = PROVIDER_REGISTRY.default_config(provider_id);
+        let Ok(provider) = PROVIDER_REGISTRY.construct(provider_id, provider_id, &default_config)
+        else {
+            continue;
+        };
+        // Wire name -> (catalog model id, variant), for every variant the
+        // provider can run.
+        let mut catalog_names: HashMap<String, (&str, &ModelVariant)> = HashMap::new();
+        for (model_id, md) in &catalog_entries {
+            for variant in &md.variants {
+                if provider.can_run_model(&variant.format, &variant.precision) {
+                    catalog_names
+                        .entry(wire_name(&*provider, model_id, variant))
+                        .or_insert((*model_id, variant));
+                }
+            }
+        }
+        for model in listed {
+            match catalog_names.get(&model.id) {
+                Some((model_id, variant)) => served
+                    .catalog
+                    .entry(model_id.to_string())
+                    .or_default()
+                    .push((provider_id.to_string(), (*variant).clone())),
+                None => served.others.push((provider_id.to_string(), model)),
+            }
+        }
+    }
+    served
+}
+
+/// The name `provider` serves catalog model `model_id` under in `variant`:
+/// its alias for that variant, otherwise the catalog id. Sync matches a
+/// configured model by the same name.
+fn wire_name(provider: &dyn Provider, model_id: &str, variant: &ModelVariant) -> String {
+    provider
+        .model_alias(model_id.to_string(), Some(variant))
+        .unwrap_or_else(|| model_id.to_string())
+}
+
+/// The requirement of every model slot of each capability type in
+/// `capability_types` that a model is chosen for.
+fn model_requirements(capability_types: &HashSet<String>) -> Vec<ModelRequirement> {
+    capability_types
+        .iter()
+        .filter_map(|cap_type| CAPABILITY_REGISTRY.get(cap_type))
+        .flat_map(|m| {
+            m.dependencies
+                .iter()
+                .filter_map(|d| match d {
+                    Dependency::Model {
+                        requirement,
+                        resolved_id: None,
+                        ..
+                    } => Some(requirement.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Whether `model` meets `req`, leaving out a model with a multimodal
+/// function `req` does not ask for, as `admits_for_recommendation` does for
+/// catalog models.
+fn admits_served(req: &ModelRequirement, model: &(dyn crate::models::Model + 'static)) -> bool {
+    if !req.admits_instance(model) {
+        return false;
+    }
+    let req_wants_multimodal = req
+        .supported_functions
+        .iter()
+        .any(|f| MULTIMODAL_FUNCTIONS.contains(f));
+    req_wants_multimodal
+        || !model
+            .supported_functions()
+            .iter()
+            .any(|f| MULTIMODAL_FUNCTIONS.contains(f))
+}
+
+/// The model sync would write for `model`, served by `provider_id`, built
+/// as an instance so a capability's requirement can be checked against it.
+fn served_instance(
+    provider_id: &str,
+    model: &crate::providers::ProviderModel,
+) -> Option<Box<dyn crate::models::Model>> {
+    // The wizard adds a provider it found under its type's name.
+    let config = crate::models::discovery::discovered_model_config(
+        provider_id,
+        provider_id,
+        model,
+        model.id.clone(),
+    );
+    MODEL_REGISTRY
+        .construct(&config.model_type, &config.model_id, &config.config)
+        .ok()
+}
+
+/// The id of the configured model `pick` is: the entry discovery manages
+/// for that name on that provider.
+fn served_instance_id(ctx: &crate::AppContext, pick: &ServedPick) -> Option<String> {
+    ctx.config()
+        .models
+        .iter()
+        .find(|(_, mc)| {
+            mc.discovered.as_ref().is_some_and(|discovered| {
+                discovered.provider_id == pick.provider_id
+                    && discovered.provider_model_id == pick.wire_id
+            })
+        })
+        .map(|(id, _)| id.clone())
 }
 
 /// One capability's resolution against its `RecommendedCapability`: which
@@ -1526,7 +1725,10 @@ impl SetupCommands {
         // on that hardware in the formats the providers found can run.
         let host = Self::select_target(ctx)?;
         ui.info(&format!("\nLooking for providers on {host}...\n"));
-        let providers = Discover::discover_providers(ctx, Some(&host)).await;
+        let mut providers = Discover::discover_providers(ctx, Some(&host)).await;
+        // What each provider found serves, so the model list can say which
+        // catalog models are there already and offer the others.
+        Discover::list_served_models(&mut providers.0).await;
         let discovery = Discover::run_with_providers(ctx, &hardware, providers).await;
 
         // Phase 3: Capabilities selection (filtered by what the selected
@@ -1535,14 +1737,18 @@ impl SetupCommands {
         let selected_caps =
             Self::select_capabilities(ctx, &discovery, &selected_launchers, &hardware).await?;
 
-        // Phase 4: Models selection (filtered by capability requirements)
-        let selected_models =
+        // Phase 4: Models selection (filtered by capability requirements):
+        // catalog models, and models the providers found serve that are not
+        // in the catalog.
+        let (selected_models, served_picks) =
             Self::select_models(ctx, &discovery, &selected_caps, &selected_launchers).await?;
 
         // Phase 5: Providers selection (those found, filtered by model
-        // compatibility). Each new provider is saved with the hardware named
-        // in phase 2 and the address it was found at.
-        let selected_providers = Self::select_providers(ctx, &discovery, &selected_models).await?;
+        // compatibility, with the ones serving a selected model checked).
+        // Each new provider is saved with the hardware named in phase 2 and
+        // the address it was found at.
+        let selected_providers =
+            Self::select_providers(ctx, &discovery, &selected_models, &served_picks).await?;
         Self::configure_new_providers(ctx, &discovery, &selected_providers);
 
         // Phase 4.5: Variant selection (limited to formats the selected
@@ -1592,6 +1798,7 @@ impl SetupCommands {
             &selected_launchers,
             &selected_providers,
             &selected_models,
+            &served_picks,
             &selected_variants,
             &resolved_capability_models,
             &recommended_capability_types_by_launcher,
@@ -1600,23 +1807,58 @@ impl SetupCommands {
 
         Self::sync_discovered(ctx, &selected_providers).await;
 
-        // Phase 6: Pull (optional)
+        // Phase 6: Pull (optional), of the models not on their provider yet.
+        let to_pull = Self::not_yet_served(ctx, &discovery, &selected_models);
         match pull {
             Some(false) => {}
-            Some(true) => Self::do_pull(ctx, &selected_models).await?,
-            None => Self::prompt_pull(ctx, &selected_models).await?,
+            Some(true) => Self::do_pull(ctx, &to_pull).await?,
+            None => Self::prompt_pull(ctx, &to_pull).await?,
         }
 
         // Phase 7: Summary
+        let mut configured_models = selected_models.clone();
+        configured_models.extend(
+            served_picks
+                .iter()
+                .filter_map(|pick| served_instance_id(ctx, pick)),
+        );
         Self::print_summary(
             ctx,
             &selected_caps,
             &selected_launchers,
             &selected_providers,
-            &selected_models,
+            &configured_models,
         );
 
         Ok(())
+    }
+
+    /// The models in `selected_models` their configured provider does not
+    /// serve yet in their configured variant, by what `discovery` found it
+    /// serving. The rest need no pull.
+    fn not_yet_served(
+        ctx: &crate::AppContext,
+        discovery: &DiscoveryResult,
+        selected_models: &HashSet<String>,
+    ) -> HashSet<String> {
+        let served = served_models(discovery);
+        selected_models
+            .iter()
+            .filter(|model_id| {
+                let Some(mc) = ctx.config().get_model(model_id) else {
+                    return true;
+                };
+                let Some(on_servers) = served.catalog.get(model_id.as_str()) else {
+                    return true;
+                };
+                !on_servers.iter().any(|(provider_id, variant)| {
+                    *provider_id == mc.provider_id
+                        && mc.variant.as_deref()
+                            == Some(format!("{}/{}", variant.format, variant.precision).as_str())
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     /// Run auto mode — detect, configure everything with defaults.
@@ -1675,6 +1917,7 @@ impl SetupCommands {
             &selected_launchers,
             &selection.providers,
             &selection.models,
+            &[],
             &selection.variants,
             &selection.resolved_capability_models,
             &selection.recommended_capability_types_by_launcher,
@@ -2137,10 +2380,40 @@ impl SetupCommands {
         ctx: &mut crate::AppContext,
         discovery: &DiscoveryResult,
         selected_models: &HashSet<String>,
+        served_picks: &[ServedPick],
     ) -> Result<HashSet<String>> {
         let ui = ctx.ui.clone(); // owned Arc<dyn Ui>: doesn't borrow `ctx`, so it stays usable across the later `&mut ctx` calls into ProviderCommands::setup
 
-        let filtered: Vec<_> = Revaluator::for_providers(discovery, selected_models, ctx)
+        // Providers serving a selected model: the provider of each server
+        // model picked, and each provider that already has a selected
+        // catalog model. They are offered checked, whether or not they can
+        // run the other selected models.
+        let served = served_models(discovery);
+        let mut serving: HashSet<String> = served_picks
+            .iter()
+            .map(|pick| pick.provider_id.clone())
+            .collect();
+        for model_id in selected_models {
+            if let Some(on_servers) = served.catalog.get(model_id) {
+                serving.extend(
+                    on_servers
+                        .iter()
+                        .map(|(provider_id, _)| provider_id.clone()),
+                );
+            }
+        }
+        let mut offered = Revaluator::for_providers(discovery, selected_models, ctx);
+        for rec in &discovery.recommendations {
+            if let Recommendation::Provider { provider_type, .. } = rec
+                && serving.contains(*provider_type)
+                && !offered.iter().any(|r| std::ptr::eq(*r, rec))
+            {
+                offered.push(rec);
+            }
+        }
+        offered.sort_by_key(|r| display_name(r));
+
+        let filtered: Vec<_> = offered
             .into_iter()
             .filter_map(|r| match r {
                 Recommendation::Provider {
@@ -2188,7 +2461,10 @@ impl SetupCommands {
                     format!("{id} — {name} ({status})")
                 })
                 .collect();
-            let mut defaults = vec![false; items.len()];
+            let mut defaults: Vec<bool> = filtered
+                .iter()
+                .map(|(id, ..)| serving.contains(id))
+                .collect();
             for id in &configured {
                 items.push(format!("{id} — configured"));
                 defaults.push(true);
@@ -2222,7 +2498,7 @@ impl SetupCommands {
 
             if !chose_different {
                 // Every selected model needs a provider to run on.
-                if result.is_empty() && !selected_models.is_empty() {
+                if result.is_empty() && !(selected_models.is_empty() && served_picks.is_empty()) {
                     ui.warn("Select at least one provider to run the selected models.");
                     continue;
                 }
@@ -2277,11 +2553,25 @@ impl SetupCommands {
         selected_providers: &HashSet<String>,
     ) -> Result<HashMap<String, ModelVariant>> {
         let mut chosen = HashMap::new();
+        let served = served_models(discovery);
 
         for model_id in selected_models {
             let Some(md) = MODEL_REGISTRY.get(model_id) else {
                 continue;
             };
+
+            // A selected provider already serves it: use that variant, which
+            // needs no pull.
+            if let Some((provider_id, variant)) =
+                served.served_variant(model_id, selected_providers)
+            {
+                ctx.ui.info(&format!(
+                    "'{model_id}' is already on {provider_id} as {} / {}; using that variant.",
+                    variant.format, variant.precision
+                ));
+                chosen.insert(model_id.clone(), variant.clone());
+                continue;
+            }
 
             let candidates = Self::candidate_variants(&md, selected_providers, ctx);
             if candidates.is_empty() {
@@ -2465,7 +2755,7 @@ impl SetupCommands {
         discovery: &DiscoveryResult,
         selected_caps: &HashSet<String>,
         selected_launchers: &HashSet<String>,
-    ) -> Result<HashSet<String>> {
+    ) -> Result<(HashSet<String>, Vec<ServedPick>)> {
         let ui = &*ctx.ui;
 
         // Resolve every launcher id to its real registry type (an escape-hatch
@@ -2526,32 +2816,54 @@ impl SetupCommands {
             )
         };
 
+        // Models the providers found serve: catalog models are marked with
+        // the providers that have them, and the others are offered after
+        // the catalog models, unchecked.
+        let served = served_models(discovery);
+        let others = Self::served_model_options(&served, selected_caps);
+
         let mut chosen: HashSet<String> = HashSet::new();
-        let mut configure_different = filtered.is_empty();
+        let mut picks: Vec<ServedPick> = Vec::new();
+        let mut configure_different = filtered.is_empty() && others.is_empty();
 
         if filtered.is_empty() {
             ui.info("No models fully fit your hardware for the selected capabilities.");
-        } else {
-            let escape_hatch_idx = filtered.len();
+        }
+        if !configure_different {
+            let escape_hatch_idx = filtered.len() + others.len();
             let mut items: Vec<String> = filtered
                 .iter()
                 .map(|(id, size, fit, providers)| {
-                    Self::format_model_option(id, size, *fit, providers)
+                    let line = Self::format_model_option(id, size, *fit, providers);
+                    match served.catalog.get(id) {
+                        Some(on_servers) => {
+                            let names: Vec<&str> = on_servers
+                                .iter()
+                                .map(|(provider_id, _)| provider_id.as_str())
+                                .collect();
+                            format!("{line} — already on: {}", names.join(", "))
+                        }
+                        None => line,
+                    }
                 })
                 .collect();
+            items.extend(others.iter().map(|(_, line)| line.clone()));
             items.push(Self::CONFIGURE_DIFFERENT_MODELS_LABEL.to_string());
 
             let mut defaults = vec![true; filtered.len()];
+            defaults.extend(vec![false; others.len()]);
             defaults.push(false);
 
             let selected = ui.multi_select("Select models to configure", &items, &defaults)?;
 
             configure_different = selected.contains(&escape_hatch_idx);
-            chosen = selected
-                .into_iter()
-                .filter(|&i| i < escape_hatch_idx)
-                .map(|i| filtered[i].0.clone())
-                .collect();
+            for i in selected {
+                if i < filtered.len() {
+                    chosen.insert(filtered[i].0.clone());
+                } else if i < escape_hatch_idx {
+                    picks.push(others[i - filtered.len()].0.clone());
+                }
+            }
         }
 
         if configure_different {
@@ -2559,7 +2871,48 @@ impl SetupCommands {
             chosen.extend(manual);
         }
 
-        Ok(chosen)
+        Ok((chosen, picks))
+    }
+
+    /// The models in `served.others` that meet the requirement of a model
+    /// slot of a capability in `selected_caps`, or all of them when no
+    /// selected capability asks for a model, each with its line in the
+    /// model picker. An id with a control character is left out, as sync
+    /// leaves it out.
+    fn served_model_options(
+        served: &ServedModels,
+        selected_caps: &HashSet<String>,
+    ) -> Vec<(ServedPick, String)> {
+        let requirements = model_requirements(selected_caps);
+        served
+            .others
+            .iter()
+            .filter(|(_, model)| !model.id.chars().any(char::is_control))
+            .filter_map(|(provider_id, model)| {
+                let instance = served_instance(provider_id, model)?;
+                let admitted = requirements.is_empty()
+                    || requirements
+                        .iter()
+                        .any(|req| admits_served(req, &*instance));
+                if !admitted {
+                    return None;
+                }
+                let name = instance.family();
+                let line = if name.is_empty() || name == model.id {
+                    format!("{} — on {provider_id}, not in the catalog", model.id)
+                } else {
+                    format!(
+                        "{} — {name} — on {provider_id}, not in the catalog",
+                        model.id
+                    )
+                };
+                let pick = ServedPick {
+                    provider_id: provider_id.clone(),
+                    wire_id: model.id.clone(),
+                };
+                Some((pick, line))
+            })
+            .collect()
     }
 
     /// Escape hatch from `select_models`: lets the user pick directly from
@@ -2678,6 +3031,7 @@ impl SetupCommands {
         selected_launchers: &HashSet<String>,
         selected_providers: &HashSet<String>,
         selected_models: &HashSet<String>,
+        served_picks: &[ServedPick],
         selected_variants: &HashMap<String, ModelVariant>,
         resolved_capability_models: &HashMap<String, HashMap<String, String>>,
         // launcher_type -> capability_types that launcher's own effective
@@ -2726,6 +3080,8 @@ impl SetupCommands {
             }
         }
 
+        let served = served_models(discovery);
+
         // Configure models. Providers were just configured above, so
         // `ctx.config` already has real entries for every id in
         // `selected_providers` -- look one up and construct it live to
@@ -2756,9 +3112,23 @@ impl SetupCommands {
                 })
             });
 
+            // A selected provider that already serves the model in that
+            // variant runs it.
+            let serving = |v: &ModelVariant| {
+                served
+                    .served_variant(model_id, selected_providers)
+                    .filter(|(_, sv)| {
+                        sv.format.eq_ignore_ascii_case(&v.format)
+                            && sv.precision.eq_ignore_ascii_case(&v.precision)
+                    })
+                    .map(|(provider_id, _)| provider_id.clone())
+            };
             let (provider_id, variant) = match &chosen_variant {
                 Some(v) => (
-                    Self::find_compatible_provider(model_id, v, selected_providers, ctx)
+                    serving(v)
+                        .or_else(|| {
+                            Self::find_compatible_provider(model_id, v, selected_providers, ctx)
+                        })
                         .or_else(|| selected_providers.iter().next().cloned()),
                     Some(format!("{}/{}", v.format, v.precision)),
                 ),
@@ -2793,6 +3163,11 @@ impl SetupCommands {
             }
         }
 
+        // The server models the user picked, written as sync writes them,
+        // so the capabilities below can name them. Sync finds them present.
+        let served_instances =
+            Self::configure_served_models(ctx, &served, served_picks, selected_providers);
+
         // Configure capabilities
         for cap_type in selected_caps {
             let dependencies = CAPABILITY_REGISTRY
@@ -2813,6 +3188,7 @@ impl SetupCommands {
                 &cap_cfg,
                 resolved_capability_models,
                 selected_models,
+                &served_instances,
             ) else {
                 ui.warn(&format!(
                     "Skipping '{cap_type}': no compatible model available."
@@ -2974,14 +3350,16 @@ impl SetupCommands {
     /// The model id for each model slot in `dependencies`, keyed by the
     /// slot's `config_key`. A slot gets the model `resolved_capability_models`
     /// lists for `cap_type` and that `config_key`, otherwise the result of
-    /// `find_model_for_capability`. An optional slot with no model is left
-    /// out. Returns `None` when any required slot has no model.
+    /// `find_model_for_capability`, otherwise the first of `served_instances`
+    /// that meets the slot's requirement. An optional slot with no model is
+    /// left out. Returns `None` when any required slot has no model.
     fn capability_model_ids(
         cap_type: &str,
         dependencies: &[Dependency],
         cap_cfg: &crate::config::CapabilityConfig,
         resolved_capability_models: &HashMap<String, HashMap<String, String>>,
         selected_models: &HashSet<String>,
+        served_instances: &[(String, Box<dyn crate::models::Model>)],
     ) -> Option<HashMap<String, String>> {
         // Base model slots from the capability's config (e.g. "model_id" →
         // "my-model") using the shared utility.
@@ -2994,6 +3372,7 @@ impl SetupCommands {
             let Dependency::Model {
                 config_key,
                 required,
+                requirement,
                 ..
             } = dep
             else {
@@ -3002,7 +3381,13 @@ impl SetupCommands {
             let model_id = resolved_capability_models
                 .get(cap_type)
                 .and_then(|slots| slots.get(config_key.as_str()).cloned())
-                .or_else(|| Self::find_model_for_capability(cap_type, selected_models));
+                .or_else(|| Self::find_model_for_capability(cap_type, selected_models))
+                .or_else(|| {
+                    served_instances
+                        .iter()
+                        .find(|(_, model)| admits_served(requirement, &**model))
+                        .map(|(id, _)| id.clone())
+                });
             match model_id {
                 Some(id) => {
                     model_ids.insert(config_key.clone(), id);
@@ -3012,6 +3397,74 @@ impl SetupCommands {
             }
         }
         Some(model_ids)
+    }
+
+    /// Writes each model in `served_picks` as sync writes a model a provider
+    /// lists, from the listing in `served`, and returns them as instances by
+    /// configured id, in pick order. A pick already configured is returned
+    /// as it is. A pick whose provider was not selected is skipped with a
+    /// warning.
+    fn configure_served_models(
+        ctx: &mut crate::AppContext,
+        served: &ServedModels,
+        served_picks: &[ServedPick],
+        selected_providers: &HashSet<String>,
+    ) -> Vec<(String, Box<dyn crate::models::Model>)> {
+        let ui = std::sync::Arc::clone(&ctx.ui);
+        let mut instances = Vec::new();
+        for pick in served_picks {
+            let provider_type = ctx
+                .config()
+                .get_provider(&pick.provider_id)
+                .map(|pc| pc.provider_type.clone());
+            let (true, Some(provider_type)) = (
+                selected_providers.contains(&pick.provider_id),
+                provider_type,
+            ) else {
+                ui.warn(&format!(
+                    "Skipping '{}': provider '{}' was not selected.",
+                    pick.wire_id, pick.provider_id
+                ));
+                continue;
+            };
+            let Some((_, model)) = served.others.iter().find(|(provider_id, model)| {
+                *provider_id == pick.provider_id && model.id == pick.wire_id
+            }) else {
+                continue;
+            };
+            if served_instance_id(ctx, pick).is_none() {
+                ui.info(&format!("\nConfiguring model: {}...", pick.wire_id));
+                let plan = crate::models::discovery::plan(
+                    &pick.provider_id,
+                    &provider_type,
+                    std::slice::from_ref(*model),
+                    &ctx.config().models,
+                    &HashMap::new(),
+                );
+                // The additions only: the plan is for a listing of this one
+                // model, so its removals are every other model discovery
+                // manages for the provider.
+                if let Err(error) = ctx.config_mut().apply_model_changes(plan.additions, &[]) {
+                    ui.warn(&format!(
+                        "Failed to save model config for '{}': {error}",
+                        pick.wire_id
+                    ));
+                    continue;
+                }
+            }
+            let Some(instance_id) = served_instance_id(ctx, pick) else {
+                continue;
+            };
+            let instance = ctx.config().get_model(&instance_id).and_then(|mc| {
+                MODEL_REGISTRY
+                    .construct(&mc.model_type, &instance_id, &mc.config)
+                    .ok()
+            });
+            if let Some(instance) = instance {
+                instances.push((instance_id, instance));
+            }
+        }
+        instances
     }
 
     /// Find a model_id from selected_models that satisfies a capability's model
@@ -3264,6 +3717,7 @@ mod tests {
                 discovered_base_url: is_healthy
                     .then(|| metadata.default_base_urls.first().cloned())
                     .flatten(),
+                served_models: Vec::new(),
             });
         }
         configured.sort();
@@ -4039,7 +4493,8 @@ mod tests {
         let chosen =
             SetupCommands::select_models(&mut ctx, &discovery, &selected_caps, &selected_launchers)
                 .await
-                .unwrap();
+                .unwrap()
+                .0;
 
         assert_eq!(
             chosen,
@@ -4080,7 +4535,8 @@ mod tests {
         let _ =
             SetupCommands::select_models(&mut ctx, &discovery, &selected_caps, &selected_launchers)
                 .await
-                .unwrap();
+                .unwrap()
+                .0;
         let idx = {
             let prompts = capture.multi_select_prompts.borrow();
             assert_eq!(prompts.len(), 1, "expected exactly one multi_select prompt");
@@ -4115,7 +4571,8 @@ mod tests {
         let chosen =
             SetupCommands::select_models(&mut ctx, &discovery, &selected_caps, &selected_launchers)
                 .await
-                .unwrap();
+                .unwrap()
+                .0;
         assert_eq!(chosen, HashSet::from(["granite-4.2-3b".to_string()]));
     }
 
@@ -4145,6 +4602,7 @@ mod tests {
             &selected_launchers,
             &selected_providers,
             &selected_models,
+            &[],
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -4210,6 +4668,7 @@ mod tests {
             &selected_launchers,
             &selected_providers,
             &selected_models,
+            &[],
             &HashMap::new(),
             &HashMap::new(),
             &recommended_capability_types_by_launcher,
@@ -4819,6 +5278,7 @@ mod tests {
                     health_healthy: true,
                     health_error: None,
                     discovered_base_url: Some("http://localhost:11434".to_string()),
+                    served_models: Vec::new(),
                 },
                 Recommendation::Capability {
                     capability_type: "sub-agent-explore".to_string(),
@@ -5016,6 +5476,7 @@ mod tests {
                     health_healthy: false,
                     health_error: Some("not running".to_string()),
                     discovered_base_url: None,
+                    served_models: Vec::new(),
                 },
             ],
             all_model_candidates: vec![],
@@ -5028,7 +5489,7 @@ mod tests {
         // No canned multi_select answers — when the queue is empty,
         // CaptureUi returns vec![] (empty selection), so the loop returns
         // immediately without entering the escape-hatch branch.
-        SetupCommands::select_providers(&mut ctx, &discovery, &HashSet::new())
+        SetupCommands::select_providers(&mut ctx, &discovery, &HashSet::new(), &[])
             .await
             .unwrap();
 
@@ -5077,9 +5538,10 @@ mod tests {
         );
         capture.multi_select_answers.borrow_mut().push_back(vec![0]);
 
-        let selected = SetupCommands::select_providers(&mut ctx, &no_discovery(), &HashSet::new())
-            .await
-            .unwrap();
+        let selected =
+            SetupCommands::select_providers(&mut ctx, &no_discovery(), &HashSet::new(), &[])
+                .await
+                .unwrap();
 
         assert_eq!(selected, HashSet::from(["ollama".to_string()]));
         let prompts = capture.multi_select_prompts.borrow();
@@ -5111,7 +5573,7 @@ mod tests {
             .extend([vec![], vec![0]]);
         let models = HashSet::from(["granite-4.2-8b".to_string()]);
 
-        let selected = SetupCommands::select_providers(&mut ctx, &no_discovery(), &models)
+        let selected = SetupCommands::select_providers(&mut ctx, &no_discovery(), &models, &[])
             .await
             .unwrap();
 
@@ -5170,6 +5632,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &selected_models,
+            &[],
             &selected_variants,
             &HashMap::new(),
             &HashMap::new(),
@@ -5224,6 +5687,7 @@ mod tests {
                 health_healthy: true,
                 health_error: None,
                 discovered_base_url: Some(discovered_base_url.to_string()),
+                served_models: Vec::new(),
             }],
             all_model_candidates: vec![],
             configured_provider_ids: vec![],
@@ -5239,6 +5703,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::from(["llama-cpp".to_string()]),
             &HashSet::new(),
+            &[],
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -5283,6 +5748,7 @@ mod tests {
             &HashSet::new(),
             &selected_providers,
             &HashSet::new(),
+            &[],
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -5334,6 +5800,7 @@ mod tests {
             &selected_launchers,
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -5379,6 +5846,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -5513,6 +5981,7 @@ mod tests {
             &launchers,
             &providers,
             &models,
+            &[],
             &HashMap::new(),
             &resolved,
             &HashMap::new(),
@@ -5660,6 +6129,7 @@ mod tests {
             &HashSet::new(),
             &string_set(&["ollama"]),
             &string_set(&["granite-4.2-3b"]),
+            &[],
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -5711,6 +6181,7 @@ mod tests {
             &cap_cfg,
             &resolved,
             &HashSet::new(),
+            &[],
         );
 
         assert_eq!(model_ids, None);
@@ -5738,6 +6209,7 @@ mod tests {
             &cap_cfg,
             &resolved,
             &HashSet::new(),
+            &[],
         );
 
         assert_eq!(
@@ -5773,6 +6245,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -5847,6 +6320,7 @@ mod tests {
                 health_healthy: true,
                 health_error: None,
                 discovered_base_url: Some("http://localhost:8080".to_string()),
+                served_models: Vec::new(),
             }],
             all_model_candidates: vec![],
             configured_provider_ids: vec![],
@@ -6485,5 +6959,487 @@ mod tests {
             .filter(|m| m.starts_with("Capability 'agent-model'"));
         assert_eq!(headers.count(), 1, "{infos:?}");
         assert_eq!(infos.len(), 3, "{infos:?}");
+    }
+
+    // -- models the providers found serve --------------------------------------
+
+    /// A model as a provider's listing reports it.
+    fn listed(
+        id: &str,
+        model_type: ModelType,
+        functions: &[ModelFunction],
+    ) -> crate::providers::ProviderModel {
+        crate::providers::ProviderModel {
+            id: id.to_string(),
+            display_name: None,
+            context_length: Some(8192),
+            parameter_count: None,
+            disk_size_bytes: None,
+            model_type: Some(model_type),
+            supported_functions: functions.to_vec(),
+        }
+    }
+
+    /// A listed chat model with tool calling.
+    fn chat(id: &str) -> crate::providers::ProviderModel {
+        listed(
+            id,
+            ModelType::Text,
+            &[ModelFunction::Chat, ModelFunction::ToolCalling],
+        )
+    }
+
+    /// The `nth` variant of catalog model `model_id` a provider of
+    /// `provider_type` can run, with the name it serves the model under in
+    /// that variant.
+    fn served_name(provider_type: &str, model_id: &str, nth: usize) -> (String, ModelVariant) {
+        let provider = PROVIDER_REGISTRY
+            .construct(
+                provider_type,
+                provider_type,
+                &PROVIDER_REGISTRY.default_config(provider_type),
+            )
+            .unwrap();
+        let md = MODEL_REGISTRY.get(model_id).unwrap();
+        let variant = md
+            .variants
+            .iter()
+            .filter(|v| provider.can_run_model(&v.format, &v.precision))
+            .nth(nth)
+            .unwrap_or_else(|| panic!("{provider_type} runs no variant {nth} of {model_id}"))
+            .clone();
+        (wire_name(&*provider, model_id, &variant), variant)
+    }
+
+    /// `discovery`, with the healthy provider `provider_type` listing
+    /// `models`.
+    fn serving(
+        mut discovery: DiscoveryResult,
+        provider_type: &str,
+        models: Vec<crate::providers::ProviderModel>,
+    ) -> DiscoveryResult {
+        for rec in &mut discovery.recommendations {
+            if let Recommendation::Provider {
+                provider_type: found,
+                health_healthy: true,
+                served_models,
+                ..
+            } = rec
+                && *found == provider_type
+            {
+                *served_models = models;
+                return discovery;
+            }
+        }
+        panic!("{provider_type} is not a healthy provider in this discovery");
+    }
+
+    fn same_variant(a: &ModelVariant, b: &ModelVariant) -> bool {
+        a.format == b.format && a.precision == b.precision
+    }
+
+    fn pick(provider_id: &str, wire_id: &str) -> ServedPick {
+        ServedPick {
+            provider_id: provider_id.to_string(),
+            wire_id: wire_id.to_string(),
+        }
+    }
+
+    /// An Ollama server answering `/api/tags` with `names`. It has no
+    /// `/api/show`, so each model gets the listing's defaults.
+    async fn ollama_listing(names: &[&str]) -> String {
+        use axum::{Json, Router, routing::get};
+        let body = serde_json::json!({
+            "models": names
+                .iter()
+                .map(|name| serde_json::json!({ "name": name, "model": name }))
+                .collect::<Vec<_>>(),
+        });
+        let app = Router::new().route(
+            "/api/tags",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_wizard_records_what_each_provider_found_serves() {
+        let base_url = ollama_listing(&["llama3:8b"]).await;
+        let mut recommendations = vec![
+            Recommendation::Provider {
+                provider_type: "ollama",
+                provider_name: "Ollama".to_string(),
+                health_healthy: true,
+                health_error: None,
+                discovered_base_url: Some(base_url),
+                served_models: Vec::new(),
+            },
+            Recommendation::Provider {
+                provider_type: "llama-cpp",
+                provider_name: "llama.cpp".to_string(),
+                health_healthy: false,
+                health_error: Some("not running".to_string()),
+                discovered_base_url: None,
+                served_models: Vec::new(),
+            },
+        ];
+
+        Discover::list_served_models(&mut recommendations).await;
+
+        let served: Vec<Vec<String>> = recommendations
+            .iter()
+            .map(|rec| match rec {
+                Recommendation::Provider { served_models, .. } => {
+                    served_models.iter().map(|m| m.id.clone()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(served, vec![vec!["llama3:8b".to_string()], Vec::new()]);
+    }
+
+    #[tokio::test]
+    async fn a_listed_model_is_a_catalog_model_when_served_under_its_name() {
+        let ctx = test_ctx();
+        let (name, variant) = served_name("ollama", "granite-4.2-8b", 0);
+        let discovery = serving(
+            run_discovery(&ctx).await,
+            "ollama",
+            vec![chat(&name), chat("llama3:8b")],
+        );
+
+        let served = served_models(&discovery);
+
+        let on_servers = &served.catalog["granite-4.2-8b"];
+        assert_eq!(on_servers.len(), 1);
+        assert_eq!(on_servers[0].0, "ollama");
+        assert!(same_variant(&on_servers[0].1, &variant));
+        let others: Vec<(&str, &str)> = served
+            .others
+            .iter()
+            .map(|(provider_id, model)| (provider_id.as_str(), model.id.as_str()))
+            .collect();
+        assert_eq!(others, vec![("ollama", "llama3:8b")]);
+    }
+
+    #[tokio::test]
+    async fn only_server_models_a_selected_capability_can_use_are_offered() {
+        let ctx = test_ctx();
+        let discovery = serving(
+            run_discovery(&ctx).await,
+            "ollama",
+            vec![
+                chat("llama3:8b"),
+                listed(
+                    "nomic-embed-text:latest",
+                    ModelType::Embedding,
+                    &[ModelFunction::Embeddings],
+                ),
+            ],
+        );
+        let served = served_models(&discovery);
+        let lines = |caps: &[&str]| -> Vec<String> {
+            SetupCommands::served_model_options(&served, &string_set(caps))
+                .into_iter()
+                .map(|(_, line)| line)
+                .collect()
+        };
+
+        assert_eq!(
+            lines(&["agent-model"]),
+            vec!["llama3:8b — on ollama, not in the catalog".to_string()]
+        );
+        assert_eq!(lines(&[]).len(), 2, "no capability asks for a model");
+    }
+
+    #[tokio::test]
+    async fn the_model_list_marks_catalog_models_a_server_has_and_offers_the_others() {
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
+        let discovery = run_discovery(&ctx).await;
+        let Some(Recommendation::Model { model_id, .. }) = discovery
+            .recommendations
+            .iter()
+            .find(|r| matches!(r, Recommendation::Model { .. }))
+        else {
+            panic!("discovery recommends no model");
+        };
+        let model_id = model_id.clone();
+        let (name, _) = served_name("ollama", &model_id, 0);
+        let discovery = serving(discovery, "ollama", vec![chat(&name), chat("llama3:8b")]);
+        let server_only = "llama3:8b — on ollama, not in the catalog";
+        let index = {
+            let served = served_models(&discovery);
+            let options = SetupCommands::model_options(Revaluator::for_models(
+                &discovery.recommendations,
+                &HashSet::new(),
+            ));
+            assert!(SetupCommands::served_model_options(&served, &HashSet::new()).len() == 1);
+            options.len()
+        };
+        capture
+            .multi_select_answers
+            .borrow_mut()
+            .push_back(vec![index]);
+
+        let (models, picks) =
+            SetupCommands::select_models(&mut ctx, &discovery, &HashSet::new(), &HashSet::new())
+                .await
+                .unwrap();
+
+        let prompts = capture.multi_select_prompts.borrow();
+        let (_, items, defaults) = &prompts[0];
+        let catalog_line = items
+            .iter()
+            .find(|item| item.starts_with(&format!("{model_id} — ")))
+            .unwrap();
+        assert!(
+            catalog_line.ends_with("— already on: ollama"),
+            "{catalog_line}"
+        );
+        assert_eq!(items[index], server_only);
+        assert!(!defaults[index], "a server model is offered unchecked");
+        assert!(models.is_empty());
+        assert_eq!(picks, vec![pick("ollama", "llama3:8b")]);
+    }
+
+    #[tokio::test]
+    async fn the_provider_serving_a_picked_model_is_offered_checked() {
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
+        let (_, variant) = served_name("llama-cpp", "granite-4.2-8b", 0);
+        // The selected catalog model can run only on llama-cpp, which leaves
+        // ollama out of the providers offered for it.
+        let discovery = DiscoveryResult {
+            recommendations: vec![
+                Recommendation::Provider {
+                    provider_type: "llama-cpp",
+                    provider_name: "llama.cpp".to_string(),
+                    health_healthy: true,
+                    health_error: None,
+                    discovered_base_url: Some("http://localhost:8080".to_string()),
+                    served_models: Vec::new(),
+                },
+                Recommendation::Provider {
+                    provider_type: "ollama",
+                    provider_name: "Ollama".to_string(),
+                    health_healthy: true,
+                    health_error: None,
+                    discovered_base_url: Some("http://localhost:11434".to_string()),
+                    served_models: vec![chat("llama3:8b")],
+                },
+                Recommendation::Model {
+                    model_id: "granite-4.2-8b".to_string(),
+                    family: "Granite".to_string(),
+                    version: "4.2".to_string(),
+                    size: "8B".to_string(),
+                    best_variant: variant,
+                    context_fit: ContextFit::Full,
+                    can_run_by: vec!["llama-cpp".to_string()],
+                },
+            ],
+            ..no_discovery()
+        };
+        capture
+            .multi_select_answers
+            .borrow_mut()
+            .push_back(vec![0, 1]);
+
+        SetupCommands::select_providers(
+            &mut ctx,
+            &discovery,
+            &string_set(&["granite-4.2-8b"]),
+            &[pick("ollama", "llama3:8b")],
+        )
+        .await
+        .unwrap();
+
+        let prompts = capture.multi_select_prompts.borrow();
+        let (_, items, defaults) = &prompts[0];
+        let checked = |id: &str| {
+            let i = items
+                .iter()
+                .position(|item| item.starts_with(&format!("{id} — ")))
+                .unwrap_or_else(|| panic!("{id} is not offered: {items:?}"));
+            defaults[i]
+        };
+        assert!(checked("ollama"));
+        assert!(!checked("llama-cpp"));
+    }
+
+    #[tokio::test]
+    async fn a_model_a_selected_provider_serves_keeps_the_variant_it_has() {
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
+        // Not the first variant, which the ranking would likely pick.
+        let (name, variant) = served_name("ollama", "granite-4.2-8b", 1);
+        let discovery = serving(run_discovery(&ctx).await, "ollama", vec![chat(&name)]);
+
+        let chosen = SetupCommands::select_variants(
+            &mut ctx,
+            &discovery,
+            &string_set(&["granite-4.2-8b"]),
+            &string_set(&["ollama"]),
+        )
+        .await
+        .unwrap();
+
+        assert!(same_variant(&chosen["granite-4.2-8b"], &variant));
+        assert!(capture.select_prompts.borrow().is_empty());
+        assert!(
+            capture
+                .infos
+                .borrow()
+                .iter()
+                .any(|info| info.starts_with("'granite-4.2-8b' is already on ollama as ")),
+            "{:?}",
+            capture.infos.borrow()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_picked_server_model_is_written_and_bound_to_a_capability() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = test_ctx();
+        let discovery = serving(run_discovery(&ctx).await, "ollama", vec![chat("llama3:8b")]);
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &string_set(&["agent-model"]),
+            &HashSet::new(),
+            &string_set(&["ollama"]),
+            &HashSet::new(),
+            &[pick("ollama", "llama3:8b")],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let model = ctx.config().get_model("llama3:8b").expect("written");
+        let discovered = model.discovered.as_ref().expect("managed by sync");
+        assert_eq!(discovered.provider_id, "ollama");
+        assert_eq!(discovered.provider_model_id, "llama3:8b");
+        assert_eq!(
+            ctx.config().get_capability("agent-model").unwrap().config["model_id"],
+            "llama3:8b"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_picked_server_model_of_a_provider_not_selected_is_skipped() {
+        let _home = crate::config::TestConfigHome::new();
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
+        let discovery = serving(run_discovery(&ctx).await, "ollama", vec![chat("llama3:8b")]);
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &[pick("ollama", "llama3:8b")],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx.config().get_model("llama3:8b").is_none());
+        assert_eq!(
+            *capture.warns.borrow(),
+            vec!["Skipping 'llama3:8b': provider 'ollama' was not selected.".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catalog_model_runs_on_the_selected_provider_that_serves_it() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = test_ctx();
+        let (name, variant) = served_name("ollama", "granite-4.2-8b", 0);
+        let providers = providers_with_healthy(&ctx, &["llama-cpp", "ollama"]);
+        let discovery =
+            Discover::run_with_providers(&ctx, &test_hardware_profile(), providers).await;
+        let discovery = serving(discovery, "ollama", vec![chat(&name)]);
+        let selected_providers = string_set(&["llama-cpp", "ollama"]);
+
+        SetupCommands::configure_all(
+            &mut ctx,
+            &discovery,
+            &HashSet::new(),
+            &HashSet::new(),
+            &selected_providers,
+            &string_set(&["granite-4.2-8b"]),
+            &[],
+            &HashMap::from([("granite-4.2-8b".to_string(), variant.clone())]),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        // Without the listing, llama-cpp would run it.
+        assert_eq!(
+            SetupCommands::find_compatible_provider(
+                "granite-4.2-8b",
+                &variant,
+                &selected_providers,
+                &ctx
+            )
+            .as_deref(),
+            Some("llama-cpp")
+        );
+        assert_eq!(
+            ctx.config()
+                .get_model("granite-4.2-8b")
+                .unwrap()
+                .provider_id,
+            "ollama"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_already_on_its_provider_is_not_offered_for_pull() {
+        let mut ctx = test_ctx();
+        let (name, variant) = served_name("ollama", "granite-4.2-8b", 0);
+        let discovery = serving(run_discovery(&ctx).await, "ollama", vec![chat(&name)]);
+        for (model_id, variant) in [
+            ("granite-4.2-8b", variant.clone()),
+            (
+                "granite-4.2-3b",
+                served_name("ollama", "granite-4.2-3b", 0).1,
+            ),
+        ] {
+            ctx.config_mut().models.insert(
+                model_id.to_string(),
+                ModelConfig {
+                    discovered: None,
+                    model_id: model_id.to_string(),
+                    model_type: model_id.to_string(),
+                    config: serde_json::json!({}),
+                    provider_id: "ollama".to_string(),
+                    variant: Some(format!("{}/{}", variant.format, variant.precision)),
+                },
+            );
+        }
+
+        let to_pull = SetupCommands::not_yet_served(
+            &ctx,
+            &discovery,
+            &string_set(&["granite-4.2-8b", "granite-4.2-3b"]),
+        );
+
+        assert_eq!(to_pull, string_set(&["granite-4.2-3b"]));
     }
 }
