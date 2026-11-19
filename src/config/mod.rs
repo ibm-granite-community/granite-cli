@@ -11,10 +11,16 @@ use serde::{Deserialize, Serialize};
 use_channel!("CONF");
 
 pub(crate) mod hardware;
+pub(crate) mod host;
 pub(crate) mod recommended_config;
 pub(crate) mod validation;
 
 pub(crate) use hardware::HardwareConfig;
+pub(crate) use host::HostConfig;
+
+/// Where the release notes say how to convert a configuration written before
+/// hosts, with `scripts/convert-0027-hosts.sh`.
+const RELEASE_NOTES_URL: &str = "https://github.com/ibm-granite-community/granite-cli/releases";
 
 pub(crate) const PATH_DELIM: &str = "---";
 
@@ -66,6 +72,18 @@ impl ConfigPathTranslator for HardwareConfig {
     }
 }
 
+impl ConfigId for HostConfig {
+    fn config_id(&self) -> &str {
+        &self.host_id
+    }
+}
+
+impl ConfigPathTranslator for HostConfig {
+    fn config_mut(&mut self) -> Option<&mut serde_json::Value> {
+        None
+    }
+}
+
 impl ConfigId for recommended_config::RecommendedConfiguration {
     fn config_id(&self) -> &str {
         &self.launcher
@@ -86,6 +104,7 @@ pub(crate) struct Config {
     pub(crate) launchers: HashMap<String, LauncherConfig>,
     pub(crate) recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
     pub(crate) hardware: HashMap<String, HardwareConfig>,
+    pub(crate) hosts: HashMap<String, HostConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,19 +146,19 @@ pub(crate) struct ProviderConfig {
     #[serde(rename = "type")]
     pub(crate) provider_type: String,
     pub(crate) config: serde_json::Value,
-    /// The hardware profile this provider runs on, which fit is estimated
-    /// against. `None` for a file saved before this field existed: fit is
-    /// estimated against `local`, and the file is saved without the field
-    /// until the user chooses a link.
+    /// The host this provider runs on, whose devices fit is estimated
+    /// against. `None` for a file saved before providers were linked: fit is
+    /// estimated on `local`, and the file is saved without the field until
+    /// the user chooses a link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) hardware: Option<hardware::HardwareLink>,
+    pub(crate) host: Option<host::HostLink>,
 }
 
 impl ProviderConfig {
-    /// The hardware profile fit is estimated against: the saved link, or
-    /// `local` when none is saved.
-    pub(crate) fn hardware_link(&self) -> hardware::HardwareLink {
-        self.hardware.clone().unwrap_or_default()
+    /// The host fit is estimated on: the saved link, or `local` when none
+    /// is saved.
+    pub(crate) fn host_link(&self) -> host::HostLink {
+        self.host.clone().unwrap_or_default()
     }
 }
 
@@ -439,6 +458,10 @@ impl Config {
         Ok(Self::config_dir()?.join("hardware"))
     }
 
+    fn hosts_dir() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("hosts"))
+    }
+
     pub(crate) fn sessions_dir() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("sessions"))
     }
@@ -467,6 +490,7 @@ impl Config {
         fs::create_dir_all(Self::launchers_dir()?)?;
         fs::create_dir_all(Self::recommended_configs_dir()?)?;
         fs::create_dir_all(Self::hardware_dir()?)?;
+        fs::create_dir_all(Self::hosts_dir()?)?;
         fs::create_dir_all(Self::sessions_dir()?)?;
         Ok(())
     }
@@ -561,14 +585,83 @@ impl Config {
             recommended_configs_dir
         );
         config.models = Self::load_dir(models_dir, |s| s.to_string())?;
+        Self::refuse_hardware_links(providers_dir)?;
         config.providers = Self::load_dir(providers_dir, |s| s.to_string())?;
         config.capabilities = Self::load_dir(capabilities_dir, |s| s.to_string())?;
         config.launchers = Self::load_dir(launchers_dir, |s| s.to_string())?;
         config.recommended_configs = Self::load_recommended_configs(recommended_configs_dir)?;
         config.hardware = Self::load_dir(&Self::hardware_dir()?, |s| s.to_string())?;
         config.report_hardware_problems();
+        config.hosts = Self::load_dir(&Self::hosts_dir()?, |s| s.to_string())?;
+        config.check_host_memory_kinds()?;
 
         Ok(config)
+    }
+
+    /// Fails on the first provider file in `dir` that links to a hardware
+    /// profile with `hardware:`, as spec 0027 saved them, naming the file and
+    /// the conversion. Loading it would link the provider to `local`, which
+    /// is not what the user chose. A file that is not valid YAML is left to
+    /// `load_dir`, which skips it with a warning.
+    fn refuse_hardware_links(dir: &Path) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(serde_yaml::Value::Mapping(fields)) = serde_yaml::from_str(&content) else {
+                continue;
+            };
+            if fields.contains_key("hardware") {
+                anyhow::bail!(
+                    "{}: 'hardware' was replaced by 'host'. Convert the configuration with \
+                     scripts/convert-0027-hosts.sh, described in the release notes: \
+                     {RELEASE_NOTES_URL}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Fails on the first host, by id, whose devices have different memory
+    /// kinds, naming its file. Fit adds up the memory of a host's devices,
+    /// which is meaningless across kinds. A device whose profile is missing
+    /// or cannot be read is not counted here; the reference checks report
+    /// it.
+    fn check_host_memory_kinds(&self) -> Result<()> {
+        let mut ids: Vec<&String> = self.hosts.keys().collect();
+        ids.sort();
+        for id in ids {
+            let mut kinds: Vec<crate::utils::hardware::MemoryKind> = self.hosts[id]
+                .hardware
+                .iter()
+                .filter_map(|hw| self.hardware.get(hw)?.profile().ok())
+                .map(|p| p.memory.kind())
+                .collect();
+            kinds.sort();
+            kinds.dedup();
+            if kinds.len() > 1 {
+                let names: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
+                anyhow::bail!(
+                    "{}: host '{id}' lists devices with different memory kinds ({}); \
+                     a host lists devices of one memory kind. Edit the file to keep one \
+                     kind, or remove it",
+                    Self::hosts_dir()?
+                        .join(format!("{}.yaml", Self::id_to_filename(id)))
+                        .display(),
+                    names.join(", ")
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Loads the user recommended configs in `dir`. A `<launcher>.yaml` file
@@ -761,6 +854,16 @@ impl Config {
             Self::save_yaml_to_file(&path, hardware)?;
         }
 
+        // Save individual host files
+        if !self.hosts.is_empty() {
+            fs::create_dir_all(Self::hosts_dir()?)?;
+        }
+        for (id, host) in &self.hosts {
+            let path = Self::hosts_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
+            alog_channel!(MessageLevel::Debug3, "Saving to {:#?}", path);
+            Self::save_yaml_to_file(&path, host)?;
+        }
+
         Ok(())
     }
 
@@ -939,6 +1042,39 @@ impl Config {
         self.save()
     }
 
+    // -- Host --
+
+    pub(crate) fn get_host(&self, id: &str) -> Option<&HostConfig> {
+        self.hosts.get(id)
+    }
+
+    pub(crate) fn insert_host(&mut self, id: &str, config: HostConfig) -> Result<()> {
+        self.hosts.insert(id.to_string(), config);
+        self.save()
+    }
+
+    /// Removes a host. `local` is the machine granite-cli runs on and cannot
+    /// be removed.
+    pub(crate) fn remove_host(&mut self, id: &str) -> Result<()> {
+        if id == host::LOCAL_HOST_ID {
+            anyhow::bail!("host '{id}' is this machine and cannot be removed");
+        }
+        self.hosts.remove(id);
+        Self::remove_config_file(Self::hosts_dir(), id);
+        self.save()
+    }
+
+    /// The hardware profile ids of host `id`, one per device. The `local`
+    /// host lists the `local` profile until it is saved, as it is written
+    /// the first time it is needed. Empty for a host that is not configured.
+    pub(crate) fn host_hardware(&self, id: &str) -> Vec<String> {
+        match self.hosts.get(id) {
+            Some(host) => host.hardware.clone(),
+            None if id == host::LOCAL_HOST_ID => vec![hardware::LOCAL_HARDWARE_ID.to_string()],
+            None => Vec::new(),
+        }
+    }
+
     /// Every hardware profile whose figures cannot be looked up, such as one
     /// that uses a size a newer catalog no longer offers, with the reason,
     /// sorted by id.
@@ -993,7 +1129,7 @@ impl Default for ProviderConfig {
             provider_id: String::new(),
             provider_type: String::new(),
             config: serde_json::Value::Object(serde_json::Map::new()),
-            hardware: Some(hardware::HardwareLink::Local),
+            host: Some(host::HostLink::Local),
         }
     }
 }
@@ -1245,7 +1381,7 @@ mod tests {
         let result = config.insert_provider(
             "p1",
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "p1".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
@@ -1465,6 +1601,122 @@ mod tests {
         assert!(!hardware_dir().join("spark.yaml").exists());
     }
 
+    fn hosts_dir() -> PathBuf {
+        Config::hosts_dir().unwrap()
+    }
+
+    fn write(dir: &Path, name: &str, content: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn hosts_are_saved_and_loaded() {
+        let _home = TestConfigHome::new();
+        let mut config = Config::new().unwrap();
+        let box_host = HostConfig {
+            host_id: "box".to_string(),
+            address: "box.lan".to_string(),
+            hardware: vec!["rtx-4090".to_string(), "rtx-4090".to_string()],
+        };
+        config.insert_host("box", box_host.clone()).unwrap();
+
+        let reloaded = Config::new().unwrap();
+
+        assert_eq!(reloaded.get_host("box"), Some(&box_host));
+        assert!(hosts_dir().join("box.yaml").exists());
+    }
+
+    #[test]
+    fn local_host_cannot_be_removed_and_others_can() {
+        let _home = TestConfigHome::new();
+        let mut config = Config::new().unwrap();
+        config
+            .insert_host(host::LOCAL_HOST_ID, HostConfig::local())
+            .unwrap();
+        config
+            .insert_host(
+                "lab",
+                HostConfig {
+                    host_id: "lab".to_string(),
+                    address: "lab.lan".to_string(),
+                    hardware: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let err = config.remove_host(host::LOCAL_HOST_ID).unwrap_err();
+        config.remove_host("lab").unwrap();
+
+        assert_eq!(
+            err.to_string(),
+            "host 'local' is this machine and cannot be removed"
+        );
+        assert!(hosts_dir().join("local.yaml").exists());
+        assert!(!hosts_dir().join("lab.yaml").exists());
+    }
+
+    #[test]
+    fn the_local_host_lists_the_local_profile_until_it_is_saved() {
+        let config = Config::default();
+        assert_eq!(config.host_hardware(host::LOCAL_HOST_ID), vec!["local"]);
+        assert!(config.host_hardware("lab").is_empty());
+    }
+
+    #[test]
+    fn a_host_mixing_memory_kinds_does_not_load_and_names_its_file() {
+        let _home = TestConfigHome::new();
+        Config::ensure_directories_for_test();
+        write(
+            &hardware_dir(),
+            "card.yaml",
+            "hardware_id: card\ntype: nvidia-rtx-4090\nmemory: 24.0\n",
+        );
+        write(
+            &hardware_dir(),
+            "spark.yaml",
+            "hardware_id: spark\ntype: dgx-spark\nmemory: 128.0\n",
+        );
+        write(
+            &hosts_dir(),
+            "mixed.yaml",
+            "host_id: mixed\naddress: mixed.lan\nhardware:\n- card\n- spark\n",
+        );
+
+        let err = Config::new().unwrap_err().to_string();
+
+        assert!(err.contains("hosts/mixed.yaml: host 'mixed' lists devices with different memory kinds (discrete, unified)"), "{err}");
+    }
+
+    #[test]
+    fn a_provider_file_with_hardware_does_not_load_and_names_the_file_and_the_release_notes() {
+        let _home = TestConfigHome::new();
+        Config::ensure_directories_for_test();
+        write(
+            &Config::providers_dir().unwrap(),
+            "llama-cpp-pgx.yaml",
+            "provider_id: llama-cpp-pgx\ntype: llama-cpp\nconfig: {}\nhardware: pgx\n",
+        );
+
+        let err = Config::new().unwrap_err().to_string();
+
+        assert!(
+            err.contains("providers/llama-cpp-pgx.yaml: 'hardware' was replaced by 'host'"),
+            "{err}"
+        );
+        assert!(err.contains("scripts/convert-0027-hosts.sh"), "{err}");
+        assert!(err.contains(RELEASE_NOTES_URL), "{err}");
+    }
+
+    #[test]
+    fn a_provider_with_no_link_reads_as_local_and_is_saved_without_one() {
+        let yaml = "provider_id: ollama\ntype: ollama\nconfig: {}\n";
+        let p: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.host, None);
+        assert_eq!(p.host_link(), host::HostLink::Local);
+        assert!(!serde_yaml::to_string(&p).unwrap().contains("host"));
+    }
+
     #[test]
     fn not_specified_survives_a_save_and_load() {
         let _home = TestConfigHome::new();
@@ -1476,7 +1728,7 @@ mod tests {
                     provider_id: "vllm-lab".to_string(),
                     provider_type: "openai-compatible".to_string(),
                     config: serde_json::json!({}),
-                    hardware: Some(hardware::HardwareLink::Unspecified),
+                    host: Some(host::HostLink::Unspecified),
                 },
             )
             .unwrap();
@@ -1484,8 +1736,8 @@ mod tests {
         let reloaded = Config::new().unwrap();
 
         assert_eq!(
-            reloaded.get_provider("vllm-lab").unwrap().hardware,
-            Some(hardware::HardwareLink::Unspecified)
+            reloaded.get_provider("vllm-lab").unwrap().host,
+            Some(host::HostLink::Unspecified)
         );
     }
 }

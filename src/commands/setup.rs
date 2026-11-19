@@ -162,9 +162,8 @@ impl Discover {
             }
 
             let default_config = PROVIDER_REGISTRY.default_config(provider_type);
-            let runs_on_hardware =
-                crate::config::hardware::HardwareLink::default_for(provider_type)
-                    == crate::config::hardware::HardwareLink::Local;
+            let runs_on_hardware = crate::config::host::HostLink::default_for(provider_type)
+                == crate::config::host::HostLink::Local;
             let default_base_urls = ctx.default_base_urls(provider_type);
             let base_urls = match host {
                 Some(host) if runs_on_hardware => base_urls_at(&default_base_urls, host),
@@ -770,31 +769,30 @@ fn best_variant_among<'a>(
         .map(|(fit, v)| (v.clone(), fit))
 }
 
-/// The hardware profiles other than `local` that `variant` would run on,
-/// through the selected providers that can run it, as " (hardware: spark)".
-/// Empty when they all run on `local`, which is what the list shows without
-/// a note.
-fn variant_hardware_note(
+/// The hosts other than `local` that `variant` would run on, through the
+/// selected providers that can run it, as " (host: spark)". Empty when they
+/// all run on `local`, which is what the list shows without a note.
+fn variant_host_note(
     variant: &ModelVariant,
     selected_providers: &HashSet<String>,
     ctx: &crate::AppContext,
 ) -> String {
-    use crate::config::hardware::HardwareLink;
-    let mut profiles: Vec<String> = selected_providers
+    use crate::config::host::HostLink;
+    let mut hosts: Vec<String> = selected_providers
         .iter()
         .filter(|id| provider_can_run(id, variant, ctx))
         .filter_map(|id| match provider_link(id, ctx) {
-            HardwareLink::Profile(profile) => Some(profile),
-            HardwareLink::Unspecified => Some("not specified".to_string()),
-            HardwareLink::Local => None,
+            HostLink::Host(host) => Some(host),
+            HostLink::Unspecified => Some("not specified".to_string()),
+            HostLink::Local => None,
         })
         .collect();
-    profiles.sort();
-    profiles.dedup();
-    if profiles.is_empty() {
+    hosts.sort();
+    hosts.dedup();
+    if hosts.is_empty() {
         String::new()
     } else {
-        format!(" (hardware: {})", profiles.join(", "))
+        format!(" (host: {})", hosts.join(", "))
     }
 }
 
@@ -879,48 +877,34 @@ fn matching_catalog_ids(m: &recommended_config::StringMatch) -> Vec<String> {
     }
 }
 
-/// The hardware link of provider `provider_id`: its saved link when it is
+/// The host link of provider `provider_id`: its saved link when it is
 /// configured, otherwise the link setup gives a provider it adds under its
-/// type's name. That is the hardware the user named in the wizard for a
-/// type the user runs, and the default for its type otherwise: `local`, or
-/// "not specified" for a hosted type.
-fn provider_link(
-    provider_id: &str,
-    ctx: &crate::AppContext,
-) -> crate::config::hardware::HardwareLink {
-    use crate::config::hardware::HardwareLink;
+/// type's name. That is the host the user named in the wizard for a type
+/// the user runs, and the default for its type otherwise: `local`, or "not
+/// specified" for a hosted type.
+fn provider_link(provider_id: &str, ctx: &crate::AppContext) -> crate::config::host::HostLink {
+    use crate::config::host::HostLink;
     if let Some(pc) = ctx.config().get_provider(provider_id) {
-        return pc.hardware_link();
+        return pc.host_link();
     }
-    match (HardwareLink::default_for(provider_id), ctx.setup_link()) {
-        (HardwareLink::Local, Some(link)) => link.clone(),
+    match (HostLink::default_for(provider_id), ctx.setup_link()) {
+        (HostLink::Local, Some(link)) => link.clone(),
         (default, _) => default,
     }
 }
 
-/// The host in the base URL of the first configured provider, by id, that
-/// is linked to `link`, when `link` names a hardware profile.
-fn known_host(
-    link: &crate::config::hardware::HardwareLink,
-    ctx: &crate::AppContext,
-) -> Option<String> {
-    if !matches!(link, crate::config::hardware::HardwareLink::Profile(_)) {
-        return None;
-    }
-    let mut providers: Vec<&crate::config::ProviderConfig> = ctx
+/// The address of the first configured host, by id, that lists hardware
+/// profile `profile` and is not `local`.
+fn known_host(profile: &str, ctx: &crate::AppContext) -> Option<String> {
+    let mut hosts: Vec<&crate::config::HostConfig> = ctx
         .config()
-        .providers
+        .hosts
         .values()
-        .filter(|pc| pc.hardware_link() == *link)
+        .filter(|h| h.host_id != crate::config::host::LOCAL_HOST_ID)
+        .filter(|h| h.hardware.iter().any(|hw| hw == profile))
         .collect();
-    providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
-    providers.into_iter().find_map(|pc| {
-        let base_url = pc.config.get("base_url")?.as_str()?;
-        url::Url::parse(base_url)
-            .ok()?
-            .host_str()
-            .map(str::to_string)
-    })
+    hosts.sort_by(|a, b| a.host_id.cmp(&b.host_id));
+    hosts.first().map(|h| h.address.clone())
 }
 
 /// Whether provider `provider_id`, configured or about to be added under
@@ -932,8 +916,8 @@ fn provider_is_hosted(provider_id: &str, ctx: &crate::AppContext) -> bool {
         .config()
         .get_provider(provider_id)
         .map_or(provider_id, |pc| pc.provider_type.as_str());
-    crate::config::hardware::HardwareLink::default_for(provider_type)
-        == crate::config::hardware::HardwareLink::Unspecified
+    crate::config::host::HostLink::default_for(provider_type)
+        == crate::config::host::HostLink::Unspecified
 }
 
 /// Whether the provider `provider_id` can run `variant`. A provider in
@@ -1464,11 +1448,11 @@ fn provider_hardware(
     local: &HardwareProfile,
     ctx: &crate::AppContext,
 ) -> std::result::Result<HardwareProfile, String> {
-    use crate::config::hardware::HardwareLink;
+    use crate::config::host::HostLink;
     match provider_link(provider_id, ctx) {
-        HardwareLink::Local => Ok(local.clone()),
-        HardwareLink::Profile(id) => ctx.hardware_profile(&id),
-        HardwareLink::Unspecified => Err(format!("no hardware profile for '{provider_id}'")),
+        HostLink::Local => Ok(local.clone()),
+        HostLink::Host(id) => ctx.host_profile(&id),
+        HostLink::Unspecified => Err(format!("no host for '{provider_id}'")),
     }
 }
 
@@ -2095,14 +2079,20 @@ impl SetupCommands {
     /*-- Selection phases ----------------------------------------------------*/
 
     /// Asks which hardware to run models on, then the host name or IP
-    /// address of that hardware, and records the hardware as the link each
-    /// new provider of a type the user runs gets in this run. Returns the
-    /// host. The host is offered from a provider already linked to that
-    /// hardware, and is `localhost` otherwise.
+    /// address of that hardware, and records the host each new provider of a
+    /// type the user runs gets in this run: `local` for this machine's
+    /// hardware, the configured host at that address, or a new host with
+    /// that hardware, written before the first provider linked to it.
+    /// Returns the address. It is offered from a host that already lists
+    /// that hardware, and is `localhost` otherwise.
     fn select_target(ctx: &mut crate::AppContext) -> Result<String> {
-        let link = crate::commands::HardwareCommands::choose_target(ctx)?;
-        let default = known_host(&link, ctx).unwrap_or_else(|| "localhost".to_string());
-        let host = loop {
+        use crate::config::host::HostLink;
+        let profile = crate::commands::HardwareCommands::choose_target(ctx)?;
+        let default = profile
+            .as_deref()
+            .and_then(|p| known_host(p, ctx))
+            .unwrap_or_else(|| crate::config::host::LOCAL_ADDRESS.to_string());
+        let address = loop {
             let answer = ctx
                 .ui
                 .text("Host name or IP address of that hardware", &default)?;
@@ -2113,8 +2103,52 @@ impl SetupCommands {
             ctx.ui
                 .warn(&format!("'{answer}' is not a host name or IP address."));
         };
-        ctx.set_setup_link(link);
-        Ok(host)
+        // A host is found by its address, which no two hosts share. When
+        // it lists other hardware than the one chosen, the host wins, and
+        // the user is told.
+        let at_address = ctx
+            .config()
+            .hosts
+            .values()
+            .find(|h| h.address == address)
+            .cloned()
+            .or_else(|| {
+                (address == crate::config::host::LOCAL_ADDRESS)
+                    .then(crate::config::HostConfig::local)
+            });
+        if let (Some(p), Some(host)) = (&profile, &at_address)
+            && !host.hardware.contains(p)
+        {
+            ctx.ui.warn(&format!(
+                "{address} is host '{}', which lists {}; its providers are linked to it.",
+                host.host_id,
+                crate::commands::HardwareCommands::devices_summary(ctx, &host.host_id)
+            ));
+        }
+        let (link, new_host) = match profile {
+            None => (HostLink::Unspecified, None),
+            Some(p) if p == crate::config::hardware::LOCAL_HARDWARE_ID => (HostLink::Local, None),
+            Some(p) => match at_address {
+                Some(host) if host.host_id == crate::config::host::LOCAL_HOST_ID => {
+                    (HostLink::Local, None)
+                }
+                Some(host) => (HostLink::Host(host.host_id), None),
+                None => {
+                    let id = crate::config::host::free_id(
+                        &crate::config::host::default_id(&address, Some(&p)),
+                        ctx.config(),
+                    );
+                    let host = crate::config::HostConfig {
+                        host_id: id.clone(),
+                        address: address.clone(),
+                        hardware: vec![p],
+                    };
+                    (HostLink::Host(id), Some(host))
+                }
+            },
+        };
+        ctx.set_setup_link(link, new_host);
+        Ok(address)
     }
 
     async fn select_capabilities(
@@ -2638,7 +2672,7 @@ impl SetupCommands {
                     format!(
                         "{}{}",
                         Self::format_variant_option(v, *gb, md.context_length),
-                        variant_hardware_note(v, selected_providers, ctx)
+                        variant_host_note(v, selected_providers, ctx)
                     )
                 })
                 .collect();
@@ -2955,7 +2989,7 @@ impl SetupCommands {
 
     /*-- Configuration phase -------------------------------------------------*/
 
-    /// Offers to repair each configured provider whose hardware link is
+    /// Offers to repair each configured provider whose host link is
     /// broken, in id order, before setup estimates fit on that provider's
     /// hardware: the remediation prompt when `can_prompt`, a warning
     /// otherwise. Providers whose references resolve are not mentioned.
@@ -3005,11 +3039,17 @@ impl SetupCommands {
                 default_config["base_url"] = base_url.clone().into();
             }
 
+            let link = provider_link(provider_id, ctx);
+            if Some(&link) == ctx.setup_link()
+                && let Err(e) = ctx.write_setup_host()
+            {
+                ui.warn(&format!("Failed to save host for '{provider_id}': {e}"));
+            }
             let provider_config = crate::config::ProviderConfig {
                 provider_id: provider_id.clone(),
                 provider_type: provider_id.to_string(),
                 config: default_config,
-                hardware: Some(provider_link(provider_id, ctx)),
+                host: Some(link),
             };
 
             if ctx
@@ -3310,7 +3350,7 @@ impl SetupCommands {
         selected_providers: &HashSet<String>,
         ctx: &crate::AppContext,
     ) -> Option<String> {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let mut candidates: Vec<&String> = selected_providers
             .iter()
             .filter(|pid| {
@@ -3324,7 +3364,7 @@ impl SetupCommands {
                     .is_some_and(|p| p.can_run_model(&variant.format, &variant.precision))
             })
             .collect();
-        let on_local = |id: &str| provider_link(id, ctx) == HardwareLink::Local;
+        let on_local = |id: &str| provider_link(id, ctx) == HostLink::Local;
         candidates.sort_by_key(|id| (!on_local(id), id.as_str()));
         let md = MODEL_REGISTRY.get(model_id);
         let local = ctx
@@ -3736,7 +3776,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             id.to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: id.to_string(),
                 provider_type: provider_type.to_string(),
                 config,
@@ -4761,7 +4801,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({ "base_url": "http://127.0.0.1:1" }),
@@ -4871,7 +4911,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "lm-studio".to_string(),
             crate::config::ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "lm-studio".to_string(),
                 provider_type: "lm-studio".to_string(),
                 config: PROVIDER_REGISTRY.default_config("lm-studio"),
@@ -5577,7 +5617,7 @@ mod tests {
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
         capture.multi_select_answers.borrow_mut().push_back(vec![0]);
@@ -5608,7 +5648,7 @@ mod tests {
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
         capture
@@ -5776,7 +5816,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             provider_id.to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: provider_id.to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({"base_url": custom_url}),
@@ -6319,15 +6359,23 @@ mod tests {
 
     // -- fit per provider hardware ----------------------------------------------
 
-    /// A context with providers `(id, type, link)` and the `spark` catalog
-    /// profile, built in memory.
+    /// A context with providers `(id, type, link)`, the `spark` catalog
+    /// profile and the `spark` host listing it, built in memory.
     fn ctx_with_linked_providers(
-        providers: &[(&str, &str, crate::config::hardware::HardwareLink)],
+        providers: &[(&str, &str, crate::config::host::HostLink)],
     ) -> crate::AppContext {
         let mut config = Config::default();
         config.hardware.insert(
             "spark".to_string(),
             crate::config::HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+        );
+        config.hosts.insert(
+            "spark".to_string(),
+            crate::config::HostConfig {
+                host_id: "spark".to_string(),
+                address: "spark.lan".to_string(),
+                hardware: vec!["spark".to_string()],
+            },
         );
         for (id, provider_type, link) in providers {
             config.providers.insert(
@@ -6336,14 +6384,15 @@ mod tests {
                     provider_id: id.to_string(),
                     provider_type: provider_type.to_string(),
                     config: crate::providers::PROVIDER_REGISTRY.default_config(provider_type),
-                    hardware: Some(link.clone()),
+                    host: Some(link.clone()),
                 },
             );
         }
         crate::AppContext::new(config, Arc::new(CaptureUi::default()))
     }
 
-    /// A context with `local` and `spark` configured, and a discovery that
+    /// A context with `local` and the `spark` profile and host (at
+    /// `spark.lan`) configured, and a discovery that
     /// found llama-cpp running at `http://localhost:8080`.
     fn wizard_with_llama_cpp_found() -> (crate::AppContext, Arc<CaptureUi>, DiscoveryResult) {
         let mut config = Config::default();
@@ -6354,6 +6403,14 @@ mod tests {
         config.hardware.insert(
             "spark".to_string(),
             crate::config::HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+        );
+        config.hosts.insert(
+            "spark".to_string(),
+            crate::config::HostConfig {
+                host_id: "spark".to_string(),
+                address: "spark.lan".to_string(),
+                hardware: vec!["spark".to_string()],
+            },
         );
         let capture = Arc::new(CaptureUi::default());
         let ctx = crate::AppContext::new(config, capture.clone());
@@ -6377,7 +6434,7 @@ mod tests {
 
     #[test]
     fn the_wizard_saves_a_found_provider_on_the_hardware_named_with_the_address_found() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let _home = crate::config::TestConfigHome::new();
         let (mut ctx, capture, mut discovery) = wizard_with_llama_cpp_found();
         if let Recommendation::Provider {
@@ -6387,16 +6444,13 @@ mod tests {
         {
             *discovered_base_url = Some("http://spark:8080".to_string());
         }
-        ctx.set_setup_link(HardwareLink::Profile("spark".to_string()));
+        ctx.set_setup_link(HostLink::Host("spark".to_string()), None);
         let selected: HashSet<String> = ["llama-cpp".to_string()].into();
 
         SetupCommands::configure_new_providers(&mut ctx, &discovery, &selected);
 
         let provider = ctx.config().get_provider("llama-cpp").unwrap();
-        assert_eq!(
-            provider.hardware,
-            Some(HardwareLink::Profile("spark".to_string()))
-        );
+        assert_eq!(provider.host, Some(HostLink::Host("spark".to_string())));
         assert_eq!(provider.config["base_url"], "http://spark:8080");
         assert!(capture.select_prompts.borrow().is_empty());
         assert!(capture.text_prompts.borrow().is_empty());
@@ -6404,7 +6458,7 @@ mod tests {
 
     #[test]
     fn auto_setup_saves_a_found_provider_on_its_default_link() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let _home = crate::config::TestConfigHome::new();
         let (mut ctx, _capture, discovery) = wizard_with_llama_cpp_found();
         let selected: HashSet<String> = ["llama-cpp".to_string()].into();
@@ -6412,13 +6466,13 @@ mod tests {
         SetupCommands::configure_new_providers(&mut ctx, &discovery, &selected);
 
         let provider = ctx.config().get_provider("llama-cpp").unwrap();
-        assert_eq!(provider.hardware, Some(HardwareLink::Local));
+        assert_eq!(provider.host, Some(HostLink::Local));
         assert_eq!(provider.config["base_url"], "http://localhost:8080");
     }
 
     #[test]
-    fn the_wizard_records_the_hardware_named_and_returns_the_host() {
-        use crate::config::hardware::HardwareLink;
+    fn the_wizard_links_to_the_host_at_the_address_named() {
+        use crate::config::host::HostLink;
         let (mut ctx, capture, _) = wizard_with_llama_cpp_found();
         capture.select_answers.borrow_mut().push_back(1); // spark
         capture
@@ -6429,35 +6483,69 @@ mod tests {
         let host = SetupCommands::select_target(&mut ctx).unwrap();
 
         assert_eq!(host, "spark.lan");
-        assert_eq!(
-            ctx.setup_link(),
-            Some(&HardwareLink::Profile("spark".to_string()))
-        );
+        assert_eq!(ctx.setup_link(), Some(&HostLink::Host("spark".to_string())));
         let selects = capture.select_prompts.borrow();
         assert_eq!(selects[0].0, "Hardware to run models on");
-        let texts = capture.text_prompts.borrow();
-        assert_eq!(texts[0].1, "localhost");
+        // The address of the host that lists that hardware.
+        assert_eq!(capture.text_prompts.borrow()[0].1, "spark.lan");
     }
 
     #[test]
-    fn the_wizard_offers_the_host_of_a_provider_already_on_that_hardware() {
-        use crate::config::hardware::HardwareLink;
+    fn an_address_of_a_host_with_other_hardware_links_to_that_host_with_a_warning() {
+        use crate::config::host::HostLink;
         let (mut ctx, capture, _) = wizard_with_llama_cpp_found();
-        ctx.config_mut().providers.insert(
-            "lab".to_string(),
-            crate::config::ProviderConfig {
-                provider_id: "lab".to_string(),
-                provider_type: "llama-cpp".to_string(),
-                config: serde_json::json!({ "base_url": "http://spark.lan:8080" }),
-                hardware: Some(HardwareLink::Profile("spark".to_string())),
-            },
-        );
         capture.select_answers.borrow_mut().push_back(1); // spark
+        capture
+            .text_answers
+            .borrow_mut()
+            .push_back("localhost".to_string());
 
-        let host = SetupCommands::select_target(&mut ctx).unwrap();
+        SetupCommands::select_target(&mut ctx).unwrap();
 
-        assert_eq!(host, "spark.lan");
-        assert_eq!(capture.text_prompts.borrow()[0].1, "spark.lan");
+        assert_eq!(ctx.setup_link(), Some(&HostLink::Local));
+        let warns = capture.warns.borrow();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].starts_with("localhost is host 'local', which lists local ("),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn the_wizard_writes_a_new_host_before_the_first_provider_on_it() {
+        use crate::config::host::HostLink;
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, capture, discovery) = wizard_with_llama_cpp_found();
+        capture.select_answers.borrow_mut().push_back(1); // spark
+        capture
+            .text_answers
+            .borrow_mut()
+            .push_back("10.0.0.12".to_string());
+
+        SetupCommands::select_target(&mut ctx).unwrap();
+        assert!(
+            ctx.config().get_host("spark-2").is_none(),
+            "not written yet"
+        );
+        SetupCommands::configure_new_providers(
+            &mut ctx,
+            &discovery,
+            &["llama-cpp".to_string()].into(),
+        );
+
+        // The id for an IP address is the profile's, which `spark` has.
+        assert_eq!(
+            ctx.config().get_host("spark-2"),
+            Some(&crate::config::HostConfig {
+                host_id: "spark-2".to_string(),
+                address: "10.0.0.12".to_string(),
+                hardware: vec!["spark".to_string()],
+            })
+        );
+        assert_eq!(
+            ctx.config().get_provider("llama-cpp").unwrap().host,
+            Some(HostLink::Host("spark-2".to_string()))
+        );
     }
 
     #[test]
@@ -6481,16 +6569,16 @@ mod tests {
 
     #[test]
     fn a_new_provider_the_user_runs_gets_the_hardware_named_in_the_wizard() {
-        use crate::config::hardware::HardwareLink;
-        let spark = HardwareLink::Profile("spark".to_string());
-        let mut ctx = ctx_with_linked_providers(&[("lab", "llama-cpp", HardwareLink::Local)]);
-        assert_eq!(provider_link("ollama", &ctx), HardwareLink::Local);
+        use crate::config::host::HostLink;
+        let spark = HostLink::Host("spark".to_string());
+        let mut ctx = ctx_with_linked_providers(&[("lab", "llama-cpp", HostLink::Local)]);
+        assert_eq!(provider_link("ollama", &ctx), HostLink::Local);
 
-        ctx.set_setup_link(spark.clone());
+        ctx.set_setup_link(spark.clone(), None);
 
         assert_eq!(provider_link("ollama", &ctx), spark);
-        assert_eq!(provider_link("openrouter", &ctx), HardwareLink::Unspecified);
-        assert_eq!(provider_link("lab", &ctx), HardwareLink::Local);
+        assert_eq!(provider_link("openrouter", &ctx), HostLink::Unspecified);
+        assert_eq!(provider_link("lab", &ctx), HostLink::Local);
     }
 
     #[test]
@@ -6519,7 +6607,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_wizard_ranks_models_on_the_hardware_named() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let recommends_30b = |d: &DiscoveryResult| {
             d.recommendations.iter().any(|r| {
                 matches!(r, Recommendation::Model { model_id, .. } if model_id == "granite-4.2-30b")
@@ -6530,7 +6618,7 @@ mod tests {
         let on_local = Discover::run_with_providers(&ctx, &small_local(), providers).await;
         assert!(!recommends_30b(&on_local));
 
-        ctx.set_setup_link(HardwareLink::Profile("spark".to_string()));
+        ctx.set_setup_link(HostLink::Host("spark".to_string()), None);
         let providers = providers_with_healthy(&ctx, &["ollama"]);
         let on_spark = Discover::run_with_providers(&ctx, &small_local(), providers).await;
 
@@ -6567,15 +6655,12 @@ mod tests {
 
     #[test]
     fn a_model_rejected_for_a_local_provider_is_accepted_on_larger_hardware() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let set = set_for("granite-4.2-30b", "GGUF");
 
-        let local_only = ctx_with_linked_providers(&[("ollama", "ollama", HardwareLink::Local)]);
-        let on_spark = ctx_with_linked_providers(&[(
-            "ollama",
-            "ollama",
-            HardwareLink::Profile("spark".to_string()),
-        )]);
+        let local_only = ctx_with_linked_providers(&[("ollama", "ollama", HostLink::Local)]);
+        let on_spark =
+            ctx_with_linked_providers(&[("ollama", "ollama", HostLink::Host("spark".to_string()))]);
         let ids = vec!["ollama".to_string()];
 
         assert!(resolve_model_set(&set, &small_local(), &ids, &local_only).is_none());
@@ -6585,10 +6670,35 @@ mod tests {
     }
 
     #[test]
+    fn fit_through_a_host_is_the_fit_on_the_profile_it_lists() {
+        use crate::config::host::HostLink;
+        let ctx =
+            ctx_with_linked_providers(&[("ollama", "ollama", HostLink::Host("spark".to_string()))]);
+        let spark = ctx.hardware_profile("spark").unwrap();
+        let through_host = provider_hardware("ollama", &small_local(), &ctx).unwrap();
+
+        for model_id in ["granite-4.2-3b", "granite-4.2-30b"] {
+            let md = MODEL_REGISTRY.get(model_id).unwrap();
+            for variant in &md.variants {
+                let fit = |hardware: &HardwareProfile| {
+                    crate::models::context_fit::estimate(
+                        md.context_length,
+                        &md.architecture,
+                        &md.native_dtype,
+                        variant,
+                        hardware,
+                    )
+                };
+                assert_eq!(fit(&through_host), fit(&spark), "{model_id} {variant:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_provider_without_a_hardware_profile_is_listed_and_not_selected() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let set = set_for("granite-4.2-3b", "GGUF");
-        let ctx = ctx_with_linked_providers(&[("ollama", "ollama", HardwareLink::Unspecified)]);
+        let ctx = ctx_with_linked_providers(&[("ollama", "ollama", HostLink::Unspecified)]);
         let ids = vec!["ollama".to_string()];
 
         assert!(resolve_model_set(&set, &test_hardware_profile(), &ids, &ctx).is_none());
@@ -6597,20 +6707,19 @@ mod tests {
         assert!(
             notes.len() == 1
                 && notes[0].starts_with("granite-4.2-3b on ollama (GGUF / ")
-                && notes[0].ends_with("): no hardware profile for 'ollama'"),
+                && notes[0].ends_with("): no host for 'ollama'"),
             "{notes:?}"
         );
     }
 
     #[test]
     fn a_hosted_variant_is_listed_and_not_selected() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let model = hosted_model_id();
         let set = set_for(&model, "OpenRouter");
         // The default link for a hosted type. The reason names the missing
         // size, not the missing hardware profile.
-        let ctx =
-            ctx_with_linked_providers(&[("openrouter", "openrouter", HardwareLink::Unspecified)]);
+        let ctx = ctx_with_linked_providers(&[("openrouter", "openrouter", HostLink::Unspecified)]);
         let ids = vec!["openrouter".to_string()];
 
         assert!(resolve_model_set(&set, &test_hardware_profile(), &ids, &ctx).is_none());
@@ -6624,7 +6733,7 @@ mod tests {
 
     #[test]
     fn a_size_less_variant_on_a_provider_the_user_runs_names_the_missing_size() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let model = hosted_model_id();
         let set = set_for(&model, "OpenRouter");
         // openai-compatible can serve the variant and is not hosted, so the
@@ -6632,7 +6741,7 @@ mod tests {
         let ctx = ctx_with_linked_providers(&[(
             "openai-compatible",
             "openai-compatible",
-            HardwareLink::Local,
+            HostLink::Local,
         )]);
         let ids = vec!["openai-compatible".to_string()];
 
@@ -6647,11 +6756,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_variant_default_follows_the_hardware_a_provider_is_linked_to() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let mut ctx = ctx_with_linked_providers(&[(
             "llama-cpp",
             "llama-cpp",
-            HardwareLink::Profile("spark".to_string()),
+            HostLink::Host("spark".to_string()),
         )]);
         ctx.config_mut().hardware.insert(
             crate::config::hardware::LOCAL_HARDWARE_ID.to_string(),
@@ -6705,13 +6814,13 @@ mod tests {
 
     #[test]
     fn the_variant_list_names_hardware_other_than_local() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let ctx = ctx_with_linked_providers(&[
-            ("ollama", "ollama", HardwareLink::Local),
+            ("ollama", "ollama", HostLink::Local),
             (
                 "llama-cpp",
                 "llama-cpp",
-                HardwareLink::Profile("spark".to_string()),
+                HostLink::Host("spark".to_string()),
             ),
         ]);
         let md = MODEL_REGISTRY.get("granite-4.2-30b").unwrap();
@@ -6720,27 +6829,21 @@ mod tests {
         let local_only: HashSet<String> = ["ollama".to_string()].into();
         let both: HashSet<String> = ["ollama".to_string(), "llama-cpp".to_string()].into();
 
-        assert_eq!(variant_hardware_note(gguf, &local_only, &ctx), "");
-        assert_eq!(
-            variant_hardware_note(gguf, &both, &ctx),
-            " (hardware: spark)"
-        );
+        assert_eq!(variant_host_note(gguf, &local_only, &ctx), "");
+        assert_eq!(variant_host_note(gguf, &both, &ctx), " (host: spark)");
     }
 
     #[test]
     fn min_context_length_is_checked_against_the_providers_hardware() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         // 64 GB of system RAM gives granite-4.2-30b only part of its context.
         let local =
             HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 64.0 });
         let mut set = set_for("granite-4.2-30b", "GGUF");
         let ids = vec!["ollama".to_string()];
-        let on_local = ctx_with_linked_providers(&[("ollama", "ollama", HardwareLink::Local)]);
-        let on_spark = ctx_with_linked_providers(&[(
-            "ollama",
-            "ollama",
-            HardwareLink::Profile("spark".to_string()),
-        )]);
+        let on_local = ctx_with_linked_providers(&[("ollama", "ollama", HostLink::Local)]);
+        let on_spark =
+            ctx_with_linked_providers(&[("ollama", "ollama", HostLink::Host("spark".to_string()))]);
 
         assert!(resolve_model_set(&set, &local, &ids, &on_local).is_some());
         set.min_context_length = Some(131_072);
@@ -6750,13 +6853,13 @@ mod tests {
 
     #[test]
     fn a_variant_keeps_its_best_fit_across_providers() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let ctx = ctx_with_linked_providers(&[
-            ("ollama", "ollama", HardwareLink::Local),
+            ("ollama", "ollama", HostLink::Local),
             (
                 "llama-cpp",
                 "llama-cpp",
-                HardwareLink::Profile("spark".to_string()),
+                HostLink::Host("spark".to_string()),
             ),
         ]);
         let md = MODEL_REGISTRY.get("granite-4.2-30b").unwrap();
@@ -6790,23 +6893,19 @@ mod tests {
         let selected: HashSet<String> = ["openrouter".to_string()].into_iter().collect();
 
         assert_eq!(
-            variant_hardware_note(hosted, &selected, &ctx),
-            " (hardware: not specified)"
+            variant_host_note(hosted, &selected, &ctx),
+            " (host: not specified)"
         );
     }
 
     #[test]
     fn a_model_is_bound_to_the_provider_where_its_variant_fits() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         // Named so that the id sorting first, `ollama`, is the one on the
         // small machine: only the fit can pick `z-llama`.
         let mut ctx = ctx_with_linked_providers(&[
-            ("ollama", "ollama", HardwareLink::Local),
-            (
-                "z-llama",
-                "llama-cpp",
-                HardwareLink::Profile("spark".to_string()),
-            ),
+            ("ollama", "ollama", HostLink::Local),
+            ("z-llama", "llama-cpp", HostLink::Host("spark".to_string())),
         ]);
         ctx.config_mut().hardware.insert(
             crate::config::hardware::LOCAL_HARDWARE_ID.to_string(),
@@ -6831,15 +6930,15 @@ mod tests {
 
     #[test]
     fn a_model_that_fits_on_both_stays_on_the_provider_on_local() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         // `llamacpp-spark` sorts before `ollama`, so only the link can pick
         // `ollama`.
         let mut ctx = ctx_with_linked_providers(&[
-            ("ollama", "ollama", HardwareLink::Local),
+            ("ollama", "ollama", HostLink::Local),
             (
                 "llamacpp-spark",
                 "llama-cpp",
-                HardwareLink::Profile("spark".to_string()),
+                HostLink::Host("spark".to_string()),
             ),
         ]);
         // This machine has the same figures as the Spark, so every fit ties.
@@ -6881,15 +6980,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_wizard_offers_to_repair_a_configured_provider_with_a_broken_link() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_linked_providers(&[
-            ("ollama", "ollama", HardwareLink::Local),
-            (
-                "llama-cpp",
-                "llama-cpp",
-                HardwareLink::Profile("gone".to_string()),
-            ),
+            ("ollama", "ollama", HostLink::Local),
+            ("llama-cpp", "llama-cpp", HostLink::Host("gone".to_string())),
         ]);
         let capture = Arc::new(CaptureUi::default());
         ctx.ui = capture.clone();
@@ -6918,11 +7013,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_that_cannot_ask_warns_about_a_broken_link() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let mut ctx = ctx_with_linked_providers(&[(
             "llama-cpp",
             "llama-cpp",
-            HardwareLink::Profile("gone".to_string()),
+            HostLink::Host("gone".to_string()),
         )]);
         let capture = Arc::new(CaptureUi::default());
         ctx.ui = capture.clone();
@@ -6940,9 +7035,8 @@ mod tests {
     #[test]
     fn auto_setup_names_a_candidate_whose_fit_is_not_available() {
         let model = hosted_model_id();
-        use crate::config::hardware::HardwareLink;
-        let mut ctx =
-            ctx_with_linked_providers(&[("openrouter", "openrouter", HardwareLink::Local)]);
+        use crate::config::host::HostLink;
+        let mut ctx = ctx_with_linked_providers(&[("openrouter", "openrouter", HostLink::Local)]);
         let capture = Arc::new(CaptureUi::default());
         ctx.ui = capture.clone();
         ctx.config_mut().recommended_configs.insert(
@@ -6976,9 +7070,8 @@ mod tests {
     #[test]
     fn auto_setup_names_a_capability_once_for_every_launcher_that_recommends_it() {
         let model = hosted_model_id();
-        use crate::config::hardware::HardwareLink;
-        let mut ctx =
-            ctx_with_linked_providers(&[("openrouter", "openrouter", HardwareLink::Local)]);
+        use crate::config::host::HostLink;
+        let mut ctx = ctx_with_linked_providers(&[("openrouter", "openrouter", HostLink::Local)]);
         let capture = Arc::new(CaptureUi::default());
         ctx.ui = capture.clone();
         for launcher in ["claude", "opencode"] {

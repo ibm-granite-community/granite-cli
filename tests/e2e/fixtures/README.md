@@ -10,7 +10,7 @@ A complete, consistent configuration with no network dependency.
 
 | Kind | Id | Notes |
 |---|---|---|
-| provider | `ollama` | `base_url: http://127.0.0.1:9`, where nothing listens, so health checks fail fast and nothing reaches a real server; `hardware: local` |
+| provider | `ollama` | `base_url: http://127.0.0.1:9`, where nothing listens, so health checks fail fast and nothing reaches a real server; `host: local` |
 | model | `granite-4.2-3b`, `granite-4.2-8b` | both `GGUF/Q8_0` on `ollama` |
 | capability | `agent-model` | uses `granite-4.2-8b` |
 | capability | `sub-agent-explore` | uses `granite-4.2-3b` |
@@ -49,7 +49,7 @@ proxy. Both launchers need their command on `PATH` (`stub_bin opencode`,
 
 ## hardware
 
-Hardware profiles, and one provider linked to one of them. `local` is in manual mode with no
+Hardware profiles, a host that lists one of them, and a provider on that host. `local` is in manual mode with no
 recorded detection, so commands use its figures and never compare them with
 this machine: no result depends on the machine the test runs on.
 
@@ -59,7 +59,8 @@ this machine: no result depends on the machine the test runs on.
 | `box` | `custom` | discrete 24.0 GB |
 | `spark` | `dgx-spark` (catalog) | 128.0 GB |
 
-Provider `lab` (`llama-cpp`, `base_url: http://127.0.0.1:9`) runs on `box`.
+Host `box` (address `127.0.0.1`) lists the `box` profile, and provider `lab`
+(`llama-cpp`, `base_url: http://127.0.0.1:9`) runs on host `box`.
 
 ## hosts
 
@@ -99,7 +100,7 @@ and the conversion script.
 | `ollama` | `http://localhost:9` | `local` |
 | `openrouter` | `https://openrouter.ai/api` | `unspecified` |
 | `ollama-spark`, `llama-cpp-spark` | `http://spark.lan:11434`, `http://spark.lan:9797` | `spark`: one profile, two providers at one address |
-| `llama-cpp-card-a`, `llama-cpp-card-b` | `http://box-a.lan:8080`, `http://10.0.0.7:8080` | `card`: one profile at two addresses |
+| `llama-cpp-card-a`, `llama-cpp-card-b`, `llama-cpp-card-v6` | `http://box-a.lan:8080`, `http://10.0.0.7:8080`, `http://[fe80::1]:8080` | `card`: one profile at three addresses, one of them IPv6 |
 
 Hardware profiles: `local` (manual, system 32.0 GB), `spark` (`dgx-spark`,
 128.0 GB) and `card` (`nvidia-rtx-4090`, 24.0 GB).

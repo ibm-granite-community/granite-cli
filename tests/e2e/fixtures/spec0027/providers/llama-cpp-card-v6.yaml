@@ -1,0 +1,5 @@
+provider_id: llama-cpp-card-v6
+type: llama-cpp
+config:
+  base_url: http://[fe80::1]:8080
+hardware: card

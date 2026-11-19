@@ -1124,7 +1124,7 @@ nothing on a second run. The script's test runs it on a fixture directory.
 - `src/context.rs` (`hardware_profile`, `ensure_local_hardware`)
 - `docs/data-model.md`
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 

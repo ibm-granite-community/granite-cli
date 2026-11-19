@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use crate::config::HardwareConfig;
 use crate::config::hardware::LOCAL_HARDWARE_ID;
+use crate::config::host::LOCAL_HOST_ID;
 use crate::utils::hardware::HardwareProfile;
 
 /*-- public --*/
@@ -31,10 +32,14 @@ pub(crate) struct AppContext {
     /// provider the sources hand out points at it, which is why setting it
     /// discards them.
     model_proxy: Option<crate::proxy::ProxyHandle>,
-    /// The hardware the setup wizard gives each provider it adds of a type
-    /// the user runs, once the user has named it. `None` outside the wizard,
-    /// where a new provider gets its type's default link.
-    setup_link: Option<crate::config::hardware::HardwareLink>,
+    /// The host the setup wizard gives each provider it adds of a type the
+    /// user runs, once the user has named it, and the host to write first
+    /// when it is not configured yet. `None` outside the wizard, where a new
+    /// provider gets its type's default link.
+    setup_link: Option<(
+        crate::config::host::HostLink,
+        Option<crate::config::HostConfig>,
+    )>,
     /// Default base URLs a test has set for a provider type, in place of
     /// the registry's.
     #[cfg(test)]
@@ -82,16 +87,33 @@ impl AppContext {
             .insert(provider_type.to_string(), urls);
     }
 
-    /// The hardware the setup wizard gives each provider it adds of a type
-    /// the user runs, when the user has named it in this run.
-    pub(crate) fn setup_link(&self) -> Option<&crate::config::hardware::HardwareLink> {
-        self.setup_link.as_ref()
+    /// The host the setup wizard gives each provider it adds of a type the
+    /// user runs, when the user has named it in this run.
+    pub(crate) fn setup_link(&self) -> Option<&crate::config::host::HostLink> {
+        self.setup_link.as_ref().map(|(link, _)| link)
     }
 
-    /// Records the hardware the setup wizard gives each provider it adds of
-    /// a type the user runs.
-    pub(crate) fn set_setup_link(&mut self, link: crate::config::hardware::HardwareLink) {
-        self.setup_link = Some(link);
+    /// Records the host the setup wizard gives each provider it adds of a
+    /// type the user runs, and `new_host`, the host to write before the
+    /// first such provider when it is not configured.
+    pub(crate) fn set_setup_link(
+        &mut self,
+        link: crate::config::host::HostLink,
+        new_host: Option<crate::config::HostConfig>,
+    ) {
+        self.setup_link = Some((link, new_host));
+    }
+
+    /// Writes the host recorded by `set_setup_link`, if it is new and not
+    /// written yet.
+    pub(crate) fn write_setup_host(&mut self) -> anyhow::Result<()> {
+        let Some((_, Some(host))) = self.setup_link.clone() else {
+            return Ok(());
+        };
+        if self.config.get_host(&host.host_id).is_none() {
+            self.config_mut().insert_host(&host.host_id.clone(), host)?;
+        }
+        Ok(())
     }
 
     /// The configuration as it now stands.
@@ -144,16 +166,53 @@ impl AppContext {
             .clone()
     }
 
+    /// The figures fit is estimated on for a provider on host `id`: those
+    /// of its device with the most usable memory. Fails with the reason when
+    /// the host is not configured, has no devices (its hardware is not
+    /// known), or a device's figures cannot be looked up.
+    pub(crate) fn host_profile(&self, id: &str) -> Result<HardwareProfile, String> {
+        if id != LOCAL_HOST_ID && self.config.get_host(id).is_none() {
+            return Err(format!("host '{id}' is not configured"));
+        }
+        let devices = self.config.host_hardware(id);
+        if devices.is_empty() {
+            return Err(format!("the hardware of host '{id}' is not known"));
+        }
+        let mut best: Option<HardwareProfile> = None;
+        for device in devices {
+            let profile = self.hardware_profile(&device)?;
+            if best
+                .as_ref()
+                .is_none_or(|b| profile.usable_memory_gb() > b.usable_memory_gb())
+            {
+                best = Some(profile);
+            }
+        }
+        Ok(best.expect("a host with devices has a largest one"))
+    }
+
     /// Writes the `local` hardware profile from `detect` when there is none,
-    /// and says so in one line. Does nothing when `local` exists. `detect` is
-    /// a parameter so tests never read the machine they run on.
-    pub(crate) fn ensure_local_hardware(
+    /// and says so in one line, then the `local` host when there is none.
+    /// Does nothing when both exist. `detect` is a parameter so tests never
+    /// read the machine they run on.
+    pub(crate) fn ensure_local_host(
         &mut self,
         detect: impl FnOnce() -> HardwareProfile,
     ) -> anyhow::Result<()> {
-        if self.config.get_hardware(LOCAL_HARDWARE_ID).is_some() {
-            return Ok(());
+        if self.config.get_hardware(LOCAL_HARDWARE_ID).is_none() {
+            self.write_local_hardware(detect)?;
         }
+        if self.config.get_host(LOCAL_HOST_ID).is_none() {
+            self.config_mut()
+                .insert_host(LOCAL_HOST_ID, crate::config::HostConfig::local())?;
+        }
+        Ok(())
+    }
+
+    fn write_local_hardware(
+        &mut self,
+        detect: impl FnOnce() -> HardwareProfile,
+    ) -> anyhow::Result<()> {
         let local = HardwareConfig::local_from_detection(detect());
         let summary = local
             .profile()
@@ -226,7 +285,7 @@ mod tests {
         let ui = Arc::new(CaptureUi::default());
         let mut ctx = ctx(ui.clone());
 
-        ctx.ensure_local_hardware(detected).unwrap();
+        ctx.ensure_local_host(detected).unwrap();
 
         assert_eq!(ctx.hardware_profile(LOCAL_HARDWARE_ID), Ok(detected()));
         assert_eq!(
@@ -243,10 +302,10 @@ mod tests {
         let _home = TestConfigHome::new();
         let ui = Arc::new(CaptureUi::default());
         let mut ctx = ctx(ui.clone());
-        ctx.ensure_local_hardware(detected).unwrap();
+        ctx.ensure_local_host(detected).unwrap();
         ui.stderr_infos.borrow_mut().clear();
 
-        ctx.ensure_local_hardware(|| panic!("detection must not run"))
+        ctx.ensure_local_host(|| panic!("detection must not run"))
             .unwrap();
 
         assert!(ui.stderr_infos.borrow().is_empty());
@@ -277,6 +336,69 @@ mod tests {
         assert_eq!(
             ctx.default_base_urls("ollama"),
             vec!["http://127.0.0.1:1".to_string()]
+        );
+    }
+
+    #[test]
+    fn first_use_writes_the_local_host_with_the_local_profile() {
+        let _home = TestConfigHome::new();
+        let mut ctx = ctx(Arc::new(CaptureUi::default()));
+
+        ctx.ensure_local_host(detected).unwrap();
+
+        let reloaded = Config::new().unwrap();
+        assert_eq!(
+            reloaded.get_host(LOCAL_HOST_ID),
+            Some(&crate::config::HostConfig::local())
+        );
+    }
+
+    fn with_host(ctx: &mut AppContext, id: &str, hardware: &[&str]) {
+        ctx.config_mut()
+            .insert_host(
+                id,
+                crate::config::HostConfig {
+                    host_id: id.to_string(),
+                    address: format!("{id}.lan"),
+                    hardware: hardware.iter().map(|h| h.to_string()).collect(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn fit_on_a_host_uses_its_largest_device() {
+        let _home = TestConfigHome::new();
+        let mut ctx = ctx(Arc::new(CaptureUi::default()));
+        for (id, catalog_id, gb) in [
+            ("spark", "dgx-spark", 128.0),
+            ("card", "nvidia-rtx-4090", 24.0),
+        ] {
+            ctx.config_mut()
+                .insert_hardware(id, HardwareConfig::catalog(id, catalog_id, gb))
+                .unwrap();
+        }
+        with_host(&mut ctx, "pgx", &["spark"]);
+        with_host(&mut ctx, "box", &["card", "card"]);
+
+        // The same figures as the profile a provider linked to before.
+        assert_eq!(ctx.host_profile("pgx"), ctx.hardware_profile("spark"));
+        assert_eq!(ctx.host_profile("box"), ctx.hardware_profile("card"));
+    }
+
+    #[test]
+    fn fit_on_a_host_with_no_devices_or_none_configured_is_not_available() {
+        let _home = TestConfigHome::new();
+        let mut ctx = ctx(Arc::new(CaptureUi::default()));
+        with_host(&mut ctx, "lab", &[]);
+
+        assert_eq!(
+            ctx.host_profile("lab"),
+            Err("the hardware of host 'lab' is not known".to_string())
+        );
+        assert_eq!(
+            ctx.host_profile("gone"),
+            Err("host 'gone' is not configured".to_string())
         );
     }
 

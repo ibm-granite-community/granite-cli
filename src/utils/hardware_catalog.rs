@@ -161,7 +161,7 @@ mod tests {
             assert!(
                 e.id != crate::config::hardware::CUSTOM_HARDWARE_TYPE
                     && e.id != crate::config::hardware::LOCAL_HARDWARE_ID
-                    && e.id != crate::config::hardware::UNSPECIFIED_HARDWARE,
+                    && e.id != crate::config::host::UNSPECIFIED_HOST,
                 "catalog id '{}' is reserved",
                 e.id
             );

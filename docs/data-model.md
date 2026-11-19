@@ -1,8 +1,8 @@
 # Data Model
 
 granite-cli reads two sets of data. The configuration holds the providers,
-models, capabilities and launchers a user has set up, as one YAML file per
-instance. The compiled-in data ships in the binary: the model catalog
+models, capabilities, launchers, hosts and hardware profiles a user has set
+up, as one YAML file per instance. The compiled-in data ships in the binary: the model catalog
 generated from `resources/models.yaml`, and the metadata each registered
 implementation type declares. A configured instance names other configured
 instances by id, and names its own implementation type by registry key.
@@ -47,9 +47,33 @@ one YAML file per instance                      registries and their metadata
 │   provider_id          │                      ┌──────────────────────────────┐
 │   provider_type      ──┼── type ─────────────▶│ PROVIDER_REGISTRY            │
 │   config               │                      │   supported_formats          │
-└────────────────────────┘                      │   supported_api_types        │
-                                                └──────────────────────────────┘
+│   host                 │                      │   supported_api_types        │
+└───────────┬────────────┘                      └──────────────────────────────┘
+            │ id, unless local or unspecified
+            ▼
+┌────────────────────────┐
+│ HostConfig             │
+│   host_id              │
+│   address              │
+│   hardware[]           │
+└───────────┬────────────┘
+            │ id, per device (none or more, may repeat)
+            ▼
+┌────────────────────────┐                      ┌──────────────────────────────┐
+│ HardwareConfig         │                      │ hardware catalog             │
+│   hardware_id          │                      │   built from hardware.yaml   │
+│   type               ──┼── type ─────────────▶│   id, family, kind, sizes    │
+│   memory, headroom     │                      └──────────────────────────────┘
+│   config               │
+└────────────────────────┘
 ```
+
+A provider links to the host it runs on: `local` (this machine), a host id,
+or `unspecified` for a hosted service. A host is a machine reached at an
+address, with one hardware profile per device; two identical cards are the
+same id listed twice, and a host with no devices has unknown hardware. Fit is
+estimated on the devices of a provider's host. A hardware profile's type is
+`local`, `custom` or a hardware catalog id.
 
 The diagram shows three kinds of reference.
 

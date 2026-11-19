@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Which of a profile's memory figures holds the model. Discrete and unified
 /// memory are read from `vram_gb`, the memory the accelerator can address;
 /// system memory from `ram_gb`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum MemoryKind {
     /// A card with its own VRAM, such as an RTX 4090.
@@ -15,6 +17,16 @@ pub(crate) enum MemoryKind {
     Unified,
     /// No accelerator: the model runs from system RAM.
     System,
+}
+
+impl std::fmt::Display for MemoryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MemoryKind::Discrete => "discrete",
+            MemoryKind::Unified => "unified",
+            MemoryKind::System => "system",
+        })
+    }
 }
 
 impl MemoryKind {

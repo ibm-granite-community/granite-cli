@@ -382,7 +382,7 @@ mod tests {
         config.providers.insert(
             "my-ollama".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "my-ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),

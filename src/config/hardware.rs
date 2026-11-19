@@ -24,74 +24,6 @@ pub(crate) const LOCAL_HARDWARE_ID: &str = "local";
 /// The type of a hardware profile whose figures the user typed.
 pub(crate) const CUSTOM_HARDWARE_TYPE: &str = "custom";
 
-/// What a provider's `hardware` field holds when no hardware profile is
-/// named.
-pub(crate) const UNSPECIFIED_HARDWARE: &str = "unspecified";
-
-/// Which hardware profile a provider runs on. Saved as a string: `local`,
-/// `unspecified`, or a hardware profile id.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(from = "String", into = "String")]
-pub(crate) enum HardwareLink {
-    /// The `local` hardware profile: the provider runs on the machine
-    /// granite-cli runs on. A provider saved before providers had a
-    /// hardware link also reads as this, because fit was estimated against
-    /// the local machine then. It may run elsewhere; `provider list` marks
-    /// it as not set.
-    #[default]
-    Local,
-    /// A configured hardware profile other than `local`.
-    Profile(String),
-    /// No hardware profile: fit cannot be estimated for this provider.
-    Unspecified,
-}
-
-impl HardwareLink {
-    /// What `provider setup` offers first for a provider of `provider_type`:
-    /// "not specified" for a hosted one, `local` for any other. A generic
-    /// provider, such as openai-compatible, often points at a server the
-    /// user runs (vLLM, a llama.cpp server), so it gets `local`.
-    pub(crate) fn default_for(provider_type: &str) -> Self {
-        let hosted = crate::providers::PROVIDER_REGISTRY
-            .get(provider_type)
-            .is_some_and(|p| p.provider_type == crate::providers::ProviderType::Hosted);
-        if hosted {
-            Self::Unspecified
-        } else {
-            Self::Local
-        }
-    }
-
-    /// The id of the hardware profile this names, if any.
-    pub(crate) fn profile_id(&self) -> Option<&str> {
-        match self {
-            Self::Local => Some(LOCAL_HARDWARE_ID),
-            Self::Profile(id) => Some(id),
-            Self::Unspecified => None,
-        }
-    }
-}
-
-impl From<String> for HardwareLink {
-    fn from(value: String) -> Self {
-        match value.as_str() {
-            LOCAL_HARDWARE_ID => Self::Local,
-            UNSPECIFIED_HARDWARE => Self::Unspecified,
-            _ => Self::Profile(value),
-        }
-    }
-}
-
-impl From<HardwareLink> for String {
-    fn from(link: HardwareLink) -> Self {
-        match link {
-            HardwareLink::Local => LOCAL_HARDWARE_ID.to_string(),
-            HardwareLink::Profile(id) => id,
-            HardwareLink::Unspecified => UNSPECIFIED_HARDWARE.to_string(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HardwareConfig {
     /// Instance id: the file name this profile is saved under.
@@ -438,47 +370,5 @@ mod tests {
         let yaml =
             serde_yaml::to_string(&HardwareConfig::catalog("spark", "dgx-spark", 128.0)).unwrap();
         assert_eq!(yaml, "hardware_id: spark\ntype: dgx-spark\nmemory: 128.0\n");
-    }
-
-    // -- a provider's hardware link ----------------------------------------------
-
-    #[test]
-    fn a_provider_saved_before_links_existed_reads_as_local() {
-        let yaml = "provider_id: ollama\ntype: ollama\nconfig: {}\n";
-        let p: crate::config::ProviderConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(p.hardware, None);
-        assert_eq!(p.hardware_link(), HardwareLink::Local);
-        // Saved again, it still has no link.
-        assert!(!serde_yaml::to_string(&p).unwrap().contains("hardware"));
-    }
-
-    #[test]
-    fn each_link_round_trips_through_yaml() {
-        for link in [
-            HardwareLink::Local,
-            HardwareLink::Unspecified,
-            HardwareLink::Profile("spark".to_string()),
-        ] {
-            let yaml = serde_yaml::to_string(&link).unwrap();
-            assert_eq!(serde_yaml::from_str::<HardwareLink>(&yaml).unwrap(), link);
-        }
-        assert_eq!(
-            serde_yaml::to_string(&HardwareLink::Unspecified).unwrap(),
-            "unspecified\n"
-        );
-    }
-
-    #[test]
-    fn a_hosted_provider_defaults_to_not_specified_and_any_other_to_local() {
-        assert_eq!(
-            HardwareLink::default_for("openrouter"),
-            HardwareLink::Unspecified
-        );
-        assert_eq!(HardwareLink::default_for("ollama"), HardwareLink::Local);
-        // Generic: often a server the user runs.
-        assert_eq!(
-            HardwareLink::default_for("openai-compatible"),
-            HardwareLink::Local
-        );
     }
 }

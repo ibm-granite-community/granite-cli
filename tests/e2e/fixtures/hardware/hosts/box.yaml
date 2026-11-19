@@ -1,0 +1,4 @@
+host_id: box
+address: 127.0.0.1
+hardware:
+- box

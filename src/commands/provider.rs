@@ -95,12 +95,12 @@ impl ProviderCommands {
                     cfg.provider_type.clone(),
                     base_url,
                     if discovery { "yes" } else { "-" }.to_string(),
-                    hardware_label(ctx, cfg),
+                    host_label(ctx, cfg),
                     notes
                         .get(id)
                         .cloned()
                         .into_iter()
-                        .chain(legacy_hardware_note(cfg))
+                        .chain(legacy_link_note(cfg))
                         .collect::<Vec<_>>()
                         .join("; "),
                 ]
@@ -116,14 +116,14 @@ impl ProviderCommands {
 
         ctx.ui.table(
             &format!("Configured Providers ({} providers)", rows.len()),
-            &["ID", "TYPE", "BASE URL", "DISCOVERY", "HARDWARE", "NOTES"],
+            &["ID", "TYPE", "BASE URL", "DISCOVERY", "HOST", "NOTES"],
             &rows,
         );
         Ok(())
     }
 
     pub(crate) async fn info(ctx: &mut crate::AppContext, id: &str) -> Result<()> {
-        // A configured provider's hardware link can be broken; an id that
+        // A configured provider's host link can be broken; an id that
         // names a catalog type is being browsed, not diagnosed. A run that
         // cannot ask prints the problem.
         if ctx.config().get_provider(id).is_some() {
@@ -227,18 +227,18 @@ impl ProviderCommands {
             })?;
         let defaults = prompt_defaults(provider_type, existing_config);
 
-        let current_link = existing_config.and_then(|c| c.hardware.clone());
+        let current_link = existing_config.and_then(|c| c.host.clone());
 
         let config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
-        let hardware =
+        let host =
             crate::commands::HardwareCommands::choose_link(ctx, provider_type, current_link)?;
 
-        let hardware_note = hardware.profile_id().unwrap_or("not specified").to_string();
+        let host_note = host.host_id().unwrap_or("not specified").to_string();
         let provider_config = crate::config::ProviderConfig {
             provider_id: instance_id.clone(),
             provider_type: provider_type.to_string(),
             config,
-            hardware: Some(hardware),
+            host: Some(host),
         };
 
         ctx.config_mut()
@@ -262,8 +262,8 @@ impl ProviderCommands {
         }
 
         ctx.ui.info(&format!(
-            "\nProvider instance '{instance_id}' configured successfully (hardware: \
-             {hardware_note})."
+            "\nProvider instance '{instance_id}' configured successfully (host: \
+             {host_note})."
         ));
         // The schema prompt already asked whether to discover models; honour
         // it now that the provider is saved and reachable.
@@ -527,8 +527,8 @@ impl ProviderCommands {
                     let config_fields = crate::commands::shared::config_fields(&cfg.config);
                     instance_fields
                         .extend(config_fields.iter().map(|(k, v)| (k.as_str(), v.clone())));
-                    instance_fields.push(("Hardware", hardware_label(ctx, cfg)));
-                    if let Some(note) = legacy_hardware_note(cfg) {
+                    instance_fields.push(("Host", host_label(ctx, cfg)));
+                    if let Some(note) = legacy_link_note(cfg) {
                         instance_fields.push(("Note", note));
                     }
 
@@ -564,29 +564,28 @@ impl ProviderCommands {
     }
 }
 
-/// The HARDWARE column of `provider list`: the hardware profile id, "hosted"
-/// for a hosted provider with none, and a warning for any other provider
-/// with none, since fit cannot be estimated for it. A provider saved before
-/// links existed is estimated against `local`, which nobody chose, so it is
-/// shown with a warning.
-fn hardware_label(ctx: &crate::AppContext, cfg: &crate::config::ProviderConfig) -> String {
-    use crate::config::hardware::HardwareLink;
-    match &cfg.hardware {
+/// The HOST column of `provider list`: the host id, "hosted" for a hosted
+/// provider with none, and a warning for any other provider with none, since
+/// fit cannot be estimated for it. A provider saved before links existed is
+/// estimated on `local`, which nobody chose, so it is shown with a warning.
+fn host_label(ctx: &crate::AppContext, cfg: &crate::config::ProviderConfig) -> String {
+    use crate::config::host::HostLink;
+    match &cfg.host {
         None => ctx.ui.warn_mark("⚠ local (not set)"),
-        Some(HardwareLink::Unspecified)
-            if HardwareLink::default_for(&cfg.provider_type) == HardwareLink::Unspecified =>
+        Some(HostLink::Unspecified)
+            if HostLink::default_for(&cfg.provider_type) == HostLink::Unspecified =>
         {
             "hosted".to_string()
         }
-        Some(HardwareLink::Unspecified) => ctx.ui.warn_mark("⚠ not specified"),
-        Some(link) => link.profile_id().unwrap_or_default().to_string(),
+        Some(HostLink::Unspecified) => ctx.ui.warn_mark("⚠ not specified"),
+        Some(link) => link.host_id().unwrap_or_default().to_string(),
     }
 }
 
 /// For a provider saved before links existed, the command that sets its
-/// hardware link.
-fn legacy_hardware_note(cfg: &crate::config::ProviderConfig) -> Option<String> {
-    if cfg.hardware.is_some() {
+/// host link.
+fn legacy_link_note(cfg: &crate::config::ProviderConfig) -> Option<String> {
+    if cfg.host.is_some() {
         return None;
     }
     let id = if cfg.provider_id == cfg.provider_type {
@@ -626,7 +625,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             id.to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: id.to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({ "base_url": url }),
@@ -777,7 +776,7 @@ mod tests {
                     "base_url": "http://localhost:11434",
                     "discover_models": true
                 }),
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
         ctx.config_mut().providers.insert(
@@ -786,7 +785,7 @@ mod tests {
                 provider_id: "prod-openai".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({ "base_url": "http://prod" }),
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
 
@@ -806,7 +805,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "prod-openai".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "prod-openai".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({ "base_url": "http://prod" }),
@@ -815,7 +814,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "local-ollama".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "local-ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({ "base_url": "http://localhost:11434" }),
@@ -824,7 +823,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "dev-openai".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "dev-openai".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({ "base_url": "http://dev" }),
@@ -907,7 +906,7 @@ mod tests {
             ProviderConfig {
                 provider_id: "my-provider".to_string(),
                 provider_type: "openai-compatible".to_string(),
-                hardware: Default::default(),
+                host: Default::default(),
                 config: serde_json::json!({
                     "base_url": "http://localhost:11434",
                     "timeout_secs": 10,
@@ -932,16 +931,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn info_warns_about_a_broken_hardware_link_and_still_shows_the_provider() {
+    async fn info_warns_about_a_broken_host_link_and_still_shows_the_provider() {
         let ui = Arc::new(CaptureUi::default());
         *ui.interactive.borrow_mut() = Some(false);
         let mut ctx = crate::AppContext::new(Config::default(), ui.clone());
         ctx.config_mut().providers.insert(
             "llamacpp-spark".to_string(),
             ProviderConfig {
-                hardware: Some(crate::config::hardware::HardwareLink::Profile(
-                    "gone".to_string(),
-                )),
+                host: Some(crate::config::host::HostLink::Host("gone".to_string())),
                 provider_id: "llamacpp-spark".to_string(),
                 provider_type: "llama-cpp".to_string(),
                 config: serde_json::json!({ "base_url": "http://spark:8080" }),
@@ -965,7 +962,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "custom-provider".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "custom-provider".to_string(),
                 provider_type: "not-a-real-type".to_string(),
                 config: serde_json::json!({}),
@@ -993,7 +990,7 @@ mod tests {
             provider_id: "old-ollama".to_string(),
             provider_type: "ollama".to_string(),
             config: serde_json::json!({ "base_url": "http://old:11434" }),
-            hardware: Default::default(),
+            host: Default::default(),
         };
         let defaults = prompt_defaults("ollama", Some(&existing));
         assert_eq!(defaults["base_url"], "http://old:11434");
@@ -1006,7 +1003,7 @@ mod tests {
             provider_id: "off-ollama".to_string(),
             provider_type: "ollama".to_string(),
             config: serde_json::json!({ "discover_models": false }),
-            hardware: Default::default(),
+            host: Default::default(),
         };
         let defaults = prompt_defaults("ollama", Some(&existing));
         assert_eq!(defaults["discover_models"], false);
@@ -1019,7 +1016,7 @@ mod tests {
     async fn setup_fails_when_config_cannot_be_saved() {
         let home = crate::config::TestConfigHome::new();
         let mut ctx = test_ctx();
-        // A run that cannot ask: the hardware link takes the current or
+        // A run that cannot ask: the host link takes the current or
         // default value, and `local` is not detected and written.
         non_interactive(&ctx);
 
@@ -1042,11 +1039,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_saves_the_hardware_link_and_keeps_an_existing_one() {
-        use crate::config::hardware::HardwareLink;
+    async fn setup_saves_the_host_link_and_keeps_an_existing_one() {
+        use crate::config::host::HostLink;
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = test_ctx();
-        // A run that cannot ask: the hardware link takes the current or
+        // A run that cannot ask: the host link takes the current or
         // default value, and `local` is not detected and written.
         non_interactive(&ctx);
 
@@ -1055,25 +1052,19 @@ mod tests {
         ProviderCommands::setup(&mut ctx, "openai-compatible", Some("vllm-lab"), false)
             .await
             .unwrap();
-        let link = || {
-            ctx.config()
-                .get_provider("vllm-lab")
-                .unwrap()
-                .hardware
-                .clone()
-        };
-        assert_eq!(link(), Some(HardwareLink::Local));
+        let link = || ctx.config().get_provider("vllm-lab").unwrap().host.clone();
+        assert_eq!(link(), Some(HostLink::Local));
         assert!(
             infos!(ctx)
                 .iter()
-                .any(|m| m.contains("'vllm-lab' configured successfully (hardware: local)")),
+                .any(|m| m.contains("'vllm-lab' configured successfully (host: local)")),
             "{:?}",
             infos!(ctx)
         );
 
         ctx.config_mut()
             .update_provider("vllm-lab", |p| {
-                p.hardware = Some(HardwareLink::Profile("spark".to_string()))
+                p.host = Some(HostLink::Host("spark".to_string()))
             })
             .unwrap();
         ProviderCommands::setup(&mut ctx, "openai-compatible", Some("vllm-lab"), true)
@@ -1081,24 +1072,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ctx.config().get_provider("vllm-lab").unwrap().hardware,
-            Some(HardwareLink::Profile("spark".to_string()))
+            ctx.config().get_provider("vllm-lab").unwrap().host,
+            Some(HostLink::Host("spark".to_string()))
         );
     }
 
     #[tokio::test]
     async fn setup_of_a_legacy_provider_offers_the_default_for_its_type() {
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = test_ctx();
-        // A run that cannot ask: the hardware link takes the current or
+        // A run that cannot ask: the host link takes the current or
         // default value, and `local` is not detected and written.
         non_interactive(&ctx);
         ProviderCommands::setup(&mut ctx, "openai-compatible", Some("vllm-lab"), false)
             .await
             .unwrap();
         ctx.config_mut()
-            .update_provider("vllm-lab", |p| p.hardware = None)
+            .update_provider("vllm-lab", |p| p.host = None)
             .unwrap();
 
         ProviderCommands::setup(&mut ctx, "openai-compatible", Some("vllm-lab"), true)
@@ -1106,8 +1097,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ctx.config().get_provider("vllm-lab").unwrap().hardware,
-            Some(HardwareLink::Local)
+            ctx.config().get_provider("vllm-lab").unwrap().host,
+            Some(HostLink::Local)
         );
     }
 
@@ -1167,50 +1158,46 @@ mod tests {
     }
 
     #[test]
-    fn hardware_column_shows_the_link_hosted_or_a_warning() {
-        use crate::config::hardware::HardwareLink;
+    fn host_column_shows_the_link_hosted_or_a_warning() {
+        use crate::config::host::HostLink;
         let ctx = crate::AppContext::new(
             crate::config::Config::default(),
             std::sync::Arc::new(crate::utils::ui::base::tests::CaptureUi::default()),
         );
-        let provider =
-            |provider_type: &str, hardware: HardwareLink| crate::config::ProviderConfig {
-                provider_id: "p".to_string(),
-                provider_type: provider_type.to_string(),
-                config: serde_json::json!({}),
-                hardware: Some(hardware),
-            };
+        let provider = |provider_type: &str, host: HostLink| crate::config::ProviderConfig {
+            provider_id: "p".to_string(),
+            provider_type: provider_type.to_string(),
+            config: serde_json::json!({}),
+            host: Some(host),
+        };
 
         assert_eq!(
-            hardware_label(&ctx, &provider("ollama", HardwareLink::Local)),
+            host_label(&ctx, &provider("ollama", HostLink::Local)),
             "local"
         );
         assert_eq!(
-            hardware_label(
+            host_label(
                 &ctx,
-                &provider("llama-cpp", HardwareLink::Profile("spark".to_string()))
+                &provider("llama-cpp", HostLink::Host("spark".to_string()))
             ),
             "spark"
         );
         assert_eq!(
-            hardware_label(&ctx, &provider("openrouter", HardwareLink::Unspecified)),
+            host_label(&ctx, &provider("openrouter", HostLink::Unspecified)),
             "hosted"
         );
         assert_eq!(
-            hardware_label(&ctx, &provider("llama-cpp", HardwareLink::Unspecified)),
+            host_label(&ctx, &provider("llama-cpp", HostLink::Unspecified)),
             "⚠ not specified"
         );
         // openai-compatible usually fronts a server the user runs, so "not
         // specified" is a warning for it, as for any provider the user runs.
         assert_eq!(
-            hardware_label(
-                &ctx,
-                &provider("openai-compatible", HardwareLink::Unspecified)
-            ),
+            host_label(&ctx, &provider("openai-compatible", HostLink::Unspecified)),
             "⚠ not specified"
         );
         assert_eq!(
-            hardware_label(&ctx, &provider("openai-compatible", HardwareLink::Local)),
+            host_label(&ctx, &provider("openai-compatible", HostLink::Local)),
             "local"
         );
     }
@@ -1226,7 +1213,7 @@ mod tests {
                     provider_id: id.to_string(),
                     provider_type: provider_type.to_string(),
                     config: serde_json::json!({}),
-                    hardware: None,
+                    host: None,
                 },
             );
         }

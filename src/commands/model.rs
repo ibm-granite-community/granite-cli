@@ -1924,7 +1924,7 @@ mod tests {
         config_obj.providers.insert(
             id.to_string(),
             crate::config::ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: id.to_string(),
                 provider_type: provider_type.to_string(),
                 config,
@@ -2192,7 +2192,7 @@ mod tests {
         config.providers.insert(
             "openai".to_string(),
             crate::config::ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "openai".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({ "base_url": "http://localhost:8080" }),
@@ -2390,7 +2390,7 @@ mod tests {
                 provider_id: "my-ollama".to_string(),
                 provider_type: provider_type.to_string(),
                 config: provider_config,
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
         config.models.insert(
@@ -2832,7 +2832,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "shared".to_string(),
             crate::config::ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "shared".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({}),
@@ -3048,9 +3048,7 @@ mod tests {
         config.providers.insert(
             "far-ollama".to_string(),
             crate::config::ProviderConfig {
-                hardware: Some(crate::config::hardware::HardwareLink::Profile(
-                    "spark".to_string(),
-                )),
+                host: Some(crate::config::host::HostLink::Host("spark".to_string())),
                 provider_id: "far-ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),

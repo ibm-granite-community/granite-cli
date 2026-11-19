@@ -504,7 +504,7 @@ mod tests {
                 provider_id: "p1".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
         config.models.insert(
@@ -694,7 +694,7 @@ mod tests {
                     "base_url": base_url,
                     "discover_models": discover
                 }),
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
         config
@@ -1004,7 +1004,7 @@ mod tests {
                     "base_url": second_url,
                     "discover_models": true
                 }),
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
         let mut ctx = crate::AppContext::new(config, Arc::new(CaptureUi::default()));
@@ -1051,7 +1051,7 @@ mod tests {
                     "base_url": unused_url,
                     "discover_models": true
                 }),
-                hardware: Default::default(),
+                host: Default::default(),
             },
         );
         config.models.insert(

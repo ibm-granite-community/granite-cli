@@ -448,7 +448,9 @@ impl Fix {
             _ => None,
         };
         Some(Self {
-            can_reconfigure: !matches!(error.problem, Problem::UnknownType { .. }),
+            // A host has no setup command to rerun yet; removal is its fix.
+            can_reconfigure: kind != RefKind::Host
+                && !matches!(error.problem, Problem::UnknownType { .. }),
             reset,
             type_name,
             disable: disable_target(error, kind, &id, root, config),
@@ -465,6 +467,7 @@ fn settings<'a>(kind: RefKind, id: &str, config: &'a Config) -> Option<&'a serde
         RefKind::Capability => config.get_capability(id).map(|c| &c.config),
         RefKind::Model => config.get_model(id).map(|c| &c.config),
         RefKind::Provider => config.get_provider(id).map(|c| &c.config),
+        RefKind::Host => None,
         RefKind::Hardware => config.get_hardware(id).map(|c| &c.config),
     }
 }
@@ -571,8 +574,9 @@ fn constructs(kind: RefKind, type_name: &str, settings: &serde_json::Value) -> b
         RefKind::Provider => crate::providers::PROVIDER_REGISTRY
             .construct(type_name, type_name, settings)
             .is_ok(),
-        // A hardware profile is not built from settings; it has no reset.
-        RefKind::Hardware => false,
+        // A host or hardware profile is not built from settings; it has no
+        // reset.
+        RefKind::Host | RefKind::Hardware => false,
     }
 }
 
@@ -583,7 +587,7 @@ fn default_settings(kind: RefKind, type_name: &str) -> serde_json::Value {
         RefKind::Capability => crate::capabilities::CAPABILITY_REGISTRY.default_config(type_name),
         RefKind::Model => crate::models::MODEL_REGISTRY.default_config(type_name),
         RefKind::Provider => crate::providers::PROVIDER_REGISTRY.default_config(type_name),
-        RefKind::Hardware => serde_json::Value::Null,
+        RefKind::Host | RefKind::Hardware => serde_json::Value::Null,
     }
 }
 
@@ -703,6 +707,8 @@ async fn reconfigure(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
         RefKind::Capability => CapabilityCommands::setup(ctx, type_name, id, true).await,
         RefKind::Model => ModelCommands::setup(ctx, type_name, id, true).await,
         RefKind::Provider => ProviderCommands::setup(ctx, type_name, id, true).await,
+        // `Fix::for_error` offers no reconfiguring for a host.
+        RefKind::Host => Ok(()),
         RefKind::Hardware => {
             use crate::config::hardware::LOCAL_HARDWARE_ID;
             let args = crate::commands::hardware::HardwareSetupArgs {
@@ -744,9 +750,9 @@ fn reset(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
         RefKind::Provider => ctx
             .config_mut()
             .update_provider(&id, |provider| provider.config = defaults),
-        // `default_settings` gives a hardware profile no defaults, so no reset
-        // plan is ever made for one.
-        RefKind::Hardware => Ok(()),
+        // `default_settings` gives a host or hardware profile no defaults, so
+        // no reset plan is ever made for one.
+        RefKind::Host | RefKind::Hardware => Ok(()),
     };
     if let Err(e) = saved {
         ctx.ui
@@ -800,6 +806,7 @@ fn remove(
         RefKind::Capability => CapabilityCommands::remove(ctx, id, policy),
         RefKind::Model => ModelCommands::remove(ctx, id, policy),
         RefKind::Provider => ProviderCommands::remove(ctx, id, policy),
+        RefKind::Host => crate::commands::HostCommands::remove(ctx, id, policy),
         RefKind::Hardware => HardwareCommands::remove(ctx, id, policy),
     }
 }
@@ -846,7 +853,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 // A deliberately chosen endpoint beside a field that cannot
@@ -954,7 +961,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
@@ -1507,7 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn reconfiguring_a_hardware_profile_replaces_it_without_an_overwrite_confirm() {
         use crate::config::HardwareConfig;
-        use crate::config::hardware::HardwareLink;
+        use crate::config::host::HostLink;
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()));
         ctx.config_mut().hardware.insert(
@@ -1517,10 +1524,18 @@ mod tests {
                 ..HardwareConfig::catalog("card", "nvidia-rtx-4090", 24.0)
             },
         );
+        ctx.config_mut().hosts.insert(
+            "lab".to_string(),
+            crate::config::HostConfig {
+                host_id: "lab".to_string(),
+                address: "lab".to_string(),
+                hardware: vec!["card".to_string()],
+            },
+        );
         ctx.config_mut().providers.insert(
             "vllm-lab".to_string(),
             ProviderConfig {
-                hardware: Some(HardwareLink::Profile("card".to_string())),
+                host: Some(HostLink::Host("lab".to_string())),
                 provider_id: "vllm-lab".to_string(),
                 provider_type: "openai-compatible".to_string(),
                 config: serde_json::json!({ "base_url": "http://lab:8000" }),
@@ -1588,7 +1603,7 @@ mod tests {
         ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
-                hardware: Default::default(),
+                host: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
