@@ -952,6 +952,7 @@ fn delete(ctx: &mut crate::AppContext, kind: RefKind, id: &str) {
         RefKind::Capability => (ctx.config_mut().remove_capability(id), "Capability"),
         RefKind::Model => (ctx.config_mut().remove_model(id), "Model"),
         RefKind::Provider => (ctx.config_mut().remove_provider(id), "Provider"),
+        RefKind::Hardware => (ctx.config_mut().remove_hardware(id), "Hardware"),
     };
     if let Err(e) = saved {
         ctx.ui
@@ -968,6 +969,7 @@ fn rank(kind: RefKind) -> u8 {
         RefKind::Model => 1,
         RefKind::Capability => 2,
         RefKind::Launcher => 3,
+        RefKind::Hardware => 4,
     }
 }
 
@@ -977,6 +979,7 @@ fn plural(kind: RefKind) -> &'static str {
         RefKind::Capability => "capabilities",
         RefKind::Model => "models",
         RefKind::Provider => "providers",
+        RefKind::Hardware => "hardware profiles",
     }
 }
 
@@ -1730,6 +1733,7 @@ mod tests {
                 provider_id: "other".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({ "discover_models": true }),
+                hardware: None,
             },
         );
         ctx.config_mut()
