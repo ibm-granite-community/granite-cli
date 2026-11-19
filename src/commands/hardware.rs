@@ -220,20 +220,6 @@ impl HardwareCommands {
         Self::choose_link_with(ctx, provider_type, current, interactive, detect_hardware)
     }
 
-    /// Asks which hardware the servers the setup wizard looks for run on:
-    /// `local`, another configured profile, "not specified", or a new
-    /// profile created with the `hardware setup` steps, starting on `local`.
-    /// `None` for "not specified".
-    pub(crate) fn choose_target(ctx: &mut AppContext) -> Result<Option<String>> {
-        let interactive = can_prompt(ctx);
-        Self::ask_profile(
-            ctx,
-            "Hardware to run models on",
-            interactive,
-            detect_hardware,
-        )
-    }
-
     /// Whether this run can ask the user something: the output backend is
     /// interactive, which for terminal and plain output means stdin and
     /// stderr are terminals (see [`crate::utils::ui::base::Ui::is_interactive`]).
@@ -616,60 +602,6 @@ impl HardwareCommands {
             }
             std::cmp::Ordering::Greater => Ok(HostLink::Unspecified),
         }
-    }
-
-    /// Asks `question` with the choices of [`Self::choose_target`], and
-    /// returns `local` without asking when the run is not `interactive`.
-    fn ask_profile(
-        ctx: &mut AppContext,
-        question: &str,
-        interactive: bool,
-        detect: impl FnOnce() -> HardwareProfile,
-    ) -> Result<Option<String>> {
-        if !interactive {
-            return Ok(Some(LOCAL_HARDWARE_ID.to_string()));
-        }
-        ctx.ensure_local_host(detect)?;
-        let mut ids: Vec<String> = ctx
-            .config()
-            .hardware
-            .keys()
-            .filter(|id| id.as_str() != LOCAL_HARDWARE_ID)
-            .cloned()
-            .collect();
-        ids.sort();
-        let local = ctx
-            .hardware_profile(LOCAL_HARDWARE_ID)
-            .map(|p| format!("local (this machine, {})", p.memory_summary()))
-            .unwrap_or_else(|_| "local (this machine)".to_string());
-        let mut items = vec![local];
-        for id in &ids {
-            let summary = ctx
-                .hardware_profile(id)
-                .map(|p| p.memory_summary())
-                .unwrap_or_else(|e| e);
-            items.push(format!("{id} ({summary})"));
-        }
-        ids.insert(0, LOCAL_HARDWARE_ID.to_string());
-        items.push("not specified (fit cannot be estimated)".to_string());
-        items.push("create new profile…".to_string());
-        let picked = ctx.ui.select(question, &items, 0)?;
-        if picked < ids.len() {
-            return Ok(Some(ids[picked].clone()));
-        }
-        if picked == ids.len() {
-            return Ok(None);
-        }
-        // Declining to replace a profile under the id typed leaves no new
-        // profile to use.
-        let id = Self::setup_with(
-            ctx,
-            HardwareSetupArgs::default(),
-            interactive,
-            detect_hardware,
-        )?
-        .ok_or_else(|| anyhow!("no hardware profile to use; hardware setup was skipped"))?;
-        Ok(Some(id))
     }
 
     fn profile_for_fit_with(
@@ -2869,69 +2801,6 @@ mod tests {
             ]
         );
         assert_eq!(*default, 0);
-    }
-
-    #[test]
-    fn the_wizard_can_create_a_hardware_profile_to_run_models_on() {
-        let _home = TestConfigHome::new();
-        let ui = Arc::new(CaptureUi::default());
-        let mut ctx = ctx_with_local(&ui, mac_36());
-        let spark = HARDWARE_CATALOG
-            .iter()
-            .filter(|e| e.family == "NVIDIA Workstation")
-            .position(|e| e.id == "dgx-spark")
-            .unwrap();
-        // "create new profile…" is last: local, not specified, create. Then
-        // the family and the device in it.
-        ui.select_answers
-            .borrow_mut()
-            .extend([2, family_index("NVIDIA Workstation"), spark]);
-        ui.text_answers.borrow_mut().push_back("spark".to_string());
-
-        let profile =
-            HardwareCommands::ask_profile(&mut ctx, "Hardware", true, no_detection).unwrap();
-
-        assert_eq!(profile.as_deref(), Some("spark"));
-        assert!(ctx.config().get_hardware("spark").is_some());
-    }
-
-    #[test]
-    fn the_wizard_declining_to_replace_the_typed_id_is_an_error() {
-        let _home = TestConfigHome::new();
-        let ui = Arc::new(CaptureUi::default());
-        let mut ctx = ctx_with_local(&ui, mac_36());
-        let lab = HardwareSetupArgs {
-            target: Some(CUSTOM_HARDWARE_TYPE.to_string()),
-            id: Some("spark".to_string()),
-            kind: Some(MemoryKind::Discrete),
-            memory: Some(24.0),
-            ..Default::default()
-        };
-        setup(&mut ctx, lab, false).unwrap();
-        let spark = HARDWARE_CATALOG
-            .iter()
-            .filter(|e| e.family == "NVIDIA Workstation")
-            .position(|e| e.id == "dgx-spark")
-            .unwrap();
-        // local, spark, not specified, create. Then the family and the
-        // device, the id of the existing profile, and no to replacing it.
-        ui.select_answers
-            .borrow_mut()
-            .extend([3, family_index("NVIDIA Workstation"), spark]);
-        ui.text_answers.borrow_mut().push_back("spark".to_string());
-        ui.confirm_answers.borrow_mut().push_back(false);
-
-        let err =
-            HardwareCommands::ask_profile(&mut ctx, "Hardware", true, no_detection).unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            "no hardware profile to use; hardware setup was skipped"
-        );
-        assert_eq!(
-            ctx.hardware_profile("spark").unwrap().memory.vram_gb(),
-            Some(24.0)
-        );
     }
 
     #[test]

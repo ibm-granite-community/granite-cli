@@ -32,14 +32,10 @@ pub(crate) struct AppContext {
     /// provider the sources hand out points at it, which is why setting it
     /// discards them.
     model_proxy: Option<crate::proxy::ProxyHandle>,
-    /// The host the setup wizard gives each provider it adds of a type the
-    /// user runs, once the user has named it, and the host to write first
-    /// when it is not configured yet. `None` outside the wizard, where a new
-    /// provider gets its type's default link.
-    setup_link: Option<(
-        crate::config::host::HostLink,
-        Option<crate::config::HostConfig>,
-    )>,
+    /// The providers the setup wizard found in this run and may add, by the
+    /// id they would be saved under, with their address and host link.
+    /// Empty outside the wizard.
+    found_providers: HashMap<String, crate::config::ProviderConfig>,
     /// Default base URLs a test has set for a provider type, in place of
     /// the registry's.
     #[cfg(test)]
@@ -61,7 +57,7 @@ impl AppContext {
             sources: std::sync::Mutex::new(None),
             hardware: std::sync::Mutex::new(HashMap::new()),
             model_proxy: None,
-            setup_link: None,
+            found_providers: HashMap::new(),
             #[cfg(test)]
             default_base_urls: HashMap::new(),
             #[cfg(test)]
@@ -93,33 +89,16 @@ impl AppContext {
             .insert(provider_type.to_string(), urls);
     }
 
-    /// The host the setup wizard gives each provider it adds of a type the
-    /// user runs, when the user has named it in this run.
-    pub(crate) fn setup_link(&self) -> Option<&crate::config::host::HostLink> {
-        self.setup_link.as_ref().map(|(link, _)| link)
+    /// A provider the setup wizard found in this run under `id`, not
+    /// configured yet.
+    pub(crate) fn found_provider(&self, id: &str) -> Option<&crate::config::ProviderConfig> {
+        self.found_providers.get(id)
     }
 
-    /// Records the host the setup wizard gives each provider it adds of a
-    /// type the user runs, and `new_host`, the host to write before the
-    /// first such provider when it is not configured.
-    pub(crate) fn set_setup_link(
-        &mut self,
-        link: crate::config::host::HostLink,
-        new_host: Option<crate::config::HostConfig>,
-    ) {
-        self.setup_link = Some((link, new_host));
-    }
-
-    /// Writes the host recorded by `set_setup_link`, if it is new and not
-    /// written yet.
-    pub(crate) fn write_setup_host(&mut self) -> anyhow::Result<()> {
-        let Some((_, Some(host))) = self.setup_link.clone() else {
-            return Ok(());
-        };
-        if self.config.get_host(&host.host_id).is_none() {
-            self.config_mut().insert_host(&host.host_id.clone(), host)?;
-        }
-        Ok(())
+    /// Records a provider the setup wizard found, under its `provider_id`.
+    pub(crate) fn add_found_provider(&mut self, provider: crate::config::ProviderConfig) {
+        self.found_providers
+            .insert(provider.provider_id.clone(), provider);
     }
 
     /// The configuration as it now stands.

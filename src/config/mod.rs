@@ -105,6 +105,15 @@ pub(crate) struct Config {
     pub(crate) recommended_configs: HashMap<String, recommended_config::RecommendedConfiguration>,
     pub(crate) hardware: HashMap<String, HardwareConfig>,
     pub(crate) hosts: HashMap<String, HostConfig>,
+    /// While set, writes stay in memory: `save` writes nothing and removals
+    /// are queued, until `write_deferred`. The setup wizard sets it so that
+    /// nothing from a run is written before its last step.
+    #[serde(skip)]
+    deferred: bool,
+    /// The files of entries removed while writes are deferred, as
+    /// (directory, id).
+    #[serde(skip)]
+    deferred_removals: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -800,6 +809,9 @@ impl Config {
     }
 
     fn save(&self) -> Result<()> {
+        if self.deferred {
+            return Ok(());
+        }
         #[cfg(test)]
         Self::assert_test_isolated();
 
@@ -880,7 +892,7 @@ impl Config {
 
     pub(crate) fn remove_model(&mut self, id: &str) -> Result<()> {
         self.models.remove(id);
-        Self::remove_model_file(id);
+        self.remove_model_file(id);
         self.save()
     }
 
@@ -900,7 +912,7 @@ impl Config {
         }
         for id in removals {
             self.models.remove(id);
-            Self::remove_model_file(id);
+            self.remove_model_file(id);
         }
         for (id, config) in additions {
             self.models.insert(id, config);
@@ -910,8 +922,35 @@ impl Config {
 
     /// Deletes the YAML file backing a model entry, best effort; an absent
     /// file is not an error.
-    fn remove_model_file(id: &str) {
-        Self::remove_config_file(Self::models_dir(), id);
+    fn remove_model_file(&mut self, id: &str) {
+        self.remove_file_of(Self::models_dir(), id);
+    }
+
+    /// Deletes the YAML file of entry `id` in `dir`, or queues it while
+    /// writes are deferred.
+    fn remove_file_of(&mut self, dir: Result<PathBuf>, id: &str) {
+        if self.deferred {
+            if let Ok(dir) = dir {
+                self.deferred_removals.push((dir, id.to_string()));
+            }
+        } else {
+            Self::remove_config_file(dir, id);
+        }
+    }
+
+    /// Keeps every later write in memory until [`Self::write_deferred`].
+    pub(crate) fn defer_writes(&mut self) {
+        self.deferred = true;
+    }
+
+    /// Writes what was kept in memory since [`Self::defer_writes`]: removes
+    /// the files of the entries removed, then saves every entry.
+    pub(crate) fn write_deferred(&mut self) -> Result<()> {
+        self.deferred = false;
+        for (dir, id) in std::mem::take(&mut self.deferred_removals) {
+            Self::remove_config_file(Ok(dir), &id);
+        }
+        self.save()
     }
 
     pub(crate) fn update_model(
@@ -940,7 +979,7 @@ impl Config {
 
     pub(crate) fn remove_provider(&mut self, id: &str) -> Result<()> {
         self.providers.remove(id);
-        Self::remove_config_file(Self::providers_dir(), id);
+        self.remove_file_of(Self::providers_dir(), id);
         self.save()
     }
 
@@ -970,7 +1009,7 @@ impl Config {
 
     pub(crate) fn remove_capability(&mut self, id: &str) -> Result<()> {
         self.capabilities.remove(id);
-        Self::remove_config_file(Self::capabilities_dir(), id);
+        self.remove_file_of(Self::capabilities_dir(), id);
         self.save()
     }
 
@@ -1000,7 +1039,7 @@ impl Config {
 
     pub(crate) fn remove_launcher(&mut self, id: &str) -> Result<()> {
         self.launchers.remove(id);
-        Self::remove_config_file(Self::launchers_dir(), id);
+        self.remove_file_of(Self::launchers_dir(), id);
         self.save()
     }
 
@@ -1035,10 +1074,7 @@ impl Config {
             anyhow::bail!("hardware profile '{id}' describes this machine and cannot be removed");
         }
         self.hardware.remove(id);
-        let path = Self::hardware_dir()?.join(format!("{}.yaml", Self::id_to_filename(id)));
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
+        self.remove_file_of(Self::hardware_dir(), id);
         self.save()
     }
 
@@ -1060,7 +1096,7 @@ impl Config {
             anyhow::bail!("host '{id}' is this machine and cannot be removed");
         }
         self.hosts.remove(id);
-        Self::remove_config_file(Self::hosts_dir(), id);
+        self.remove_file_of(Self::hosts_dir(), id);
         self.save()
     }
 
@@ -1608,6 +1644,42 @@ mod tests {
     fn write(dir: &Path, name: &str, content: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn deferred_writes_reach_the_disk_only_when_written() {
+        let _home = TestConfigHome::new();
+        let mut config = Config::new().unwrap();
+        config
+            .insert_host(
+                "gone",
+                HostConfig {
+                    host_id: "gone".to_string(),
+                    address: "gone.lan".to_string(),
+                    hardware: Vec::new(),
+                },
+            )
+            .unwrap();
+        config.defer_writes();
+        config
+            .insert_host(
+                "box",
+                HostConfig {
+                    host_id: "box".to_string(),
+                    address: "box.lan".to_string(),
+                    hardware: Vec::new(),
+                },
+            )
+            .unwrap();
+        config.remove_host("gone").unwrap();
+
+        assert!(!hosts_dir().join("box.yaml").exists());
+        assert!(hosts_dir().join("gone.yaml").exists());
+
+        config.write_deferred().unwrap();
+
+        assert!(hosts_dir().join("box.yaml").exists());
+        assert!(!hosts_dir().join("gone.yaml").exists());
     }
 
     #[test]

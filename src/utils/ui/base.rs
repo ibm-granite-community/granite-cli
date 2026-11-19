@@ -386,6 +386,24 @@ pub(crate) mod tests {
         /// so a test only sets this when it is testing what happens without
         /// a person to ask.
         pub(crate) interactive: RefCell<Option<bool>>,
+        /// When set, the first select or multi-select whose prompt contains
+        /// this text fails, as when the user presses Ctrl-C there.
+        pub(crate) quit_at: RefCell<Option<String>>,
+    }
+
+    impl CaptureUi {
+        /// Fails like Ctrl-C when `prompt` is the one `quit_at` names.
+        fn quit_if_asked(&self, prompt: &str) -> anyhow::Result<()> {
+            if self
+                .quit_at
+                .borrow()
+                .as_deref()
+                .is_some_and(|at| prompt.contains(at))
+            {
+                anyhow::bail!("interrupted at '{prompt}'");
+            }
+            Ok(())
+        }
     }
 
     impl ConfigConstructable for CaptureUi {
@@ -501,6 +519,7 @@ pub(crate) mod tests {
             self.select_prompts
                 .borrow_mut()
                 .push((prompt.to_string(), items.to_vec(), default));
+            self.quit_if_asked(prompt)?;
             Ok(self
                 .select_answers
                 .borrow_mut()
@@ -519,6 +538,7 @@ pub(crate) mod tests {
                 items.to_vec(),
                 defaults.to_vec(),
             ));
+            self.quit_if_asked(prompt)?;
             Ok(self
                 .multi_select_answers
                 .borrow_mut()

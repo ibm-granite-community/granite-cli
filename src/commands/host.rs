@@ -87,8 +87,13 @@ impl HostCommands {
     /// setup` runs it for "create new host…"; the host stays saved when the
     /// rest of that setup is cancelled.
     pub(crate) fn create(ctx: &mut AppContext) -> Result<String> {
-        setup_with(ctx, HostSetupArgs::default(), true)?
-            .ok_or_else(|| anyhow!("no host was configured"))
+        Self::add(ctx)?.ok_or_else(|| anyhow!("no host was configured"))
+    }
+
+    /// [`Self::create`], with `None` when the user keeps a configured host
+    /// as it was, so the caller can ask again.
+    pub(crate) fn add(ctx: &mut AppContext) -> Result<Option<String>> {
+        setup_with(ctx, HostSetupArgs::default(), true)
     }
 
     /// Asks again for the devices of host `id` and saves them, keeping its

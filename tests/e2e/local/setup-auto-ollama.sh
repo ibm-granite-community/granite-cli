@@ -30,6 +30,14 @@ gcli model list -o json
 expect_json 'ids | length > 0' "at least one model"
 expect_json "(col(\"PROVIDER\") - $providers) == []" "every PROVIDER is configured"
 
+step "the local host is written and ollama is linked to it"
+expect_file "$GRANITE_CLI_HOME/hosts/local.yaml"
+gcli host info local -o json
+expect_rc 0
+expect_json 'detail("Host '"'"'local'"'"'").Address == "localhost"' "local is at localhost"
+gcli provider list -o json
+expect_json 'row("ollama").HOST == "local"' "ollama has host: local"
+
 step "the stub launcher and at least one capability are configured"
 gcli launcher list -o json
 expect_json 'ids | index("opencode") != null' "opencode launcher"

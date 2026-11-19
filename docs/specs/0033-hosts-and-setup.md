@@ -1310,7 +1310,7 @@ link.
 - The "Configure a different …" items call the `setup` commands, which save
   at once.
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
