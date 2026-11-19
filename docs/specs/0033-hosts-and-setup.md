@@ -44,8 +44,8 @@ A host helps in four places.
   and detection on this machine reads the first NVIDIA device only. A box
   with two 24 GB cards is estimated as 24 GB, so a model that needs 40 GB is
   reported as not fitting, although llama.cpp, Ollama and LM Studio split a
-  model across the GPUs of one machine, and vLLM does when started to. With hosts, a machine lists its devices
-  and fit can use their combined memory.
+  model across the GPUs of one machine, and vLLM does when started to. With
+  hosts, a machine lists its devices and fit can use their combined memory.
 - **The address of a machine.** The address is stored only in provider base
   URLs. Two providers on one machine each carry it, so a machine that
   changes address needs every provider edited by hand, and nothing checks
@@ -511,6 +511,10 @@ $ granite-cli host setup pgx --address 10.0.0.12
 ✓ Host 'pgx' configured (10.0.0.12, hardware: pgx)
 ```
 
+A run that cannot prompt saves the new address and leaves the base URLs as
+they are; `provider list` then shows the address mismatch warning for each
+of them.
+
 `host remove` lists the providers linked to the host and offers the usual
 choices from spec 0024. `local` cannot be removed or set up by hand; its
 devices follow detection, and each can be changed with `hardware setup`.
@@ -795,6 +799,159 @@ in the run. The reference checks of spec 0024 gain two kinds: a provider's
 host, and a host's hardware profiles. `docs/data-model.md` gains the host
 between providers and hardware profiles.
 
+## Test Strategy
+
+The spec is implemented when the acceptance tests in this section exist and
+pass in CI, and the manual test guide has been run once on real hardware.
+The acceptance tests are written from the use cases, and each one names the
+use case it proves. The "Tests cover" list of each sub-task adds the unit
+tests behind them; those check parts, and the acceptance tests check that
+the parts give the behaviour a user sees.
+
+### Test levels
+
+```
+  level           where                               runs in CI                 drives
+  ─────           ─────                               ──────────                 ──────
+  in-process      src/, #[cfg(test)]                  check job, every run       the interactive wizard and prompts,
+                                                                                 through CaptureUi's canned answers,
+                                                                                 against fake provider servers
+
+  hermetic e2e    tests/e2e/hermetic/                 e2e job                    the binary, from fixtures: commands
+                                                                                 that do not prompt, files written,
+                                                                                 exit codes, JSON output
+
+  local e2e       tests/e2e/local/                    e2e-local job, Ollama      probing and sync against a real
+                                                      in Docker, --no-skip       provider server
+
+  manual          tests/e2e/manual/hosts-and-setup.md once, before the last     two GPUs, a remote box, the wizard
+                                                      sub-task merges            in a terminal, the TUI
+```
+
+The wizard asks its questions through the `Ui` trait, and only in-process
+tests can answer them, so the wizard's acceptance tests are in-process. They
+run the whole wizard, from the first question to the summary, against a
+temporary configuration home, and check the files it writes. No acceptance
+test depends on the machine it runs on, as AGENTS.md requires: detection is
+fed findings, the `local` hardware profile in fixtures is in manual mode,
+and provider servers are fakes on the loopback address.
+
+### Fixtures and helpers
+
+- **A fake provider server** in `src/utils/test_support.rs`. It serves the
+  health and model-list endpoints of ollama, llama-cpp and lm-studio with a
+  given list of models, on an ephemeral port of the loopback address, and
+  counts the requests it receives. It generalizes the Ollama server the
+  server-models change added to the setup tests.
+- **Default ports a test can set.** The wizard probes each type's default
+  URLs from the provider registry, and a fake server on an ephemeral port is
+  not at a default URL. The wizard reads the default URLs through
+  `AppContext`, which returns the registry's values unless a test has set
+  others, so a test can put "the default port" of a type on its fake server.
+  Configured providers and providers added at another address need no
+  setting: the test writes the fake server's URL in the configuration or
+  types it as the answer.
+- **Two hosts in one test** are `localhost` and `127.0.0.1`: two addresses,
+  which the wizard keeps apart, that both reach the test's fake servers. No
+  test needs a second machine or a network.
+- **The `hosts` e2e fixture**: the `local` host in manual mode; `pgx` and
+  `pgx2` sharing the `dgx-spark` profile; `box` listing `rtx-4090` twice, with
+  a llama-cpp provider, an openai-compatible provider that keeps the default
+  (`openai-box`), and one that sets `splits_across_devices: true`
+  (`vllm-box`); and `lab` with no hardware.
+- **The `spec0027` e2e fixture**: providers linked with `hardware:` to
+  `local`, `unspecified`, one profile shared by two providers at one address,
+  and one profile at two addresses.
+- **The manual guide** `tests/e2e/manual/hosts-and-setup.md`, from the
+  template, with the steps that need real hardware.
+
+### Acceptance tests
+
+Each use case has at least one acceptance test. The sub-task column says
+which sub-task makes it pass.
+
+```
+  use case                           test                                                    level        sub-task
+  ────────                           ────                                                    ─────        ────────
+  1 first setup on a laptop          wizard_local_host_only                                  in-process   6
+
+  2 setup --auto on a new machine    local/setup-auto-ollama.sh: hosts/local.yaml written,   local e2e    6
+                                     ollama has host: local
+
+  3 two cards in this machine        detection_two_gpus_two_local_devices,                   in-process   4
+                                     recommend_on_local_two_devices;
+                                     manual guide, step "two GPUs"                           manual
+
+  4 two cards in a remote box        hermetic/hosts-fit.sh: model recommend --host box,      hermetic     4
+                                     llama-cpp-box on 2 × 24 GB, openai-box on 24 GB
+
+  5 a vLLM server using both cards   hermetic/hosts-fit.sh: vllm-box on 2 × 24 GB            hermetic     4
+
+  6 add a box during setup           wizard_add_host_probes_its_address                      in-process   6
+
+  7 add a box from the command line  hermetic/host-commands.sh: host setup --address         hermetic     5
+                                     --hardware, host list, host info
+
+  8 a box whose hardware is unknown  hermetic/host-commands.sh: host setup without           hermetic     5
+                                     --hardware, "unknown" in host list, fit not available;
+                                     wizard_unknown_hardware_offers_served_models            in-process   6
+
+  9 two identical boxes              hermetic/host-commands.sh: hardware list HOSTS          hermetic     5
+                                     pgx, pgx2;
+                                     edit_shared_profile_new_profile_for_one_host,           in-process   5
+                                     edit_shared_profile_pick_uses
+
+  10 rank across both                wizard_binds_model_where_it_fits_best                   in-process   6
+
+  11 two providers of one type       wizard_same_type_on_two_hosts_two_ids                   in-process   6
+
+  12 a server on a non-default port  wizard_provider_at_other_address_is_ranked_and_bound:   in-process   7
+                                     the case from the #267 review, ending with a launcher
+                                     that has a capability
+
+  13 models a configured server has  wizard_marks_models_on_configured_provider              in-process   6
+
+  14 quit before the end             wizard_quit_writes_nothing: the configuration home is   in-process   6
+                                     the same tree before and after
+
+  15 know when something is missing  hermetic/setup-summary.sh: setup --auto with a stub     hermetic     7
+                                     launcher and no provider names it;
+                                     wizard_summary_names_launcher_without_capability        in-process   7
+
+  16 know when models compete        wizard_summary_memory_over_host                         in-process   7
+
+  17 hosts are remembered            wizard_offers_configured_hosts_and_skips_their_urls:    in-process   6
+                                     the fake server for a configured provider gets no
+                                     health check
+
+  18 move a box                      hermetic/host-commands.sh: a run that cannot prompt     hermetic     5
+                                     keeps the URLs and provider list warns;
+                                     host_setup_address_change_rewrites_when_accepted        in-process   5
+
+  19 upgrade                         hermetic/upgrade-0027.sh: the error names the file and  hermetic     2
+                                     the release notes; the script converts; model
+                                     recommend gives the same rows as before; a second run
+                                     changes nothing
+```
+
+The four hermetic scripts are written in sub-task 1, before the code they
+test. Each starts with `skip "spec 0033 sub-task N"`, so `run.sh` reports it
+as skipped, and the sub-task named in the table removes that line. The
+in-process tests use types that do not exist before their sub-task, so each
+is written in the sub-task the table names.
+
+### Definition of done
+
+- Every test in the acceptance table exists under the name given, or a name
+  the sub-task's commit message gives in its place.
+- `cargo test`, `tests/e2e/run.sh --no-skip hermetic/` and
+  `tests/e2e/run.sh --local --no-skip local/` pass in CI. With `--no-skip`, a
+  hermetic script that still has its skip line fails.
+- The tests that existed before this spec pass, changed only where the spec
+  changes the behaviour they check, such as `hardware:` becoming `host:`.
+- The manual guide has been run once on a machine with two GPUs and with one
+  remote host, and the result is in the pull request of the last sub-task.
+
 ## Open Questions
 
 1. **The per-device overhead figure.** `device_overhead_gb` defaults to 1 GB,
@@ -867,23 +1024,62 @@ machine per run, with the address still stored only in provider base URLs.
 ## Sub-Tasks
 
 Each sub-task is one commit, or one pull request, that leaves `main` working,
-with its tests and documentation. Sub-task 1 changes the configuration with
-no visible change other than the error for a spec 0027 provider file. Sub-task 3 can run in
-parallel with 4 to 6.
+with its tests and documentation. Sub-task 1 adds the acceptance tests and
+their fixtures, with the hermetic scripts skipped. Sub-task 2 changes the
+configuration with no visible change other than the error for a spec 0027
+provider file. Sub-task 4 can run in parallel with 5 to 7.
 
 ```mermaid
 flowchart LR
-  s1["1 hosts in the configuration"] --> s2["2 host links checked and shown"]
-  s1 --> s3["3 fit on several devices"]
-  s2 --> s4["4 host commands"]
-  s2 --> s5["5 wizard: collect, then plan"]
-  s4 -. "host setup steps reused" .-> s5
-  s5 --> s6["6 wizard: providers at other addresses, summary"]
+  s1["1 acceptance tests and fixtures"] --> s2["2 hosts in the configuration"]
+  s2 --> s3["3 host links checked and shown"]
+  s2 --> s4["4 fit on several devices"]
+  s3 --> s5["5 host commands"]
+  s3 --> s6["6 wizard: collect, then plan"]
+  s5 -. "host setup steps reused" .-> s6
+  s6 --> s7["7 wizard: providers at other addresses, summary"]
 ```
 
 ---
 
-### Sub-Task 1 — Hosts in the configuration
+### Sub-Task 1 — Acceptance tests and fixtures
+
+**Intent**
+Write down what done means for this spec as tests, before the code they
+test.
+
+**Expected Outcomes**
+
+The `hosts` and `spec0027` fixtures exist under `tests/e2e/fixtures/`. The
+wizard reads the default URLs of the provider types through `AppContext`,
+and tests can set them. The hermetic scripts `upgrade-0027.sh`,
+`hosts-fit.sh`, `host-commands.sh` and `setup-summary.sh` exist with every
+step of the acceptance table that they own, and each starts with `skip "spec
+0033 sub-task N"`, so `run.sh` reports them as skipped and CI stays green.
+`src/utils/test_support.rs` has the fake provider server for ollama,
+llama-cpp and lm-studio, and the setup tests that used the Ollama server
+from the server-models change use it instead. The manual guide
+`tests/e2e/manual/hosts-and-setup.md` exists with the steps for two GPUs, a
+remote host and the TUI. No behaviour changes.
+
+Tests cover: the fake server answering the health and model-list request of
+each type, counting requests, and refusing on a closed port; the wizard
+probing a default URL a test has set; the existing setup tests passing on
+the shared server; `shellcheck -x` passing on the new scripts; and `run.sh`
+listing the four scripts as skipped with their sub-task.
+
+**Relevant Context**
+- `tests/e2e/README.md`, `tests/e2e/lib.sh` (`use_fixture`, `skip`,
+  `expect_same_tree`), `tests/e2e/manual-test-template.md`
+- `src/utils/test_support.rs`
+- `src/commands/setup.rs` (the Ollama server in the setup tests)
+- [Test Strategy](#test-strategy)
+
+**Status** — `[ ]` not started
+
+---
+
+### Sub-Task 2 — Hosts in the configuration
 
 **Intent**
 Save hosts, link providers to hosts, and estimate fit through the host,
@@ -894,17 +1090,17 @@ with a script that converts spec 0027 configuration.
 The configuration gains a hosts directory, loaded and saved like the other
 kinds. A host saves its id, address and a list of hardware profile ids,
 which may be empty and may repeat an id; a list that mixes memory kinds
-fails to load with an error that names the file. The `local` host is written on first use with the
-address `localhost` and the `local` hardware profile, and cannot be removed.
-A provider's `hardware:` field becomes `host:`, with the values `local`, a
-host id and `unspecified`, and a provider with neither field still reads as
-`local (not set)`. A provider file with `hardware:` fails to load, with an
-error that names the file and the release notes. Fit for a provider is
-estimated on the largest device of its host, and is "not available" on a
-host with no devices, so every estimate for a converted configuration stays
-the same. A script in `scripts/` converts a spec 0027 configuration as
-[Upgrading from spec 0027](#upgrading-from-spec-0027) describes.
-`docs/data-model.md` shows the host.
+fails to load with an error that names the file. The `local` host is written
+on first use with the address `localhost` and the `local` hardware profile,
+and cannot be removed. A provider's `hardware:` field becomes `host:`, with
+the values `local`, a host id and `unspecified`, and a provider with neither
+field still reads as `local (not set)`. A provider file with `hardware:`
+fails to load, with an error that names the file and the release notes. Fit
+for a provider is estimated on the largest device of its host, and is "not
+available" on a host with no devices, so every estimate for a converted
+configuration stays the same. A script in `scripts/` converts a spec 0027
+configuration as [Upgrading from spec 0027](#upgrading-from-spec-0027)
+describes. `docs/data-model.md` shows the host.
 
 Tests cover: a host round-tripping through YAML, with one device and with the
 same profile listed twice, and with none; mixed memory kinds failing to
@@ -916,6 +1112,7 @@ link read as `local (not set)`; and the script converting a spec 0027
 configuration with `local`, `unspecified`, one profile shared by two
 providers at one address, and one profile at two addresses, then changing
 nothing on a second run. The script's test runs it on a fixture directory.
+`hermetic/upgrade-0027.sh` loses its skip line and passes.
 
 **Relevant Context**
 - `src/config/hardware.rs` (`HardwareLink`, `HardwareConfig`)
@@ -927,7 +1124,7 @@ nothing on a second run. The script's test runs it on a fixture directory.
 
 ---
 
-### Sub-Task 2 — Host links are checked and shown
+### Sub-Task 3 — Host links are checked and shown
 
 **Intent**
 Check host links like the other references, and show and ask for the host
@@ -964,7 +1161,7 @@ PROVIDERS column through hosts.
 
 ---
 
-### Sub-Task 3 — Fit on several devices
+### Sub-Task 4 — Fit on several devices
 
 **Intent**
 Estimate fit on all of a host's devices for providers that split a model,
@@ -972,24 +1169,28 @@ and detect every GPU on this machine.
 
 **Expected Outcomes**
 
-Provider metadata gives each type a default for splitting a model across
-the devices of one machine and for the per-device overhead: llama-cpp,
-ollama and lm-studio split, openai-compatible does not, and the overhead is
-1 GB. A provider's `splits_across_devices` and `device_overhead_gb` override
-them. Fit for a provider that splits, on a host with several devices, uses
-their combined usable memory less the overhead for each extra device; fit
-for any other provider uses the largest device. Detection reads every NVIDIA, AMD and DXGI device, and the `local`
-host lists one hardware profile per GPU, `local`, `local-2` and so on. The
-check before setup compares the devices found with the saved ones and asks
-when they differ. `host info` and `host list` show the devices, and
-`model recommend --host` estimates on a host's devices.
+Provider metadata gives each type a default for splitting a model across the
+devices of one machine and for the per-device overhead: llama-cpp, ollama
+and lm-studio split, openai-compatible does not, and the overhead is 1 GB. A
+provider's `splits_across_devices` and `device_overhead_gb` override them.
+Fit for a provider that splits, on a host with several devices, uses their
+combined usable memory less the overhead for each extra device; fit for any
+other provider uses the largest device. Detection reads every NVIDIA, AMD
+and DXGI device, and the `local` host lists one hardware profile per GPU,
+`local`, `local-2` and so on. The check before setup compares the devices
+found with the saved ones and asks when they differ. `host info` and `host
+list` show the devices, and `model recommend --host` estimates on a host's
+devices.
 
 Tests cover: fit on two equal devices and on two unequal ones, for a
 provider that splits and one that does not; the type defaults and each
-override; one device giving the same result as before; detection findings with two GPUs mapping to two `local` profiles,
-and with one GPU or unified memory mapping to one; the check asking when a
-GPU is added or removed; and `model recommend --host` output. Detection is
-tested through findings, not through the machine the tests run on.
+override; one device giving the same result as before; detection findings
+with two GPUs mapping to two `local` profiles, and with one GPU or unified
+memory mapping to one; the check asking when a GPU is added or removed;
+`model recommend --host` output; and the acceptance tests
+`detection_two_gpus_two_local_devices` and `recommend_on_local_two_devices`.
+`hermetic/hosts-fit.sh` loses its skip line and passes. Detection is tested
+through findings, not through the machine the tests run on.
 
 **Relevant Context**
 - `src/models/context_fit.rs` (`estimate`)
@@ -1002,7 +1203,7 @@ tested through findings, not through the machine the tests run on.
 
 ---
 
-### Sub-Task 4 — Host commands
+### Sub-Task 5 — Host commands
 
 **Intent**
 Let users list, inspect, add and remove hosts from the command line.
@@ -1030,8 +1231,11 @@ devices and for unknown hardware; the id default for a host name and for an
 IP address; each refused input; the address change rewriting base URLs when
 accepted and leaving them when declined; editing a shared profile for every
 use, and creating a new one for one host, for one device on a host, and for
-uses picked from `hardware setup`; and `remove` listing the providers on the
-host.
+uses picked from `hardware setup`; `remove` listing the providers on the
+host; and the acceptance tests `edit_shared_profile_new_profile_for_one_host`,
+`edit_shared_profile_pick_uses` and
+`host_setup_address_change_rewrites_when_accepted`.
+`hermetic/host-commands.sh` loses its skip line and passes.
 
 **Relevant Context**
 - `src/commands/hardware.rs` (the command group pattern, `choose_target`)
@@ -1042,7 +1246,7 @@ host.
 
 ---
 
-### Sub-Task 5 — The wizard collects, then plans
+### Sub-Task 6 — The wizard collects, then plans
 
 **Intent**
 Replace the wizard's hardware and host questions with a hosts step that
@@ -1055,13 +1259,13 @@ hosted services, all checked, and "Add a host…", which runs the `host setup`
 steps. For each selected host it lists the configured providers there and
 probes the default URLs of the types the user runs at the host's address,
 including types configured on another host and skipping URLs a configured
-provider uses. It lists the models every provider on a selected host
-serves, configured or found. Models are ranked on each selected host's
-devices; providers on a host with no devices are not ranked, and their
-served models are offered. A provider found on `local` keeps its type as id; one found on
-another host gets `<type>-<host id>`, and the wizard asks for an id when that
-one belongs to a provider at another address. Launchers, capabilities and
-models typed by hand through "Configure a different …" are added to the
+provider uses. It lists the models every provider on a selected host serves,
+configured or found. Models are ranked on each selected host's devices;
+providers on a host with no devices are not ranked, and their served models
+are offered. A provider found on `local` keeps its type as id; one found on
+another host gets `<type>-<host id>`, and the wizard asks for an id when
+that one belongs to a provider at another address. Launchers, capabilities
+and models typed by hand through "Configure a different …" are added to the
 plan, and the wizard writes nothing other than confirmed repairs until the
 write phase. It writes the hosts added in the run and links each new
 provider to its host. `setup --auto` links new providers to `local` or "not
@@ -1076,7 +1280,16 @@ configured provider serves marked "already on"; the same type found on two
 hosts saved under two ids; a model bound to the host it fits best on; a
 host with unknown hardware probed and its served models offered; a
 capability typed by hand written at the end and not written when the user
-quits before it; and `setup --auto` writing `local` and linking to it.
+quits before it; `setup --auto` writing `local` and linking to it; and the
+acceptance tests `wizard_local_host_only`,
+`wizard_add_host_probes_its_address`,
+`wizard_unknown_hardware_offers_served_models`,
+`wizard_binds_model_where_it_fits_best`,
+`wizard_same_type_on_two_hosts_two_ids`,
+`wizard_marks_models_on_configured_provider`, `wizard_quit_writes_nothing`
+and `wizard_offers_configured_hosts_and_skips_their_urls`.
+`local/setup-auto-ollama.sh` checks the `local` host and the provider's
+link.
 
 **Relevant Context**
 - `src/commands/setup.rs` (`run_wizard`, `select_target`,
@@ -1097,7 +1310,7 @@ quits before it; and `setup --auto` writing `local` and linking to it.
 
 ---
 
-### Sub-Task 6 — Providers at other addresses, and what the summary reports
+### Sub-Task 7 — Providers at other addresses, and what the summary reports
 
 **Intent**
 Let the user add a provider at a non-default address before models are
@@ -1128,7 +1341,12 @@ each of the three choices for an address that does not answer; the
 summary naming a launcher left without a capability, in the wizard and in
 `setup --auto`; and the memory line for a host over its memory, not shown
 for a host under it, with a model of unknown size noted, and skipped for a
-host with unknown hardware.
+host with unknown hardware; and the acceptance tests
+`wizard_provider_at_other_address_is_ranked_and_bound`,
+`wizard_summary_names_launcher_without_capability` and
+`wizard_summary_memory_over_host`. `hermetic/setup-summary.sh` loses its
+skip line and passes. With this sub-task, the
+[definition of done](#definition-of-done) is met.
 
 **Relevant Context**
 - `src/commands/setup.rs` (`select_providers`,
