@@ -1246,7 +1246,7 @@ host; and the acceptance tests `edit_shared_profile_new_profile_for_one_host`,
 - `src/main.rs` (`Commands`)
 - `src/commands/shared/remediation.rs`
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 

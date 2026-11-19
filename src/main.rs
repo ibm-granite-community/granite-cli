@@ -168,6 +168,59 @@ enum HardwareSubcommands {
 }
 
 #[derive(clap::Args, Debug)]
+struct HostWithOutput {
+    /// Output format
+    #[arg(short, long, global = true, default_value = "terminal", value_parser = output_formats())]
+    output: String,
+
+    #[command(subcommand)]
+    subcommand: HostSubcommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum HostSubcommands {
+    /// List the hosts, with their addresses, devices and providers
+    List,
+
+    /// Show a host's address, devices and providers
+    Info {
+        /// Host id
+        host_id: String,
+    },
+
+    /// Add a host, or change a configured one (`local` follows detection)
+    Setup {
+        /// Host id (defaults to the first label of a host name; for an IP
+        /// address, to the first hardware profile, or `host` without one)
+        host_id: Option<String>,
+
+        /// Host name or IP address
+        #[arg(long)]
+        address: Option<String>,
+
+        /// Hardware profile of one device; repeat it for each device, or
+        /// leave it out when the hardware is not known (see `hardware list`)
+        #[arg(long)]
+        hardware: Vec<String>,
+    },
+
+    /// Remove a host (`local` cannot be removed)
+    Remove {
+        /// Host id
+        host_id: String,
+
+        /// How to handle the providers on this host. `cascade` removes
+        /// them too; `refuse` aborts with a non-zero exit; `leave` removes
+        /// only the host and leaves the providers' links broken. Omitting
+        /// the flag prompts when the run can ask; otherwise, when providers
+        /// are on the host, it aborts with a non-zero exit that names the
+        /// policies.
+        #[arg(long, value_name = "POLICY")]
+        dependents: Option<DependentsPolicy>,
+    },
+}
+
+#[derive(clap::Args, Debug)]
 struct LaunchWithOutput {
     /// Output format
     #[arg(short, long, global = true, default_value = "terminal", value_parser = output_formats())]
@@ -258,6 +311,10 @@ enum Commands {
     /// Hardware profiles: show the local machine, browse the catalog, and
     /// manage the hardware providers run on
     Hardware(HardwareWithOutput),
+
+    /// Hosts: the machines that run model servers, with their addresses and
+    /// devices
+    Host(HostWithOutput),
 
     /// Launch a configured launcher with Granite overlay
     Launch(LaunchWithOutput),
@@ -766,6 +823,16 @@ async fn main() {
             run_hardware_command(&mut ctx, wrapper.subcommand)
                 .map_err(|e| ctx.ui.error(&e.to_string()))
         }
+        Some(Commands::Host(wrapper)) => {
+            let mut ctx = construct_context(
+                &wrapper.output,
+                &log_level,
+                &log_filters,
+                log_json,
+                log_thread_id,
+            );
+            run_host_command(&mut ctx, wrapper.subcommand).map_err(|e| ctx.ui.error(&e.to_string()))
+        }
         Some(Commands::Launcher(wrapper)) => {
             let mut ctx = construct_context(
                 &wrapper.output,
@@ -880,6 +947,30 @@ async fn main() {
     }
 }
 
+fn run_host_command(ctx: &mut AppContext, subcmd: HostSubcommands) -> anyhow::Result<()> {
+    match subcmd {
+        HostSubcommands::List => commands::HostCommands::list(ctx),
+        HostSubcommands::Info { host_id } => commands::HostCommands::info(ctx, &host_id),
+        HostSubcommands::Setup {
+            host_id,
+            address,
+            hardware,
+        } => commands::HostCommands::setup(
+            ctx,
+            commands::host::HostSetupArgs {
+                id: host_id,
+                address,
+                hardware,
+            },
+        )
+        .map(|_| ()),
+        HostSubcommands::Remove {
+            host_id,
+            dependents,
+        } => commands::HostCommands::remove(ctx, &host_id, dependents),
+    }
+}
+
 fn run_hardware_command(
     ctx: &mut AppContext,
     subcmd: Option<HardwareSubcommands>,
@@ -914,6 +1005,7 @@ fn run_hardware_command(
                 headroom,
                 force_overwrite: false,
                 check_local: true,
+                for_host: None,
             },
         )
         .map(|_| ()),

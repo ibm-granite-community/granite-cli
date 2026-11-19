@@ -40,6 +40,9 @@ pub(crate) struct HardwareSetupArgs {
     /// `local`, as the `hardware` commands do. Set by `hardware setup`;
     /// callers that create a profile on the way leave it off.
     pub(crate) check_local: bool,
+    /// When the profile is shared and the user creates a new one, the host
+    /// whose devices may move to it. `None` offers every use.
+    pub(crate) for_host: Option<String>,
 }
 
 impl HardwareCommands {
@@ -179,7 +182,7 @@ impl HardwareCommands {
         if devices.is_empty() {
             return "unknown".to_string();
         }
-        let mut counted: Vec<(String, usize)> = Vec::new();
+        let mut counted: Vec<Use> = Vec::new();
         for device in devices {
             match counted.iter_mut().find(|(d, _)| *d == device) {
                 Some((_, n)) => *n += 1,
@@ -345,6 +348,114 @@ impl HardwareCommands {
             ctx.set_local_devices(detected)?;
         }
         Ok(())
+    }
+
+    /// The id to save a profile under, and the uses of a shared profile
+    /// that move to it, or `None` when the user keeps the profile that is
+    /// there. A profile listed by several hosts, or more than once on one
+    /// host, is shared: an interactive run asks whether to edit it for every
+    /// use or to create a new profile, and which uses move to it.
+    fn claim_id(
+        ctx: &AppContext,
+        id: &str,
+        args: &HardwareSetupArgs,
+        interactive: bool,
+    ) -> Result<Option<(String, Vec<Use>)>> {
+        let uses = uses_of(ctx, id);
+        let shared = ctx.config().get_hardware(id).is_some() && uses.len() > 1;
+        if !(shared && interactive) {
+            let keep = replace_existing(ctx, id, args.force_overwrite, interactive)?;
+            return Ok(keep.then(|| (id.to_string(), Vec::new())));
+        }
+        ctx.ui.warn(&format!(
+            "'{id}' is used by {}.",
+            join_and(&uses.iter().map(|u| use_label(ctx, u)).collect::<Vec<_>>())
+        ));
+        let (question, create) = match &args.for_host {
+            Some(host) => (
+                format!("Edit the shared profile, or create a new one for {host}?"),
+                format!("Create a new profile for {host}"),
+            ),
+            None => (
+                "Edit the shared profile, or create a new one?".to_string(),
+                "Create a new profile".to_string(),
+            ),
+        };
+        let items = ["Edit the shared profile".to_string(), create];
+        if ctx.ui.select(&question, &items, 0)? == 0 {
+            return Ok(Some((id.to_string(), Vec::new())));
+        }
+        let offered: Vec<Use> = match &args.for_host {
+            Some(host) => uses.iter().filter(|(h, _)| h == host).cloned().collect(),
+            None => uses.clone(),
+        };
+        let picked: Vec<Use> = if offered.len() == 1 {
+            offered
+        } else {
+            let (question, labels): (String, Vec<String>) = match &args.for_host {
+                Some(host) => (
+                    format!("Which devices on {host} use the new profile?"),
+                    offered
+                        .iter()
+                        .map(|(_, i)| format!("device {}", i + 1))
+                        .collect(),
+                ),
+                None => (
+                    "Which uses move to the new profile?".to_string(),
+                    offered.iter().map(|u| use_label(ctx, u)).collect(),
+                ),
+            };
+            let mut defaults = vec![false; labels.len()];
+            if args.for_host.is_some() {
+                defaults[0] = true;
+            }
+            let chosen = ctx.ui.multi_select(&question, &labels, &defaults)?;
+            chosen.into_iter().map(|i| offered[i].clone()).collect()
+        };
+        if picked.is_empty() {
+            ctx.ui.info(&format!(
+                "No use moves to a new profile; '{id}' is unchanged."
+            ));
+            return Ok(None);
+        }
+        let default = format!("{id}-{}", picked[0].0);
+        let new_id = loop {
+            let answer = ctx.ui.text("Profile id", &default)?;
+            let answer = answer.trim().to_string();
+            let taken = ctx.config().get_hardware(&answer).is_some();
+            match check_profile_id(&answer) {
+                Ok(()) if !taken => break answer,
+                Ok(()) => ctx.ui.warn(&format!(
+                    "hardware profile '{answer}' is already configured"
+                )),
+                Err(e) => ctx.ui.warn(&e.to_string()),
+            }
+        };
+        Ok(Some((new_id, picked)))
+    }
+
+    /// Edits hardware profile `profile`, which host `host` lists, from `host
+    /// setup`, and returns the host's devices afterwards: unchanged when the
+    /// profile is edited for every use, and with the devices the user picked
+    /// moved to a new profile otherwise.
+    pub(crate) fn edit_for_host(
+        ctx: &mut AppContext,
+        profile: &str,
+        host: &str,
+    ) -> Result<Vec<String>> {
+        let hardware_type = ctx
+            .config()
+            .get_hardware(profile)
+            .map(|hw| hw.hardware_type.clone())
+            .ok_or_else(|| not_configured(ctx, profile))?;
+        let args = HardwareSetupArgs {
+            target: Some(hardware_type),
+            id: Some(profile.to_string()),
+            for_host: Some(host.to_string()),
+            ..Default::default()
+        };
+        Self::setup_with(ctx, args, true, detect_hardware)?;
+        Ok(ctx.config().host_hardware(host))
     }
 
     fn compare_local_profile(
@@ -736,16 +847,35 @@ impl HardwareCommands {
                  `custom` or `local`"
             ),
         };
+        // `hardware setup <profile id>` changes that profile.
+        let (target, args) = match ctx.config().get_hardware(&target) {
+            Some(hw)
+                if hardware_catalog::find(&target).is_none()
+                    && target != LOCAL_HARDWARE_ID
+                    && target != CUSTOM_HARDWARE_TYPE
+                    && args.id.is_none() =>
+            {
+                let args = HardwareSetupArgs {
+                    id: Some(target.clone()),
+                    ..args
+                };
+                (hw.hardware_type.clone(), args)
+            }
+            _ => (target, args),
+        };
         check_flags(&target, &args)?;
         // Taken by `setup local`, or by the check of `local` below.
         let mut detect = Some(detect);
+        // The uses of a shared profile that move to the new one.
+        let mut moves: Vec<Use> = Vec::new();
         let mut config = match target.as_str() {
             LOCAL_HARDWARE_ID => setup_local(ctx, &args, interactive, detect.take().unwrap())?,
             CUSTOM_HARDWARE_TYPE => {
                 let id = profile_id(ctx, &args, None, interactive)?;
-                if !replace_existing(ctx, &id, args.force_overwrite, interactive)? {
+                let Some((id, picked)) = Self::claim_id(ctx, &id, &args, interactive)? else {
                     return Ok(None);
-                }
+                };
+                moves = picked;
                 let profile = typed_figures(ctx, &args, interactive)?;
                 HardwareConfig::custom(&id, profile)
             }
@@ -758,9 +888,10 @@ impl HardwareCommands {
                 })?;
                 let memory = catalog_size(ctx, entry, args.memory, interactive)?;
                 let id = profile_id(ctx, &args, Some(catalog_id), interactive)?;
-                if !replace_existing(ctx, &id, args.force_overwrite, interactive)? {
+                let Some((id, picked)) = Self::claim_id(ctx, &id, &args, interactive)? else {
                     return Ok(None);
-                }
+                };
+                moves = picked;
                 HardwareConfig::catalog(&id, catalog_id, memory)
             }
         };
@@ -774,6 +905,7 @@ impl HardwareCommands {
             Self::check_local_or_warn(ctx, detect, interactive);
         }
         ctx.config_mut().insert_hardware(&id, config)?;
+        move_uses(ctx, &moves, &id)?;
         let summary = ctx
             .hardware_profile(&id)
             .map(|p| p.memory_summary())
@@ -887,6 +1019,63 @@ fn hosts_using(ctx: &AppContext, id: &str) -> Vec<String> {
     ids.retain(|host| config.host_hardware(host).iter().any(|h| h == id));
     ids.sort();
     ids
+}
+
+/// A host that lists a hardware profile, and the position, from 0, of that
+/// device in the host's list.
+type Use = (String, usize);
+
+/// Each use of hardware profile `id`, hosts sorted by id.
+fn uses_of(ctx: &AppContext, id: &str) -> Vec<Use> {
+    let mut hosts: Vec<String> = ctx.config().hosts.keys().cloned().collect();
+    if !hosts.iter().any(|h| h == LOCAL_HOST_ID) {
+        hosts.push(LOCAL_HOST_ID.to_string());
+    }
+    hosts.sort();
+    let mut uses = Vec::new();
+    for host in hosts {
+        for (i, device) in ctx.config().host_hardware(&host).iter().enumerate() {
+            if device == id {
+                uses.push((host.clone(), i));
+            }
+        }
+    }
+    uses
+}
+
+/// A use as the questions name it: the host, and the device number when
+/// the host lists the profile more than once.
+fn use_label(ctx: &AppContext, (host, i): &Use) -> String {
+    let devices = ctx.config().host_hardware(host);
+    let id = &devices[*i];
+    if devices.iter().filter(|d| *d == id).count() > 1 {
+        format!("{host} (device {})", i + 1)
+    } else {
+        host.clone()
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Points each use in `moves` at profile `id`.
+fn move_uses(ctx: &mut AppContext, moves: &[Use], id: &str) -> Result<()> {
+    for (host, i) in moves {
+        let Some(mut config) = ctx.config().get_host(host).cloned() else {
+            continue;
+        };
+        if let Some(device) = config.hardware.get_mut(*i) {
+            *device = id.to_string();
+        }
+        ctx.config_mut().insert_host(host, config)?;
+    }
+    Ok(())
 }
 
 /// See [`HardwareCommands::providers_on`].

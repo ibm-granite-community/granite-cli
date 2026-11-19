@@ -6,12 +6,12 @@
 # shellcheck source=tests/e2e/lib.sh
 . "$(dirname "$0")/../lib.sh"
 
-skip "spec 0033 sub-task 5"
-
 hosts_dir() { echo "$GRANITE_CLI_HOME/hosts"; }
 
 step "read-only commands list the hosts and leave the files as they were"
 use_fixture hosts
+# The first load creates the empty per-kind directories; snapshot after it.
+gcli host list -o json
 rm -rf "$E2E_TMP/before"
 cp -R "$GRANITE_CLI_HOME" "$E2E_TMP/before"
 gcli host list -o json
@@ -59,6 +59,8 @@ expect_json 'row("mystery").DEVICES == "unknown"' "mystery's hardware is unknown
 
 step "host setup refuses what it cannot save, and writes nothing"
 use_fixture hosts
+# The first load creates the empty per-kind directories; snapshot after it.
+gcli host list -o json
 rm -rf "$E2E_TMP/before"
 cp -R "$GRANITE_CLI_HOME" "$E2E_TMP/before"
 gcli host setup local --address example.lan -o json
