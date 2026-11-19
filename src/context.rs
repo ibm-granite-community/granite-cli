@@ -44,6 +44,10 @@ pub(crate) struct AppContext {
     /// detection finds. Empty unless a test sets them.
     #[cfg(test)]
     other_gpus: Vec<HardwareProfile>,
+    /// The launcher commands a test says are on PATH, by launcher type, in
+    /// place of looking them up. `None` unless a test sets them.
+    #[cfg(test)]
+    launcher_paths: Option<HashMap<String, String>>,
 }
 
 impl AppContext {
@@ -62,6 +66,8 @@ impl AppContext {
             default_base_urls: HashMap::new(),
             #[cfg(test)]
             other_gpus: Vec::new(),
+            #[cfg(test)]
+            launcher_paths: None,
         }
     }
 
@@ -93,6 +99,11 @@ impl AppContext {
     /// configured yet.
     pub(crate) fn found_provider(&self, id: &str) -> Option<&crate::config::ProviderConfig> {
         self.found_providers.get(id)
+    }
+
+    /// Every provider the setup wizard found in this run.
+    pub(crate) fn found_providers(&self) -> impl Iterator<Item = &crate::config::ProviderConfig> {
+        self.found_providers.values()
     }
 
     /// Records a provider the setup wizard found, under its `provider_id`.
@@ -230,6 +241,35 @@ impl AppContext {
                 .skip(1)
                 .collect()
         }
+    }
+
+    /// The path of the command of launcher type `launcher_type`, which
+    /// `look_up` finds on PATH. In tests that set the commands with
+    /// `set_launcher_paths`, what they set, so the wizard's launcher list
+    /// does not depend on the machine.
+    pub(crate) fn launcher_path(
+        &self,
+        launcher_type: &str,
+        look_up: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        #[cfg(test)]
+        if let Some(paths) = &self.launcher_paths {
+            return paths.get(launcher_type).cloned();
+        }
+        let _ = launcher_type;
+        look_up()
+    }
+
+    /// Makes `launcher_path` return the paths in `paths`, and nothing for
+    /// any other launcher type.
+    #[cfg(test)]
+    pub(crate) fn set_launcher_paths(&mut self, paths: &[(&str, &str)]) {
+        self.launcher_paths = Some(
+            paths
+                .iter()
+                .map(|(t, p)| (t.to_string(), p.to_string()))
+                .collect(),
+        );
     }
 
     /// Makes `other_gpus` return `gpus`.

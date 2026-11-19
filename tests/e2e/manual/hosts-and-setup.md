@@ -1,15 +1,23 @@
 # Manual test: hosts and setup (spec 0033)
 
-Branch `specs/0033-hosts-and-setup-impl`, tip `<short sha>`, on top of
-`origin/main` `<short sha>`.
+Branch `specs/0033-hosts-and-setup-impl`, on top of `origin/main` `bdb6aad`
+and the two spec commits of PR #289.
 
 | Commit | Content |
 |---|---|
-| `<sha>` | <one line per commit> |
+| `d2d5169` | Sub-task 1: acceptance tests, fixtures, fake provider server |
+| `aefe005` | Sub-task 2: providers link to hosts; conversion script |
+| `c4e6cfc` | Sub-task 3: host links checked and shown; host in `provider setup` |
+| `2185196` | Sub-task 4: fit on several devices; every GPU detected |
+| `0a9d3a5` | Sub-task 5: `host` commands; shared hardware profiles |
+| `283d900` | Sub-task 6: the wizard collects hosts and providers, then plans |
+| `d1810a6` | Sub-task 7: providers at other addresses; summary lines |
 
-All output below was observed on <machine: OS, CPU, GPUs, memory> with the
-debug build of `<sha>`, unless a section says otherwise. <Which servers were
-running on this machine and on the remote host.>
+The automated steps were run on macOS (Apple Silicon) with the debug build of
+`d1810a6`, with Ollama on `localhost:11434` for the local test. The manual
+steps have not been run: they need a machine with two GPUs and a second
+machine on the network. Fill in the machine and the output when you run
+them.
 
 Steps 6 to 8 need hardware a CI runner does not have: a machine with two
 NVIDIA or AMD GPUs, and a second machine on the network that runs a model
@@ -20,24 +28,22 @@ server. Steps 9 and 10 need a terminal.
 Run every automated step:
 
 ```sh
-tests/e2e/run.sh --no-skip upgrade-0027
-tests/e2e/run.sh --no-skip hosts-fit
-tests/e2e/run.sh --no-skip host-commands
-tests/e2e/run.sh --no-skip setup-summary
-tests/e2e/run.sh --local --no-skip setup-auto-ollama
+tests/e2e/run.sh --no-skip hermetic/
+tests/e2e/run.sh --local --no-skip setup-auto-ollama   # needs Ollama on localhost:11434
+cargo +1.99 test wizard_ host_setup edit_shared recommend_on detection_two_gpus
 ```
 
 It prints `PASS`, `FAIL` or `SKIP` for each script, and the checks of a
 script that fails. The wizard's acceptance tests are in-process; run them
 with `cargo test wizard_`.
 
-| Step | What it covers | Kind | Status on `<short sha>` |
+| Step | What it covers | Kind | Status on `d1810a6` |
 |---|---|---|---|
-| 1 | A spec 0027 configuration fails to load, and the script converts it | Automated (`hermetic/upgrade-0027.sh`) | Not run yet |
-| 2 | `model recommend --host` on a host with two cards | Automated (`hermetic/hosts-fit.sh`) | Not run yet |
-| 3 | `host` commands: setup, list, info, remove; address change | Automated (`hermetic/host-commands.sh`) | Not run yet |
-| 4 | `setup --auto` names a launcher left without a capability | Automated (`hermetic/setup-summary.sh`) | Not run yet |
-| 5 | `setup --auto` writes the `local` host and links Ollama to it | Automated, needs Ollama on `localhost:11434` (`local/setup-auto-ollama.sh`) | Not run yet |
+| 1 | A spec 0027 configuration fails to load, and the script converts it | Automated (`hermetic/upgrade-0027.sh`) | Passed in the automated run (2026-11-19) |
+| 2 | `model recommend --host` on a host with two cards | Automated (`hermetic/hosts-fit.sh`) | Passed in the automated run (2026-11-19) |
+| 3 | `host` commands: setup, list, info, remove; address change | Automated (`hermetic/host-commands.sh`) | Passed in the automated run (2026-11-19) |
+| 4 | `setup --auto` names a launcher left without a capability | Automated (`hermetic/setup-summary.sh`) | Passed in the automated run (2026-11-19) |
+| 5 | `setup --auto` writes the `local` host and links Ollama to it | Automated, needs Ollama on `localhost:11434` (`local/setup-auto-ollama.sh`) | Passed in the automated run (2026-11-19) |
 | 6 | Detection lists every GPU of this machine as a `local` device | Manual: needs a machine with two GPUs | Not run yet |
 | 7 | Fit on two local GPUs for llama-cpp and Ollama | Manual: needs a machine with two GPUs | Not run yet |
 | 8 | A remote host added from the command line and probed by the wizard | Manual: needs a second machine running a model server, and a terminal | Not run yet |
@@ -159,7 +165,7 @@ URL of `llama-cpp-pgx` still uses `pgx.lan` and `provider list` notes it.
 
 ```sh
 fresh; fresh_home; stub_bin opencode
-GRANITE_CLI_TEST_DEFAULT_BASE_URL=http://127.0.0.1:9 $B setup --auto --skip-pull -o plain </dev/null
+GRANITE_CLI_TEST_DEFAULT_BASE_URL=http://127.0.0.1:9 $B setup --auto --skip-pull </dev/null
 ```
 
 Expected: the summary ends with `⚠ Launcher 'opencode' has no capability`
@@ -172,7 +178,7 @@ Needs Ollama on `localhost:11434`. Sub-task 6 adds these checks to
 
 ```sh
 fresh; fresh_home; stub_bin opencode
-$B setup --auto --skip-pull -o plain </dev/null
+$B setup --auto --skip-pull </dev/null
 cat "$GRANITE_CLI_HOME/hosts/local.yaml" "$P/ollama.yaml"
 ```
 
@@ -197,7 +203,7 @@ Start llama-server and Ollama on their default ports, then:
 
 ```sh
 fresh; fresh_home
-$B setup --auto --skip-pull -o plain </dev/null
+$B setup --auto --skip-pull </dev/null
 $B model recommend --host local -o plain </dev/null
 ```
 
@@ -216,7 +222,7 @@ fresh
 $B host setup
 ```
 
-1. At `Host name or IP address:`, type `$REMOTE` and press Enter.
+1. At `Host name or IP address`, type `$REMOTE` and press Enter.
 2. At `Hardware on <address>:`, pick `create new profile…`, then the family
    and card of the remote machine, and accept the profile id.
 3. At `How many of these on <address>?`, type the number of cards.
@@ -242,8 +248,10 @@ $B setup
 ```
 
 1. At the launchers question, keep the defaults.
-2. At `Hosts to run models on`, keep `local`, the remote host and the hosted
-   services checked, and press Enter.
+2. At `Hosts to run models on`, keep `local` and the hosted services
+   checked, check `→ Add a host…` if the remote host is not configured yet
+   (it runs the step 8 questions and comes back with it checked), and press
+   Enter.
 3. The wizard prints `Looking for providers on localhost...` and then on the
    remote address. For the remote host, at `Add a provider on <address> at
    another address?`, pick `llama-cpp`, clear the field, type
@@ -274,7 +282,10 @@ host with several devices, the memory the provider type can use there.
 
 ## 4. Not verified
 
-- <What was not run, and why.>
+- Steps 6 to 10: they need two GPUs, a second machine and a terminal.
+- The Windows DXGI probe, rewritten to list every adapter, was not compiled
+  here: cross-compiling from macOS fails in `openssl-sys`.
+- `shellcheck -x` on the new scripts was not run locally; CI runs it.
 
 ## 5. Findings
 

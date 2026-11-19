@@ -8,19 +8,19 @@
 # shellcheck source=tests/e2e/lib.sh
 . "$(dirname "$0")/../lib.sh"
 
-skip "spec 0033 sub-task 7"
-
 export GRANITE_CLI_TEST_DEFAULT_BASE_URL=http://127.0.0.1:9
 
 step "setup --auto with a launcher and no provider names the launcher"
 fresh
 fresh_home
 stub_bin opencode
-gcli setup --auto --skip-pull -o plain
+# Only the stub launcher, so launchers installed on the machine take no part.
+PATH="$E2E_TMP/bin:/usr/bin:/bin" gcli setup --auto --skip-pull
 expect_rc 0
 expect_out_contains "=== Setup Complete ==="
-expect_out_contains "Launcher 'opencode' has no capability"
-expect_out_contains "granite-cli capability setup"
+# Warnings go to stderr.
+expect_err_contains "Launcher 'opencode' has no capability: its recommended 'agent-model' did not resolve"
+expect_err_contains "Run \`granite-cli capability setup\` to bind one."
 
 step "no provider was added"
 if [ -z "$(ls -A "$P")" ]; then pass "providers/ is empty"; else fail "providers/ has: $(ls -A "$P")"; fi

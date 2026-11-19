@@ -11,7 +11,6 @@ use crate::capabilities::{BindingType, CAPABILITY_REGISTRY, Dependency, ModelReq
 use crate::commands::capability::CapabilityCommands;
 use crate::commands::launcher::LauncherCommands;
 use crate::commands::model::ModelCommands;
-use crate::commands::provider::ProviderCommands;
 use crate::config::recommended_config;
 use crate::dependency::{Configured, Requirement};
 use crate::launchers::LAUNCHER_REGISTRY;
@@ -415,18 +414,16 @@ impl Discover {
             // Construct a transient instance with default config
             let default_config = LAUNCHER_REGISTRY.default_config(launcher_type);
             match LAUNCHER_REGISTRY.construct(launcher_type, launcher_type, &default_config) {
-                Ok(launcher) => match launcher.validate_command() {
-                    Ok(path) => recommendations.push(Recommendation::Launcher {
-                        launcher_type: launcher_type.to_string(),
-                        launcher_name: metadata.name.clone(),
-                        binary_path: Some(path.to_string_lossy().to_string()),
+                Ok(launcher) => recommendations.push(Recommendation::Launcher {
+                    launcher_type: launcher_type.to_string(),
+                    launcher_name: metadata.name.clone(),
+                    binary_path: ctx.launcher_path(launcher_type, || {
+                        launcher
+                            .validate_command()
+                            .ok()
+                            .map(|path| path.to_string_lossy().to_string())
                     }),
-                    Err(_) => recommendations.push(Recommendation::Launcher {
-                        launcher_type: launcher_type.to_string(),
-                        launcher_name: metadata.name.clone(),
-                        binary_path: None,
-                    }),
-                },
+                }),
                 Err(_) => {
                     // Could not construct — still recommend but without binary info
                     recommendations.push(Recommendation::Launcher {
@@ -1128,6 +1125,32 @@ struct ResolvedCapability {
     slots: HashMap<String, (String, ModelVariant)>,
 }
 
+/// How the providers question labels a provider added at an address that
+/// did not answer.
+const ADDED_ANYWAY: &str = "added, not answering; models not listed";
+
+/// The provider types offered after probing a host: the types the user
+/// runs, or, for the hosted services (`hosted`), the hosted types and
+/// openai-compatible. Sorted.
+fn offered_types(hosted: bool) -> Vec<&'static str> {
+    use crate::config::host::HostLink;
+    let mut types: Vec<&'static str> = PROVIDER_REGISTRY
+        .entries()
+        .keys()
+        .copied()
+        .filter(|t| {
+            let runs = HostLink::default_for(t) == HostLink::Local;
+            if hosted {
+                !runs || *t == "openai-compatible"
+            } else {
+                runs
+            }
+        })
+        .collect();
+    types.sort();
+    types
+}
+
 /// A host the wizard looks for providers on in this run.
 struct HostTarget {
     id: String,
@@ -1257,26 +1280,6 @@ fn changed_launcher_id(
 ) -> Option<String> {
     ctx.config()
         .launchers
-        .iter()
-        .find_map(|(id, cfg)| match before.get(id) {
-            None => Some(id.clone()),
-            Some(prev) => (serde_json::to_value(prev).ok() != serde_json::to_value(cfg).ok())
-                .then(|| id.clone()),
-        })
-}
-
-/// The id `ProviderCommands::setup` just wrote to or updated in
-/// `ctx.config().providers`, found by diffing against a `before` snapshot
-/// taken just before the call -- necessary because that wizard lets the
-/// user free-type an instance name, so the resulting id isn't known ahead
-/// of time. `None` when nothing changed (the user declined an overwrite
-/// confirmation).
-fn changed_provider_id(
-    before: &std::collections::HashMap<String, crate::config::ProviderConfig>,
-    ctx: &crate::AppContext,
-) -> Option<String> {
-    ctx.config()
-        .providers
         .iter()
         .find_map(|(id, cfg)| match before.get(id) {
             None => Some(id.clone()),
@@ -2408,10 +2411,236 @@ impl SetupCommands {
                     ));
                 }
             }
+            let added = Self::add_at_other_addresses(
+                ctx,
+                &address,
+                &link,
+                host_id.as_deref(),
+                !found_here.is_empty(),
+            )
+            .await?;
             recommendations.extend(found_here);
+            recommendations.extend(added);
         }
         recommendations.sort_by_key(display_name);
         Ok((recommendations, configured_ids))
+    }
+
+    const NO_CONTINUE_LABEL: &'static str = "No, continue";
+
+    /// After probing a host, asks whether to add a provider at another
+    /// address on it, until the user says no. The question starts on "No,
+    /// continue" when something answered there, and on the first type
+    /// otherwise. On a host the user runs, it offers the types the user runs
+    /// and takes an address on that host, starting on the type's default URL
+    /// there; for the hosted services, the hosted types and
+    /// openai-compatible, with an address the user types and the link "not
+    /// specified". The type's other settings follow. An address that does
+    /// not answer can be tried again, added anyway (its models are not
+    /// listed) or skipped. Each provider added is recorded like one found.
+    async fn add_at_other_addresses(
+        ctx: &mut crate::AppContext,
+        address: &str,
+        link: &crate::config::host::HostLink,
+        host_id: Option<&str>,
+        something_answered: bool,
+    ) -> Result<Vec<Recommendation>> {
+        use crate::config::host::HostLink;
+        let hosted = *link == HostLink::Unspecified;
+        let types = offered_types(hosted);
+        let mut items: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        items.push(Self::NO_CONTINUE_LABEL.to_string());
+        let question = if hosted {
+            "Add a hosted provider at another address?".to_string()
+        } else {
+            format!("Add a provider on {address} at another address?")
+        };
+        let mut added: Vec<Recommendation> = Vec::new();
+        let mut default = if something_answered { types.len() } else { 0 };
+        loop {
+            let picked = ctx.ui.select(&question, &items, default)?;
+            default = types.len();
+            let Some(provider_type) = types.get(picked).copied() else {
+                return Ok(added);
+            };
+            if let Some(rec) =
+                Self::add_one_at_other_address(ctx, provider_type, address, link, host_id).await?
+            {
+                added.push(rec);
+            }
+        }
+    }
+
+    /// The id of a provider of `provider_type` at `base_url`, configured or
+    /// found in this run, if there is one.
+    fn provider_at(ctx: &crate::AppContext, provider_type: &str, base_url: &str) -> Option<String> {
+        let normalize = |u: &str| u.trim_end_matches('/').to_ascii_lowercase();
+        let wanted = normalize(base_url);
+        let at = |p: &crate::config::ProviderConfig| {
+            p.provider_type == provider_type
+                && p.config
+                    .get("base_url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| normalize(u) == wanted)
+        };
+        ctx.config()
+            .providers
+            .values()
+            .chain(ctx.found_providers())
+            .find(|p| at(p))
+            .map(|p| p.provider_id.clone())
+    }
+
+    /// Asks the settings of `provider_type` other than its address, starting
+    /// on `config`, and returns them with `base_url` as the address.
+    fn other_settings(
+        ctx: &crate::AppContext,
+        provider_type: &str,
+        base_url: &str,
+        config: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let Some(mut schema) = PROVIDER_REGISTRY.config_schema(provider_type) else {
+            return Ok(config.clone());
+        };
+        if let Some(fields) = schema.as_object_mut() {
+            if let Some(properties) = fields.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                properties.remove("base_url");
+            }
+            if let Some(required) = fields.get_mut("required").and_then(|r| r.as_array_mut()) {
+                required.retain(|r| r != "base_url");
+            }
+        }
+        let mut asked = crate::utils::prompt_from_schema(&*ctx.ui, &schema, config)?;
+        asked["base_url"] = base_url.into();
+        Ok(asked)
+    }
+
+    /// One provider of `provider_type` at an address the user types on the
+    /// host at `address` (any address for the hosted services). `None` when
+    /// the user skips it.
+    async fn add_one_at_other_address(
+        ctx: &mut crate::AppContext,
+        provider_type: &'static str,
+        address: &str,
+        link: &crate::config::host::HostLink,
+        host_id: Option<&str>,
+    ) -> Result<Option<Recommendation>> {
+        use crate::config::host::{HostLink, same_address, url_at, url_host};
+        let hosted = *link == HostLink::Unspecified;
+        let start = ctx
+            .default_base_urls(provider_type)
+            .first()
+            .and_then(|url| {
+                if hosted {
+                    Some(url.clone())
+                } else {
+                    url_at(url, address)
+                }
+            })
+            .unwrap_or_else(|| {
+                if hosted {
+                    "https://api.example.com/v1".to_string()
+                } else {
+                    url_at("http://localhost:8000/v1", address).unwrap_or_default()
+                }
+            });
+        let mut current = start;
+        // A hosted service may need its API key to answer, so its settings
+        // are asked once, before its address is checked; a server the user
+        // runs is checked first, and its settings are asked once it is
+        // added.
+        let mut config = PROVIDER_REGISTRY.default_config(provider_type);
+        if hosted {
+            config = Self::other_settings(ctx, provider_type, &current, &config)?;
+        }
+        let base_url = loop {
+            let answer = ctx
+                .ui
+                .text(&format!("Address of the {provider_type} server"), &current)?;
+            let answer = answer.trim().trim_end_matches('/').to_string();
+            let Some(host) = url_host(&answer) else {
+                ctx.ui
+                    .warn(&format!("'{answer}' is not a URL, such as {current}."));
+                continue;
+            };
+            if !hosted && !same_address(&host, address) {
+                ctx.ui.warn(&format!(
+                    "{answer} is not on {address}; add its machine with \"Add a host…\"."
+                ));
+                continue;
+            }
+            current = answer.clone();
+            if let Some(existing) = Self::provider_at(ctx, provider_type, &answer) {
+                ctx.ui.warn(&format!(
+                    "{provider_type} at {answer} is already in this run as '{existing}'."
+                ));
+                continue;
+            }
+            config["base_url"] = answer.clone().into();
+            let healthy = match PROVIDER_REGISTRY.construct(provider_type, provider_type, &config) {
+                Ok(provider) => Discover::run_health_check(&*provider)
+                    .await
+                    .is_ok_and(|h| h.healthy),
+                Err(_) => false,
+            };
+            let keep = if healthy {
+                true
+            } else {
+                ctx.ui
+                    .warn(&format!("{provider_type} is not answering at {answer}."));
+                let choices = [
+                    "Try another address".to_string(),
+                    "Add it anyway (models not listed)".to_string(),
+                    "Skip".to_string(),
+                ];
+                match ctx.ui.select("What would you like to do?", &choices, 0)? {
+                    0 => continue,
+                    1 => false,
+                    _ => return Ok(None),
+                }
+            };
+            if !hosted {
+                config = Self::other_settings(ctx, provider_type, &answer, &config)?;
+            }
+            break (answer, config.clone(), keep && healthy);
+        };
+        let (base_url, config, healthy) = base_url;
+        let id = match host_id {
+            Some(host) if !hosted && *link != HostLink::Local => format!("{provider_type}-{host}"),
+            _ => provider_type.to_string(),
+        };
+        let id = Self::free_provider_id(ctx, id, &base_url)?;
+        ctx.add_found_provider(crate::config::ProviderConfig {
+            provider_id: id.clone(),
+            provider_type: provider_type.to_string(),
+            config,
+            host: Some(link.clone()),
+        });
+        let name = PROVIDER_REGISTRY
+            .get(provider_type)
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        let mut recs = vec![Recommendation::Provider {
+            provider_type,
+            provider_id: id.clone(),
+            provider_name: name,
+            health_healthy: true,
+            health_error: (!healthy).then(|| ADDED_ANYWAY.to_string()),
+            discovered_base_url: Some(base_url.clone()),
+            served_models: Vec::new(),
+        }];
+        if healthy {
+            Discover::list_served_models(&mut recs).await;
+        }
+        if let Some(Recommendation::Provider { served_models, .. }) = recs.first() {
+            let serves = if healthy {
+                format!("serves {} models", served_models.len())
+            } else {
+                "added, models not listed".to_string()
+            };
+            ctx.ui.info(&format!("  {id:<16} {base_url:<28} {serves}"));
+        }
+        Ok(recs.pop())
     }
 
     /// `id`, unless a configured provider or one found earlier in this run
@@ -2614,7 +2843,6 @@ impl SetupCommands {
     const CONFIGURE_DIFFERENT_CAPABILITY_LABEL: &'static str =
         "→ Configure a different capability…";
     const CONFIGURE_DIFFERENT_LAUNCHER_LABEL: &'static str = "→ Configure a different launcher…";
-    const CONFIGURE_DIFFERENT_PROVIDER_LABEL: &'static str = "→ Configure a different provider…";
     const CONFIGURE_DIFFERENT_MODELS_LABEL: &'static str = "→ Configure a different models…";
 
     async fn select_launchers(
@@ -2779,19 +3007,14 @@ impl SetupCommands {
             .collect();
         configured.sort();
 
-        let mut manual: Vec<String> = Vec::new(); // ids configured via the escape hatch this run
-
         loop {
             let mut items: Vec<String> = filtered
                 .iter()
                 .map(|(id, name, error)| {
-                    let status = if error.is_none() || error.as_ref().is_some_and(|e| e.is_empty())
-                    {
-                        "healthy".to_string()
-                    } else if let Some(e) = &error {
-                        format!("healthy ({e})")
-                    } else {
-                        "healthy".to_string()
+                    let status = match error.as_deref() {
+                        None | Some("") => "healthy".to_string(),
+                        Some(e) if e.starts_with(ADDED_ANYWAY) => e.to_string(),
+                        Some(e) => format!("healthy ({e})"),
                     };
                     format!("{id} — {name} ({status})")
                 })
@@ -2804,74 +3027,33 @@ impl SetupCommands {
                 items.push(format!("{id} — configured"));
                 defaults.push(true);
             }
-            for id in &manual {
-                items.push(format!("{id} — manually configured"));
-                defaults.push(true); // pre-checked: the user just configured it
+            if items.is_empty() {
+                // Providers are added in the hosts step, at another address
+                // when nothing answered on the default ports.
+                ui.info(
+                    "No providers on the hosts of this run. Run `granite-cli setup` again and \
+                     add one at its address in the hosts step.",
+                );
+                return Ok(HashSet::new());
             }
-            if filtered.is_empty() && configured.is_empty() && manual.is_empty() {
-                ui.info("No healthy providers available to configure.");
-            }
-            items.push(Self::CONFIGURE_DIFFERENT_PROVIDER_LABEL.to_string());
-            defaults.push(false);
-            let escape_idx = items.len() - 1;
 
             let selected = ui.multi_select("Select providers to configure", &items, &defaults)?;
-            let chose_different = selected.contains(&escape_idx);
             let result: HashSet<String> = selected
                 .iter()
-                .filter(|&&i| i != escape_idx)
                 .map(|&i| {
                     if i < filtered.len() {
                         filtered[i].0.clone()
-                    } else if i < filtered.len() + configured.len() {
-                        configured[i - filtered.len()].clone()
                     } else {
-                        manual[i - filtered.len() - configured.len()].clone()
+                        configured[i - filtered.len()].clone()
                     }
                 })
                 .collect();
-
-            if !chose_different {
-                // Every selected model needs a provider to run on.
-                if result.is_empty() && !(selected_models.is_empty() && served_picks.is_empty()) {
-                    ui.warn("Select at least one provider to run the selected models.");
-                    continue;
-                }
-                return Ok(result);
+            // Every selected model needs a provider to run on.
+            if result.is_empty() && !(selected_models.is_empty() && served_picks.is_empty()) {
+                ui.warn("Select at least one provider to run the selected models.");
+                continue;
             }
-
-            let mut type_ids: Vec<String> = PROVIDER_REGISTRY
-                .entries()
-                .keys()
-                .map(|k| k.to_string())
-                .collect();
-            type_ids.sort();
-            let type_items: Vec<String> = type_ids
-                .iter()
-                .map(|id| {
-                    format!(
-                        "{id} — {}",
-                        PROVIDER_REGISTRY
-                            .get(id)
-                            .map(|m| m.name.clone())
-                            .unwrap_or_default()
-                    )
-                })
-                .collect();
-            let idx = ui.select("Configure which provider type?", &type_items, 0)?;
-            let chosen_type = type_ids[idx].clone();
-
-            let before: HashMap<String, crate::config::ProviderConfig> =
-                ctx.config().providers.clone();
-            ProviderCommands::setup(ctx, &chosen_type, None, false).await?;
-            if let Some(new_id) = changed_provider_id(&before, ctx)
-                && !manual.contains(&new_id)
-                && !configured.contains(&new_id)
-                && !filtered.iter().any(|(id, ..)| id == &new_id)
-            {
-                manual.push(new_id);
-            }
-            // loop again, re-rendering with `manual` folded in
+            return Ok(result);
         }
     }
 
@@ -3985,10 +4167,22 @@ impl SetupCommands {
         let ui = &*ctx.ui;
 
         ui.info("\n=== Setup Complete ===");
+        let hosts = summary_hosts(ctx, selected_providers);
+        if !hosts.is_empty() {
+            ui.info(&format!("Hosts: {}", hosts.join(", ")));
+        }
         ui.info(&format!("Providers: {}", summary_list(selected_providers)));
         ui.info(&format!("Models: {}", summary_list(selected_models)));
         ui.info(&format!("Launchers: {}", summary_list(selected_launchers)));
         ui.info(&format!("Capabilities: {}", summary_list(selected_caps)));
+        for line in launchers_without_capability(ctx, selected_launchers) {
+            ui.warn(&line);
+        }
+        for host in &hosts {
+            if let Some(line) = host_memory_note(ctx, host) {
+                ui.info(&line);
+            }
+        }
 
         ui.info("\nRun `granite-cli launcher list` to see configured launchers.");
         if let Some(first_launcher) = selected_launchers.iter().min() {
@@ -3997,6 +4191,141 @@ impl SetupCommands {
             ));
         }
     }
+}
+
+/// The hosts the providers in `providers` run on, `local` first, then by
+/// id. Hosted providers have none.
+fn summary_hosts(ctx: &crate::AppContext, providers: &HashSet<String>) -> Vec<String> {
+    let mut hosts: Vec<String> = providers
+        .iter()
+        .filter_map(|id| provider_link(id, ctx).host_id().map(str::to_string))
+        .collect();
+    hosts.sort_by_key(|h| (h != crate::config::host::LOCAL_HOST_ID, h.clone()));
+    hosts.dedup();
+    hosts
+}
+
+/// One line for each launcher in `launchers` that has no configured
+/// capability enabled: the capability its recommended configuration asks
+/// for, that it did not resolve, and the command that binds one.
+fn launchers_without_capability(
+    ctx: &crate::AppContext,
+    launchers: &HashSet<String>,
+) -> Vec<String> {
+    let mut ids: Vec<&String> = launchers.iter().collect();
+    ids.sort();
+    let mut lines = Vec::new();
+    for id in ids {
+        let enabled = ctx.config().get_launcher(id).is_some_and(|l| {
+            l.enabled_capabilities
+                .iter()
+                .any(|c| ctx.config().get_capability(c).is_some())
+        });
+        if enabled {
+            continue;
+        }
+        let launcher_type = resolved_launcher_type(ctx, id);
+        let supported = LAUNCHER_REGISTRY
+            .get(&launcher_type)
+            .map(|m| m.supported_capabilities.clone())
+            .unwrap_or_default();
+        let recommended = recommended_config::effective_capabilities(
+            &launcher_type,
+            &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
+            &ctx.config().recommended_configs,
+        )
+        .into_iter()
+        .map(|c| c.capability)
+        .find(|cap| {
+            CAPABILITY_REGISTRY.get(cap).is_some_and(|m| {
+                m.supported_binding_types
+                    .iter()
+                    .any(|b| supported.contains(b))
+            })
+        });
+        let why = match recommended {
+            Some(cap) => format!("its recommended '{cap}' did not resolve to a selected model"),
+            None => "no capability is recommended for it".to_string(),
+        };
+        lines.push(format!(
+            "Launcher '{id}' has no capability: {why}. Run `granite-cli capability setup` to \
+             bind one."
+        ));
+    }
+    lines
+}
+
+/// When the models bound to capabilities on the providers of host `host`
+/// need more memory together than the host's devices have, says so. A model
+/// whose variant states no size is left out of the total, and the line says
+/// so. `None` for a host whose hardware is not known, or under its memory.
+///
+/// The memory is the devices' combined usable memory, less the default
+/// overhead for each device after the first, whichever providers the models
+/// are on: the models are counted as if loaded together, and the fit of
+/// each model on its own provider is checked when it is ranked.
+fn host_memory_note(ctx: &crate::AppContext, host: &str) -> Option<String> {
+    let usable = ctx
+        .host_fit_profile(
+            host,
+            crate::providers::DeviceUse {
+                splits: true,
+                overhead_gb: crate::providers::DEFAULT_DEVICE_OVERHEAD_GB,
+            },
+        )
+        .ok()?
+        .usable_memory_gb();
+    let mut bound: Vec<String> = Vec::new();
+    for cap in ctx.config().capabilities.values() {
+        let Some(metadata) = CAPABILITY_REGISTRY.get(&cap.capability_type) else {
+            continue;
+        };
+        for model_id in
+            crate::utils::capability_model_ids(cap, &metadata.dependencies).into_values()
+        {
+            if !bound.contains(&model_id) {
+                bound.push(model_id);
+            }
+        }
+    }
+    let mut total = 0.0;
+    let mut unknown = 0;
+    let mut counted = 0;
+    for model_id in &bound {
+        let Some(mc) = ctx.config().get_model(model_id) else {
+            continue;
+        };
+        if provider_link(&mc.provider_id, ctx).host_id() != Some(host) {
+            continue;
+        }
+        let size = MODEL_REGISTRY.get(&mc.model_type).and_then(|md| {
+            let (format, precision) = mc.variant.as_deref()?.split_once('/')?;
+            md.variants
+                .iter()
+                .find(|v| v.format == format && v.precision == precision)?
+                .size_gb
+        });
+        match size {
+            Some(gb) => {
+                total += gb;
+                counted += 1;
+            }
+            None => unknown += 1,
+        }
+    }
+    if counted == 0 || total <= usable {
+        return None;
+    }
+    let mut line = format!(
+        "{host}: models bound here total {total:.1} GB, usable memory is {usable:.1} GB.\n  \
+         They cannot all be loaded at once; switching between them reloads weights."
+    );
+    if unknown > 0 {
+        line.push_str(&format!(
+            "\n  {unknown} model(s) of unknown size are not counted."
+        ));
+    }
+    Some(line)
 }
 
 /// The ids in `ids` as one line of the setup summary, sorted so that the same
@@ -5857,57 +6186,32 @@ mod tests {
     // -- select_providers escape hatch -----------------------------------------
 
     #[tokio::test]
-    async fn select_providers_escape_hatch_appears_with_zero_healthy_providers() {
-        // Regression test: `select_providers` used to return early with an
-        // info message when `filtered` was empty, which was exactly the
-        // situation where the escape hatch is most needed. The guard was
-        // removed so the loop renders with just the escape-hatch item.
+    async fn select_providers_says_how_to_add_one_when_none_is_offered() {
         let capture = Arc::new(CaptureUi::default());
         let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
-
         let discovery = DiscoveryResult {
-            recommendations: vec![
-                // A provider that exists in the registry but is unhealthy.
-                Recommendation::Provider {
-                    provider_type: "ollama",
-                    provider_id: "ollama".to_string(),
-                    provider_name: "Ollama".to_string(),
-                    health_healthy: false,
-                    health_error: Some("not running".to_string()),
-                    discovered_base_url: None,
-                    served_models: Vec::new(),
-                },
-            ],
-            all_model_candidates: vec![],
-            configured_provider_ids: vec![],
-            configured_model_ids: vec![],
-            configured_launcher_ids: vec![],
-            configured_capability_ids: vec![],
+            recommendations: vec![Recommendation::Provider {
+                provider_type: "ollama",
+                provider_id: "ollama".to_string(),
+                provider_name: "Ollama".to_string(),
+                health_healthy: false,
+                health_error: Some("not running".to_string()),
+                discovered_base_url: None,
+                served_models: Vec::new(),
+            }],
+            ..no_discovery()
         };
 
-        // No canned multi_select answers — when the queue is empty,
-        // CaptureUi returns vec![] (empty selection), so the loop returns
-        // immediately without entering the escape-hatch branch.
-        SetupCommands::select_providers(&mut ctx, &discovery, &HashSet::new(), &[])
+        let selected = SetupCommands::select_providers(&mut ctx, &discovery, &HashSet::new(), &[])
             .await
             .unwrap();
 
-        let prompts = capture.multi_select_prompts.borrow();
-        assert_eq!(prompts.len(), 1, "expected exactly one multi_select prompt");
-        let (_, items, defaults) = &prompts[0];
-        // The only item should be the escape-hatch label.
-        assert_eq!(
-            items.len(),
-            1,
-            "with zero healthy providers, only the escape-hatch item should appear"
-        );
+        assert!(selected.is_empty());
+        assert!(capture.multi_select_prompts.borrow().is_empty());
         assert!(
-            items[0].contains("Configure a different provider"),
-            "the escape-hatch label must appear even with zero healthy providers: {items:?}"
-        );
-        assert!(
-            !defaults[0],
-            "the escape-hatch item should NOT be pre-selected (user must explicitly choose it)"
+            capture.infos.borrow()[0].starts_with("No providers on the hosts of this run."),
+            "{:?}",
+            capture.infos.borrow()
         );
     }
 
@@ -7874,6 +8178,8 @@ mod tests {
         let figures = local.clone();
         ctx.ensure_local_host(move || figures).unwrap();
         probe_only(&mut ctx, servers).await;
+        // No launcher on PATH, unless a test says so.
+        ctx.set_launcher_paths(&[]);
         Wizard { ctx, ui, local }
     }
 
@@ -7936,8 +8242,22 @@ mod tests {
         }
     }
 
+    /// The index of "No, continue" in the question that follows probing a
+    /// host the user runs, or the hosted services when `hosted`.
+    fn no_more(hosted: bool) -> usize {
+        offered_types(hosted).len()
+    }
+
+    impl Wizard {
+        /// Queues the answers of the next selects, in order.
+        fn select(&self, answers: &[usize]) {
+            self.ui.select_answers.borrow_mut().extend(answers);
+        }
+    }
+
     // The answers the tests give, in order: launchers (none, so the run does
     // not depend on what is on PATH), hosts, capabilities, models, providers.
+    // After each host is probed, "No, continue" (`no_more`).
     const NO_LAUNCHER: &[usize] = &[];
     const NO_CAPABILITY: &[usize] = &[];
     const NO_MODEL: &[usize] = &[];
@@ -7949,9 +8269,20 @@ mod tests {
         let mut w = wizard(unified(96.0), &[("ollama", &server)]).await;
         // local only; ollama.
         w.answer(&[NO_LAUNCHER, &[0], NO_CAPABILITY, NO_MODEL, &[0]]);
+        w.select(&[no_more(false)]);
 
         w.run().await.unwrap();
 
+        let selects = w.ui.select_prompts.borrow().clone();
+        assert_eq!(
+            selects[0].0,
+            "Add a provider on localhost at another address?"
+        );
+        assert_eq!(
+            selects[0].2,
+            no_more(false),
+            "ollama answered: No, continue"
+        );
         let hosts = w.items("Hosts to run models on");
         assert_eq!(hosts[0], "local — localhost, local (unified 96.0 GB)");
         assert!(
@@ -7977,7 +8308,7 @@ mod tests {
         // the new host. Its address, and "unknown" of create and unknown;
         // the id takes its default.
         w.answer(&[NO_LAUNCHER, &[2], &[1]]);
-        w.ui.select_answers.borrow_mut().push_back(1);
+        w.select(&[1, no_more(false)]);
         w.text(&["127.0.0.1"]);
         w.answer(&[NO_CAPABILITY, NO_MODEL, &[0]]);
 
@@ -8008,6 +8339,7 @@ mod tests {
         w.add_host("box", "127.0.0.1", &[]);
         // local and box; both providers.
         w.answer(&[NO_LAUNCHER, &[0, 1], NO_CAPABILITY, NO_MODEL, &[0, 1]]);
+        w.select(&[no_more(false), no_more(false)]);
 
         w.run().await.unwrap();
 
@@ -8029,6 +8361,7 @@ mod tests {
         w.add_host("lab", "127.0.0.1", &[]);
         // lab only (local, lab, hosted, add).
         w.answer(&[NO_LAUNCHER, &[1], NO_CAPABILITY, NO_MODEL, NO_MODEL]);
+        w.select(&[no_more(false)]);
 
         w.run().await.unwrap();
 
@@ -8062,6 +8395,7 @@ mod tests {
                 )
                 .unwrap();
             w.answer(&[NO_LAUNCHER, &[0], NO_CAPABILITY, NO_MODEL, NO_MODEL]);
+            w.select(&[no_more(false)]);
             w.run().await.unwrap();
             w.items("Select models to configure")
         }
@@ -8105,6 +8439,7 @@ mod tests {
                 .unwrap();
             w.add_host("big", "127.0.0.1", &["spark"]);
             w.answer(&[NO_LAUNCHER, &[0, 1], NO_CAPABILITY, NO_MODEL, NO_MODEL]);
+            w.select(&[no_more(false), no_more(false)]);
             w.run().await.unwrap();
             w.items("Select models to configure")
                 .iter()
@@ -8124,6 +8459,7 @@ mod tests {
         w.add_host("big", "127.0.0.1", &["spark"]);
         // local and big; the model; both providers.
         w.answer(&[NO_LAUNCHER, &[0, 1], NO_CAPABILITY, &[index], &[0, 1]]);
+        w.select(&[no_more(false), no_more(false)]);
 
         w.run().await.unwrap();
 
@@ -8145,7 +8481,7 @@ mod tests {
         let before = tree(&home);
         // Add a host, then quit at the providers question.
         w.answer(&[NO_LAUNCHER, &[2], &[0, 1], NO_CAPABILITY, NO_MODEL]);
-        w.ui.select_answers.borrow_mut().push_back(1);
+        w.select(&[1, no_more(false), no_more(false)]);
         w.text(&["127.0.0.1"]);
         *w.ui.quit_at.borrow_mut() = Some("Select providers".to_string());
 
@@ -8197,6 +8533,7 @@ mod tests {
         // box only: the type's default URL at 127.0.0.1 is the configured
         // provider's, so nothing is probed there.
         w.answer(&[NO_LAUNCHER, &[1], NO_CAPABILITY, NO_MODEL, NO_MODEL]);
+        w.select(&[no_more(false)]);
 
         w.run().await.unwrap();
 
@@ -8230,6 +8567,7 @@ mod tests {
             let hosted = FakeServer::start("ollama", &[]).await;
             let mut w = wizard(unified(96.0), &[("openrouter", &hosted)]).await;
             w.answer(&[NO_LAUNCHER, hosts, NO_CAPABILITY, NO_MODEL, NO_MODEL]);
+            w.select(&[no_more(false), no_more(true)]);
 
             w.run().await.unwrap();
 
@@ -8259,16 +8597,14 @@ mod tests {
         // box only. Nothing is ranked there and nothing is served, so there
         // is no models question; the provider found.
         w.answer(&[NO_LAUNCHER, &[1], NO_CAPABILITY, &[0]]);
+        w.select(&[no_more(false)]);
 
         w.run().await.unwrap();
 
         let providers = w.items("Select providers to configure");
         assert_eq!(
             providers,
-            vec![
-                "ollama-box — Ollama (healthy)",
-                "→ Configure a different provider…"
-            ],
+            vec!["ollama-box — Ollama (healthy)"],
             "ollama on local, which is not in this run, is not offered"
         );
         let config = Config::new().unwrap();
@@ -8329,9 +8665,7 @@ mod tests {
             // Capabilities: the escape hatch (its only item), then
             // `model-provider` by hand, then keep it checked.
             w.answer(&[NO_LAUNCHER, &[0], &[0], &[0], NO_MODEL, &[0]]);
-            w.ui.select_answers
-                .borrow_mut()
-                .push_back(capability_type_index("model-provider"));
+            w.select(&[no_more(false), capability_type_index("model-provider")]);
             if quit {
                 *w.ui.quit_at.borrow_mut() = Some("Select providers".to_string());
             }
@@ -8363,7 +8697,7 @@ mod tests {
         // The address of box, refused; another; box's id, refused; then the
         // default id.
         w.text(&["box.lan", "10.0.0.5", "box"]);
-        w.ui.select_answers.borrow_mut().push_back(1); // unknown
+        w.select(&[1, no_more(false)]); // unknown
 
         w.run().await.unwrap();
 
@@ -8385,6 +8719,482 @@ mod tests {
                 .filter(|(p, _, _)| p == "Hosts to run models on")
                 .count(),
             2
+        );
+    }
+
+    /// The index of `provider_type` in the question that follows probing a
+    /// host the user runs.
+    fn type_index(provider_type: &str) -> usize {
+        offered_types(false)
+            .iter()
+            .position(|t| *t == provider_type)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn wizard_provider_at_other_address_is_ranked_and_bound() {
+        /// Nothing answers on the default ports; the user adds llama-cpp at
+        /// its address. opencode is the one launcher on PATH.
+        async fn run(answers: &[&[usize]]) -> (Wizard, String) {
+            let server = FakeServer::start("llama-cpp", &["llama3:8b"]).await;
+            let url = server.base_url_at("localhost");
+            let mut w = wizard(unified(96.0), &[]).await;
+            w.ctx
+                .set_launcher_paths(&[("opencode", "/usr/local/bin/opencode")]);
+            w.answer(answers);
+            // llama-cpp at its address; then "No, continue" by default.
+            w.select(&[type_index("llama-cpp")]);
+            w.text(&[&url]);
+            w.run().await.unwrap();
+            (w, url)
+        }
+        // The capability's index, from a run that picks opencode and nothing
+        // else, and then the model's, from one that also picks the
+        // capability, which decides the models offered.
+        let capability = {
+            let _home = crate::config::TestConfigHome::new();
+            let (w, _) = run(&[&[0], &[0], NO_CAPABILITY, NO_MODEL, &[0]]).await;
+            let models = w.items("Select models to configure");
+            assert!(
+                models
+                    .iter()
+                    .any(|m| m.contains(" — Fit: ") && m.contains("runs on: llama-cpp")),
+                "catalog models are ranked for the provider added: {models:?}"
+            );
+            let capabilities = w.items("Select capabilities to configure");
+            capabilities
+                .iter()
+                .position(|c| c.starts_with("agent-model — "))
+                .unwrap_or_else(|| panic!("{capabilities:?}"))
+        };
+        let model = {
+            let _home = crate::config::TestConfigHome::new();
+            let _user_home = TempHome::new();
+            let (w, _) = run(&[&[0], &[0], &[capability], NO_MODEL, &[0]]).await;
+            let models = w.items("Select models to configure");
+            models
+                .iter()
+                .position(|m| m == "llama3:8b — on llama-cpp, not in the catalog")
+                .unwrap_or_else(|| panic!("the model it serves is offered: {models:?}"))
+        };
+        let _home = crate::config::TestConfigHome::new();
+        let _user_home = TempHome::new();
+
+        let (w, url) = run(&[&[0], &[0], &[capability], &[model], &[0]]).await;
+
+        let prompts = w.ui.select_prompts.borrow();
+        assert_eq!(
+            prompts[0].0,
+            "Add a provider on localhost at another address?"
+        );
+        assert_eq!(prompts[0].2, 0, "nothing answered: the first type");
+        assert_eq!(
+            prompts[1].2,
+            no_more(false),
+            "after one is added: No, continue"
+        );
+        let config = Config::new().unwrap();
+        let provider = config.get_provider("llama-cpp").unwrap();
+        assert_eq!(provider.config["base_url"], url);
+        assert_eq!(provider.host, Some(crate::config::host::HostLink::Local));
+        let model = config
+            .get_model("llama3:8b")
+            .expect("the served model is written");
+        assert_eq!(model.provider_id, "llama-cpp");
+        assert_eq!(
+            config.get_capability("agent-model").unwrap().config["model_id"],
+            "llama3:8b",
+            "bound to the capability"
+        );
+        assert_eq!(
+            config
+                .get_launcher("opencode")
+                .unwrap()
+                .enabled_capabilities,
+            vec!["agent-model".to_string()],
+            "the launcher ends with a capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_elsewhere_is_refused_and_one_that_does_not_answer_offers_three_choices() {
+        let _home = crate::config::TestConfigHome::new();
+        let closed = closed_base_url().await.replace("127.0.0.1", "localhost");
+        let mut w = wizard(unified(96.0), &[]).await;
+        w.answer(&[NO_LAUNCHER, &[0], NO_CAPABILITY, NO_MODEL, &[0]]);
+        // llama-cpp: an address on another machine, then a closed port,
+        // "Try another address", the closed port again, "Add it anyway".
+        // ollama: the closed port, "Skip". Then "No, continue".
+        // The settings asked once llama-cpp is added, at their defaults.
+        let settings = Arc::new(CaptureUi::default());
+        let mut config = PROVIDER_REGISTRY.default_config("llama-cpp");
+        config["base_url"] = closed.clone().into();
+        let probe = crate::AppContext::new(Config::default(), settings.clone());
+        SetupCommands::other_settings(&probe, "llama-cpp", &closed, &config).unwrap();
+        let texts: Vec<String> = settings
+            .text_prompts
+            .borrow()
+            .iter()
+            .map(|(_, d)| d.clone())
+            .collect();
+        let selects: Vec<usize> = settings
+            .select_prompts
+            .borrow()
+            .iter()
+            .map(|(_, _, d)| *d)
+            .collect();
+        w.ui.confirm_answers
+            .borrow_mut()
+            .extend(settings.confirm_prompts.borrow().iter().map(|(_, d)| *d));
+        let mut select = vec![type_index("llama-cpp"), 0, 1];
+        select.extend(selects);
+        select.extend([type_index("ollama"), 2, no_more(false)]);
+        w.select(&select);
+        let mut text = vec![
+            "http://10.9.9.9:8080".to_string(),
+            closed.clone(),
+            closed.clone(),
+        ];
+        text.extend(texts);
+        text.push(closed.clone());
+        w.text(&text.iter().map(String::as_str).collect::<Vec<_>>());
+
+        w.run().await.unwrap();
+
+        let warns = w.ui.warns.borrow();
+        assert!(
+            warns.contains(
+                &"http://10.9.9.9:8080 is not on localhost; add its machine with \"Add a host…\"."
+                    .to_string()
+            ),
+            "{warns:?}"
+        );
+        assert_eq!(
+            warns
+                .iter()
+                .filter(|m| m.ends_with(&format!("is not answering at {closed}.")))
+                .count(),
+            3
+        );
+        let config = Config::new().unwrap();
+        assert_eq!(
+            config.get_provider("llama-cpp").unwrap().config["base_url"],
+            closed,
+            "added anyway"
+        );
+        assert!(config.get_provider("ollama").is_none(), "skipped");
+    }
+
+    fn launcher(id: &str, capabilities: &[&str]) -> crate::config::LauncherConfig {
+        serde_json::from_value(serde_json::json!({
+            "launcher_id": id,
+            "type": id,
+            "enabled_capabilities": capabilities,
+            "config": {},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn wizard_summary_names_launcher_without_capability() {
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
+        ctx.config_mut()
+            .launchers
+            .insert("opencode".to_string(), launcher("opencode", &[]));
+
+        SetupCommands::print_summary(
+            &ctx,
+            &HashSet::new(),
+            &string_set(&["opencode"]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        let warns = capture.warns.borrow();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].starts_with("Launcher 'opencode' has no capability: its recommended '"),
+            "{}",
+            warns[0]
+        );
+        assert!(warns[0].ends_with("Run `granite-cli capability setup` to bind one."));
+    }
+
+    /// A context with host `box` listing `hardware`, provider `llama-cpp-box`
+    /// on it, and a capability for each model in `models`, each bound to
+    /// `llama-cpp-box` in its largest GGUF variant. Returns it and the total
+    /// size of those variants.
+    fn ctx_with_bound_models(
+        hardware: &[&str],
+        models: &[&str],
+    ) -> (crate::AppContext, Arc<CaptureUi>, f64) {
+        let capture = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
+        ctx.config_mut().hardware.insert(
+            "card".to_string(),
+            crate::config::HardwareConfig::catalog("card", "nvidia-rtx-4090", 24.0),
+        );
+        ctx.config_mut().hosts.insert(
+            "box".to_string(),
+            crate::config::HostConfig {
+                host_id: "box".to_string(),
+                address: "box.lan".to_string(),
+                hardware: hardware.iter().map(|h| h.to_string()).collect(),
+            },
+        );
+        ctx.config_mut().providers.insert(
+            "llama-cpp-box".to_string(),
+            ProviderConfig {
+                provider_id: "llama-cpp-box".to_string(),
+                provider_type: "llama-cpp".to_string(),
+                config: serde_json::json!({}),
+                host: Some(crate::config::host::HostLink::Host("box".to_string())),
+            },
+        );
+        let mut total = 0.0;
+        for (i, model_id) in models.iter().enumerate() {
+            let md = MODEL_REGISTRY.get(model_id).unwrap();
+            let variant = md
+                .variants
+                .iter()
+                .filter(|v| v.format == "GGUF")
+                .max_by(|a, b| {
+                    a.size_gb
+                        .unwrap_or(0.0)
+                        .total_cmp(&b.size_gb.unwrap_or(0.0))
+                })
+                .unwrap();
+            total += variant.size_gb.unwrap_or(0.0);
+            ctx.config_mut().models.insert(
+                model_id.to_string(),
+                ModelConfig {
+                    discovered: None,
+                    model_id: model_id.to_string(),
+                    model_type: model_id.to_string(),
+                    config: serde_json::json!({}),
+                    provider_id: "llama-cpp-box".to_string(),
+                    variant: Some(format!("{}/{}", variant.format, variant.precision)),
+                },
+            );
+            let cap_id = format!("cap-{i}");
+            ctx.config_mut().capabilities.insert(
+                cap_id.clone(),
+                crate::config::CapabilityConfig {
+                    capability_id: cap_id,
+                    capability_type: "agent-model".to_string(),
+                    config: serde_json::json!({ "model_id": model_id }),
+                },
+            );
+        }
+        (ctx, capture, total)
+    }
+
+    #[test]
+    fn wizard_summary_memory_over_host() {
+        let models = ["granite-4.2-30b", "granite-4.2-8b"];
+        let (ctx, capture, total) = ctx_with_bound_models(&["card"], &models);
+        assert!(
+            total > 16.0,
+            "the two need more than one 24 GB card: {total}"
+        );
+
+        SetupCommands::print_summary(
+            &ctx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &string_set(&["llama-cpp-box"]),
+            &string_set(&models),
+        );
+
+        let infos = capture.infos.borrow();
+        assert!(infos.contains(&"Hosts: box".to_string()), "{infos:?}");
+        let line = infos
+            .iter()
+            .find(|i| i.starts_with("box: models bound here total "))
+            .unwrap_or_else(|| panic!("{infos:?}"));
+        assert!(
+            line.contains(&format!("total {total:.1} GB, usable memory is 16.0 GB.")),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn no_memory_line_under_the_memory_or_on_unknown_hardware() {
+        for (hardware, model) in [
+            (&["card"][..], "granite-4.2-3b"),
+            (&[][..], "granite-4.2-30b"),
+        ] {
+            let (ctx, capture, _) = ctx_with_bound_models(hardware, &[model]);
+
+            SetupCommands::print_summary(
+                &ctx,
+                &HashSet::new(),
+                &HashSet::new(),
+                &string_set(&["llama-cpp-box"]),
+                &string_set(&[model]),
+            );
+
+            assert!(
+                !capture
+                    .infos
+                    .borrow()
+                    .iter()
+                    .any(|i| i.contains("models bound here")),
+                "{hardware:?} {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_of_unknown_size_is_noted_and_not_counted() {
+        let models = ["granite-4.2-30b", "granite-4.2-8b"];
+        let (mut ctx, capture, _) = ctx_with_bound_models(&["card"], &models);
+        ctx.config_mut()
+            .models
+            .get_mut("granite-4.2-8b")
+            .unwrap()
+            .variant = None;
+
+        SetupCommands::print_summary(
+            &ctx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &string_set(&["llama-cpp-box"]),
+            &string_set(&models),
+        );
+
+        let infos = capture.infos.borrow();
+        let line = infos
+            .iter()
+            .find(|i| i.starts_with("box: models bound here"))
+            .unwrap_or_else(|| panic!("{infos:?}"));
+        assert!(
+            line.ends_with("1 model(s) of unknown size are not counted."),
+            "{line}"
+        );
+    }
+
+    /// Points HOME at a temporary directory while it lives, for runs that
+    /// configure a launcher, which may write its settings under HOME.
+    struct TempHome {
+        previous: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TempHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("HOME");
+            // SAFETY: serialized by the configuration home lock the caller
+            // holds.
+            unsafe { std::env::set_var("HOME", dir.path()) };
+            Self {
+                previous,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            // SAFETY: as in `new`.
+            unsafe {
+                match &self.previous {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hosted_provider_is_added_at_any_address_with_its_settings_first() {
+        let _home = crate::config::TestConfigHome::new();
+        let closed = closed_base_url().await;
+        let mut w = wizard(unified(96.0), &[]).await;
+        // The settings openai-compatible asks, at their defaults, before
+        // its address.
+        let settings = Arc::new(CaptureUi::default());
+        let probe = crate::AppContext::new(Config::default(), settings.clone());
+        SetupCommands::other_settings(
+            &probe,
+            "openai-compatible",
+            "https://api.example.com/v1",
+            &PROVIDER_REGISTRY.default_config("openai-compatible"),
+        )
+        .unwrap();
+        let mut text: Vec<String> = settings
+            .text_prompts
+            .borrow()
+            .iter()
+            .map(|(_, d)| d.clone())
+            .collect();
+        text.push(closed.clone());
+        let hosted_index = offered_types(true)
+            .iter()
+            .position(|t| *t == "openai-compatible")
+            .unwrap();
+        let mut select = vec![hosted_index];
+        select.extend(settings.select_prompts.borrow().iter().map(|(_, _, d)| *d));
+        // "Add it anyway", then "No, continue".
+        select.extend([1, no_more(true)]);
+        w.ui.confirm_answers
+            .borrow_mut()
+            .extend(settings.confirm_prompts.borrow().iter().map(|(_, d)| *d));
+        // The hosted services only (local, hosted services, add).
+        w.answer(&[NO_LAUNCHER, &[1], NO_CAPABILITY, &[0]]);
+        w.select(&select);
+        w.text(&text.iter().map(String::as_str).collect::<Vec<_>>());
+
+        w.run().await.unwrap();
+
+        let prompts = w.ui.select_prompts.borrow();
+        assert_eq!(prompts[0].0, "Add a hosted provider at another address?");
+        let mut expected: Vec<String> = offered_types(true).iter().map(|t| t.to_string()).collect();
+        expected.push("No, continue".to_string());
+        assert_eq!(prompts[0].1, expected);
+        assert!(expected.contains(&"openai-compatible".to_string()));
+        let providers = w.items("Select providers to configure");
+        assert_eq!(
+            providers,
+            vec![format!(
+                "openai-compatible — OpenAI Compatible Provider ({ADDED_ANYWAY})"
+            )]
+        );
+        let provider = Config::new()
+            .unwrap()
+            .get_provider("openai-compatible")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            provider.host,
+            Some(crate::config::host::HostLink::Unspecified)
+        );
+        assert_eq!(provider.config["base_url"], closed);
+    }
+
+    #[tokio::test]
+    async fn an_address_already_in_the_run_is_refused() {
+        let _home = crate::config::TestConfigHome::new();
+        let server = FakeServer::start("llama-cpp", &[]).await;
+        let url = server.base_url_at("localhost");
+        let mut w = wizard(unified(96.0), &[("llama-cpp", &server)]).await;
+        w.answer(&[NO_LAUNCHER, &[0], NO_CAPABILITY, NO_MODEL, NO_MODEL]);
+        // llama-cpp, found at its default port; adding it again there is
+        // refused, then "Skip" of the other address that does not answer.
+        let closed = closed_base_url().await.replace("127.0.0.1", "localhost");
+        w.select(&[type_index("llama-cpp"), 2, no_more(false)]);
+        w.text(&[&url, &closed]);
+
+        w.run().await.unwrap();
+
+        assert!(
+            w.ui.warns.borrow().contains(&format!(
+                "llama-cpp at {url} is already in this run as 'llama-cpp'."
+            )),
+            "{:?}",
+            w.ui.warns.borrow()
         );
     }
 }

@@ -1359,4 +1359,4 @@ skip line and passes. With this sub-task, the
 - Review of #267, 2026-11-18: llama-server on port 9797 not found, launchers
   configured with no capability.
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
