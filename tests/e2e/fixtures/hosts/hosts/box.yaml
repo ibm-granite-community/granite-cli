@@ -1,0 +1,5 @@
+host_id: box
+address: box.lan
+hardware:
+- rtx-4090
+- rtx-4090

@@ -1,0 +1,6 @@
+provider_id: vllm-box
+type: openai-compatible
+config:
+  base_url: http://box.lan:8001/v1
+  splits_across_devices: true
+host: box

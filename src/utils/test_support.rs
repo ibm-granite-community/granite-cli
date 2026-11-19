@@ -6,9 +6,14 @@
 //! `ModelType`, a repository string and whether they carried variants. One
 //! definition of each lives here, so a change to `ConfigConstructable` or to
 //! a domain trait edits one implementation.
+//!
+//! [`FakeServer`] is a provider server on the loopback address, for tests
+//! that probe providers or list the models they serve.
 
 // Standard
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Local
 use crate::models::{Model, ModelArchitecture, ModelFunction, ModelType, ModelVariant};
@@ -19,6 +24,116 @@ use crate::registry::{ConfigConstructable, ConstructError, Named, Secret};
 use crate::utils::ui::Ui;
 
 /*-- public --*/
+
+/// A provider server on an ephemeral port of the loopback address. It
+/// answers the health check and the model listing of one provider type
+/// (`ollama`, `llama-cpp` or `lm-studio`) with the models it was given, and
+/// counts the requests it receives. Any other path gets 404. The server runs
+/// until the test's runtime stops.
+pub(crate) struct FakeServer {
+    base_url: String,
+    requests: Arc<AtomicUsize>,
+}
+
+impl FakeServer {
+    /// Starts a server for `provider_type` that serves `models`, by the
+    /// names the type's listing reports them under. Panics for a type it has
+    /// no routes for.
+    pub(crate) async fn start(provider_type: &str, models: &[&str]) -> Self {
+        use axum::{Json, Router, routing::get};
+
+        let names: Vec<String> = models.iter().map(|m| m.to_string()).collect();
+        let (health, listing, body) = match provider_type {
+            // Ollama's health check is its listing.
+            "ollama" => (
+                "/api/tags",
+                "/api/tags",
+                serde_json::json!({
+                    "models": names
+                        .iter()
+                        .map(|name| serde_json::json!({ "name": name, "model": name }))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+            "llama-cpp" => (
+                "/health",
+                "/models",
+                serde_json::json!({
+                    "data": names
+                        .iter()
+                        .map(|id| serde_json::json!({ "id": id }))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+            "lm-studio" => (
+                "/v1/models",
+                "/api/v1/models",
+                serde_json::json!({
+                    "models": names
+                        .iter()
+                        .map(|key| serde_json::json!({ "key": key, "type": "llm" }))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+            other => panic!("FakeServer has no routes for provider type '{other}'"),
+        };
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mut app = Router::new().route(
+            listing,
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        if health != listing {
+            app = app.route(
+                health,
+                get(|| async { Json(serde_json::json!({ "status": "ok" })) }),
+            );
+        }
+        let counter = requests.clone();
+        let app = app.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                next.run(request)
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self {
+            base_url: format!("http://{addr}"),
+            requests,
+        }
+    }
+
+    /// The URL the server answers on, `http://127.0.0.1:<port>`.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The URL the server answers on, with `host` in place of `127.0.0.1`.
+    /// `localhost` reaches the same server, which lets one test stand for
+    /// two hosts.
+    pub(crate) fn base_url_at(&self, host: &str) -> String {
+        self.base_url.replace("127.0.0.1", host)
+    }
+
+    /// How many requests the server has received.
+    pub(crate) fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+/// A loopback URL where nothing listens: the port of a listener that was
+/// bound and closed, so a connection to it is refused.
+pub(crate) async fn closed_base_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
 
 /// A provider whose connection details and endpoint table the test states
 /// outright, so a binding can be checked without a live upstream.
@@ -195,5 +310,81 @@ impl Model for FakeModel {
     }
     fn supported_functions(&self) -> &[ModelFunction] {
         &self.supported_functions
+    }
+}
+
+/*-- tests --*/
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::PROVIDER_REGISTRY;
+
+    /// A provider of `provider_type` with its default configuration at
+    /// `base_url`.
+    fn provider_at(provider_type: &str, base_url: &str) -> Box<dyn Provider> {
+        let mut config = PROVIDER_REGISTRY.default_config(provider_type);
+        config["base_url"] = base_url.into();
+        PROVIDER_REGISTRY
+            .construct(provider_type, provider_type, &config)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_type_answers_its_health_check_and_lists_its_models() {
+        for provider_type in ["ollama", "llama-cpp", "lm-studio"] {
+            let server = FakeServer::start(provider_type, &["m1", "m2"]).await;
+            let provider = provider_at(provider_type, server.base_url());
+
+            let health = provider.health_check().await.unwrap();
+            let listed: Vec<String> = provider
+                .list_models()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+
+            assert!(health.healthy, "{provider_type}: {:?}", health.error);
+            assert_eq!(listed, vec!["m1", "m2"], "{provider_type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_are_counted() {
+        let server = FakeServer::start("llama-cpp", &[]).await;
+        let provider = provider_at("llama-cpp", server.base_url());
+        assert_eq!(server.requests(), 0);
+
+        provider.health_check().await.unwrap();
+        provider.list_models().await.unwrap();
+
+        assert_eq!(server.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn localhost_reaches_the_same_server() {
+        let server = FakeServer::start("ollama", &["m1"]).await;
+        let provider = provider_at("ollama", &server.base_url_at("localhost"));
+
+        assert!(provider.health_check().await.unwrap().healthy);
+        assert_eq!(server.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_port_refuses_the_connection() {
+        let provider = provider_at("ollama", &closed_base_url().await);
+
+        let health = provider.health_check().await.unwrap();
+
+        assert!(!health.healthy);
+        assert!(
+            health
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("Connection failed")),
+            "{:?}",
+            health.error
+        );
     }
 }

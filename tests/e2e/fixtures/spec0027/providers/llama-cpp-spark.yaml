@@ -1,0 +1,5 @@
+provider_id: llama-cpp-spark
+type: llama-cpp
+config:
+  base_url: http://spark.lan:9797
+hardware: spark

@@ -1,0 +1,5 @@
+provider_id: ollama
+type: ollama
+config:
+  base_url: http://localhost:9
+host: local

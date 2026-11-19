@@ -98,10 +98,13 @@ Commands that are not hermetic on `main` today:
 | `launch` without `--dry-run` | the launcher command, which takes over the terminal |
 | any prompt (`* setup` wizards, `remove` without `--dependents` in a terminal) | an interactive terminal |
 
-Two of these can be made hermetic: `provider health` against
+Three of these can be made hermetic: `provider health` against
 `http://127.0.0.1:9` (nothing listens there, so it reports a failed
-connection), and `launch --dry-run` with a stub launcher command
-(`stub_bin opencode`).
+connection), `launch --dry-run` with a stub launcher command
+(`stub_bin opencode`), and `setup --auto` with
+`GRANITE_CLI_TEST_DEFAULT_BASE_URL=http://127.0.0.1:9`, which replaces the
+default URL of every provider type, so setup finds no server on the machine
+and reaches no hosted service.
 
 ## Using Docker Compose for local testing
 

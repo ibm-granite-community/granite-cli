@@ -1,0 +1,3 @@
+hardware_id: spark
+type: dgx-spark
+memory: 128.0

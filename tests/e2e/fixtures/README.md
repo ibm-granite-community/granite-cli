@@ -60,3 +60,46 @@ this machine: no result depends on the machine the test runs on.
 | `spark` | `dgx-spark` (catalog) | 128.0 GB |
 
 Provider `lab` (`llama-cpp`, `base_url: http://127.0.0.1:9`) runs on `box`.
+
+## hosts
+
+Hosts, the hardware profiles they list, and providers on them. Spec 0033
+sub-task 1 adds this fixture with the acceptance tests, which skip until the
+sub-task that makes them pass; it loads from sub-task 2 on. `local` is in
+manual mode with no recorded detection, as in `hardware`, so no result
+depends on the machine the test runs on. Every base URL uses its host's
+address; nothing contacts them, and `ollama` uses port 9, where nothing
+listens.
+
+| Host | Address | Devices |
+|---|---|---|
+| `local` | `localhost` | `local` (manual, system 32.0 GB) |
+| `pgx` | `pgx.lan` | `dgx-spark` (catalog, 128.0 GB) |
+| `pgx2` | `pgx2.lan` | `dgx-spark`, shared with `pgx` |
+| `box` | `box.lan` | `rtx-4090` twice (catalog, discrete 24.0 GB) |
+| `lab` | `lab.lan` | none: hardware unknown |
+
+| Provider | Type | Host | Notes |
+|---|---|---|---|
+| `ollama` | `ollama` | `local` | `http://localhost:9` |
+| `llama-cpp-pgx` | `llama-cpp` | `pgx` | `http://pgx.lan:9797` |
+| `llama-cpp-box` | `llama-cpp` | `box` | splits a model across devices by default |
+| `openai-box` | `openai-compatible` | `box` | keeps the type's default: one device |
+| `vllm-box` | `openai-compatible` | `box` | `splits_across_devices: true` |
+| `vllm-lab` | `openai-compatible` | `lab` | fit not available |
+
+## spec0027
+
+A configuration written by spec 0027, before hosts: providers link to
+hardware profiles with `hardware:`. Used to test the error such a file gives
+and the conversion script.
+
+| Provider | Base URL | `hardware:` |
+|---|---|---|
+| `ollama` | `http://localhost:9` | `local` |
+| `openrouter` | `https://openrouter.ai/api` | `unspecified` |
+| `ollama-spark`, `llama-cpp-spark` | `http://spark.lan:11434`, `http://spark.lan:9797` | `spark`: one profile, two providers at one address |
+| `llama-cpp-card-a`, `llama-cpp-card-b` | `http://box-a.lan:8080`, `http://10.0.0.7:8080` | `card`: one profile at two addresses |
+
+Hardware profiles: `local` (manual, system 32.0 GB), `spark` (`dgx-spark`,
+128.0 GB) and `card` (`nvidia-rtx-4090`, 24.0 GB).

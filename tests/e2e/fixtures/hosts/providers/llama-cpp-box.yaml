@@ -1,0 +1,5 @@
+provider_id: llama-cpp-box
+type: llama-cpp
+config:
+  base_url: http://box.lan:8080
+host: box

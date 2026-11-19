@@ -1,0 +1,5 @@
+provider_id: openai-box
+type: openai-compatible
+config:
+  base_url: http://box.lan:8000/v1
+host: box

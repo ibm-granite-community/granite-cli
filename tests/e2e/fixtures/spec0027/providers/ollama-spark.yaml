@@ -1,0 +1,5 @@
+provider_id: ollama-spark
+type: ollama
+config:
+  base_url: http://spark.lan:11434
+hardware: spark

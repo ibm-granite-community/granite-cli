@@ -1,0 +1,5 @@
+provider_id: llama-cpp-card-a
+type: llama-cpp
+config:
+  base_url: http://box-a.lan:8080
+hardware: card

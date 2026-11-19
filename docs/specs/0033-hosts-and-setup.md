@@ -851,6 +851,10 @@ and provider servers are fakes on the loopback address.
   Configured providers and providers added at another address need no
   setting: the test writes the fake server's URL in the configuration or
   types it as the answer.
+  The environment variable `GRANITE_CLI_TEST_DEFAULT_BASE_URL` replaces the
+  default URLs of every type in the binary, so a hermetic test can run
+  `setup --auto` without reaching a server on the machine or a hosted
+  service.
 - **Two hosts in one test** are `localhost` and `127.0.0.1`: two addresses,
   which the wizard keeps apart, that both reach the test's fake servers. No
   test needs a second machine or a network.
@@ -1075,7 +1079,7 @@ listing the four scripts as skipped with their sub-task.
 - `src/commands/setup.rs` (the Ollama server in the setup tests)
 - [Test Strategy](#test-strategy)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 

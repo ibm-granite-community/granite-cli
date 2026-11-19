@@ -1,0 +1,5 @@
+provider_id: llama-cpp-card-b
+type: llama-cpp
+config:
+  base_url: http://10.0.0.7:8080
+hardware: card

@@ -35,6 +35,10 @@ pub(crate) struct AppContext {
     /// the user runs, once the user has named it. `None` outside the wizard,
     /// where a new provider gets its type's default link.
     setup_link: Option<crate::config::hardware::HardwareLink>,
+    /// Default base URLs a test has set for a provider type, in place of
+    /// the registry's.
+    #[cfg(test)]
+    default_base_urls: HashMap<String, Vec<String>>,
 }
 
 impl AppContext {
@@ -49,7 +53,33 @@ impl AppContext {
             hardware: std::sync::Mutex::new(HashMap::new()),
             model_proxy: None,
             setup_link: None,
+            #[cfg(test)]
+            default_base_urls: HashMap::new(),
         }
+    }
+
+    /// The URLs a server of `provider_type` answers on by default, which the
+    /// setup wizard probes: the registry's, unless a test has set others.
+    /// Empty for a type the registry does not know.
+    ///
+    /// The environment variable `GRANITE_CLI_TEST_DEFAULT_BASE_URL` replaces
+    /// the default URLs of every type with its value, so an end-to-end test
+    /// can run `setup` without reaching a server on the machine or a hosted
+    /// service.
+    pub(crate) fn default_base_urls(&self, provider_type: &str) -> Vec<String> {
+        #[cfg(test)]
+        if let Some(urls) = self.default_base_urls.get(provider_type) {
+            return urls.clone();
+        }
+        default_base_urls_with(provider_type, std::env::var(TEST_DEFAULT_BASE_URL_VAR).ok())
+    }
+
+    /// Makes `default_base_urls` return `urls` for `provider_type`, so a
+    /// test can put a type's default port on a fake server.
+    #[cfg(test)]
+    pub(crate) fn set_default_base_urls(&mut self, provider_type: &str, urls: Vec<String>) {
+        self.default_base_urls
+            .insert(provider_type.to_string(), urls);
     }
 
     /// The hardware the setup wizard gives each provider it adds of a type
@@ -143,6 +173,25 @@ impl AppContext {
     }
 }
 
+/*-- private --*/
+
+/// The environment variable that replaces every provider type's default base
+/// URLs, for end-to-end tests. See [`AppContext::default_base_urls`].
+const TEST_DEFAULT_BASE_URL_VAR: &str = "GRANITE_CLI_TEST_DEFAULT_BASE_URL";
+
+/// The default base URLs of `provider_type`: `[replacement]` when the
+/// replacement is set and not empty, the registry's otherwise. Empty for a
+/// type the registry does not know.
+fn default_base_urls_with(provider_type: &str, replacement: Option<String>) -> Vec<String> {
+    let Some(metadata) = crate::providers::PROVIDER_REGISTRY.get(provider_type) else {
+        return Vec::new();
+    };
+    match replacement {
+        Some(url) if !url.is_empty() => vec![url],
+        _ => metadata.default_base_urls.clone(),
+    }
+}
+
 /*-- tests --*/
 
 #[cfg(test)]
@@ -202,6 +251,33 @@ mod tests {
 
         assert!(ui.stderr_infos.borrow().is_empty());
         assert_eq!(ctx.hardware_profile(LOCAL_HARDWARE_ID), Ok(detected()));
+    }
+
+    #[test]
+    fn default_base_urls_are_the_registry_s_unless_replaced() {
+        let ollama = vec!["http://localhost:11434".to_string()];
+        assert_eq!(default_base_urls_with("ollama", None), ollama);
+        assert_eq!(
+            default_base_urls_with("ollama", Some(String::new())),
+            ollama
+        );
+        assert_eq!(
+            default_base_urls_with("ollama", Some("http://127.0.0.1:9".to_string())),
+            vec!["http://127.0.0.1:9".to_string()]
+        );
+        assert!(default_base_urls_with("no-such-type", Some("http://x".to_string())).is_empty());
+    }
+
+    #[test]
+    fn a_test_can_set_one_type_s_default_base_urls() {
+        let mut ctx = AppContext::new(Config::default(), Arc::new(CaptureUi::default()));
+
+        ctx.set_default_base_urls("ollama", vec!["http://127.0.0.1:1".to_string()]);
+
+        assert_eq!(
+            ctx.default_base_urls("ollama"),
+            vec!["http://127.0.0.1:1".to_string()]
+        );
     }
 
     #[test]

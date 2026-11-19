@@ -1,0 +1,5 @@
+provider_id: openrouter
+type: openrouter
+config:
+  base_url: https://openrouter.ai/api
+hardware: unspecified

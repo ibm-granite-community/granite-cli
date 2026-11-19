@@ -1,0 +1,5 @@
+provider_id: llama-cpp-pgx
+type: llama-cpp
+config:
+  base_url: http://pgx.lan:9797
+host: pgx

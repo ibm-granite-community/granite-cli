@@ -165,9 +165,10 @@ impl Discover {
             let runs_on_hardware =
                 crate::config::hardware::HardwareLink::default_for(provider_type)
                     == crate::config::hardware::HardwareLink::Local;
+            let default_base_urls = ctx.default_base_urls(provider_type);
             let base_urls = match host {
-                Some(host) if runs_on_hardware => base_urls_at(&metadata.default_base_urls, host),
-                _ => metadata.default_base_urls.clone(),
+                Some(host) if runs_on_hardware => base_urls_at(&default_base_urls, host),
+                _ => default_base_urls,
             };
             let (discovered_base_url, health_error) =
                 first_healthy_base_url(&base_urls, |base_url| {
@@ -3664,6 +3665,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, ModelConfig, ProviderConfig};
     use crate::models::ModelType;
+    use crate::utils::test_support::{FakeServer, closed_base_url};
     use crate::utils::ui::base::tests::CaptureUi;
     use std::sync::{Arc, Mutex};
 
@@ -3759,7 +3761,49 @@ mod tests {
         ctx
     }
 
+    /// Points the default URLs of every provider type at a closed loopback
+    /// port, except the types in `servers`, whose default URL is the given
+    /// server's. Probing then reaches only the test's own servers, and no
+    /// hosted service or server on the machine running the test.
+    async fn probe_only(ctx: &mut crate::AppContext, servers: &[(&str, &FakeServer)]) {
+        let closed = closed_base_url().await;
+        for (provider_type, _) in PROVIDER_REGISTRY.entries() {
+            let url = servers
+                .iter()
+                .find(|(t, _)| *t == provider_type)
+                .map_or_else(
+                    || closed.clone(),
+                    |(_, server)| server.base_url().to_string(),
+                );
+            ctx.set_default_base_urls(provider_type, vec![url]);
+        }
+    }
+
     // -- discover_providers ----------------------------------------------------
+
+    #[tokio::test]
+    async fn discovery_probes_the_default_url_a_test_has_set() {
+        let server = FakeServer::start("llama-cpp", &[]).await;
+        let mut ctx = test_ctx();
+        probe_only(&mut ctx, &[("llama-cpp", &server)]).await;
+
+        let (recommendations, _) = Discover::discover_providers(&ctx, None).await;
+
+        let healthy: Vec<(&str, Option<&str>)> = recommendations
+            .iter()
+            .filter_map(|rec| match rec {
+                Recommendation::Provider {
+                    provider_type,
+                    health_healthy: true,
+                    discovered_base_url,
+                    ..
+                } => Some((*provider_type, discovered_base_url.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(healthy, vec![("llama-cpp", Some(server.base_url()))]);
+        assert_eq!(server.requests(), 1);
+    }
 
     #[tokio::test]
     async fn provider_discovery_uses_the_first_healthy_base_url() {
@@ -7045,32 +7089,10 @@ mod tests {
         }
     }
 
-    /// An Ollama server answering `/api/tags` with `names`. It has no
-    /// `/api/show`, so each model gets the listing's defaults.
-    async fn ollama_listing(names: &[&str]) -> String {
-        use axum::{Json, Router, routing::get};
-        let body = serde_json::json!({
-            "models": names
-                .iter()
-                .map(|name| serde_json::json!({ "name": name, "model": name }))
-                .collect::<Vec<_>>(),
-        });
-        let app = Router::new().route(
-            "/api/tags",
-            get(move || {
-                let body = body.clone();
-                async move { Json(body) }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}")
-    }
-
     #[tokio::test]
     async fn the_wizard_records_what_each_provider_found_serves() {
-        let base_url = ollama_listing(&["llama3:8b"]).await;
+        let server = FakeServer::start("ollama", &["llama3:8b"]).await;
+        let base_url = server.base_url().to_string();
         let mut recommendations = vec![
             Recommendation::Provider {
                 provider_type: "ollama",
