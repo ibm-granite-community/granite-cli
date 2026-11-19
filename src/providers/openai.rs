@@ -289,7 +289,7 @@ impl HasProviderMetadata for OpenAIProvider {
         ProviderMetadata {
             name: "OpenAI Compatible Provider".to_string(),
             description: "Provider for OpenAI-compatible API endpoints supporting chat, embeddings, and audio transcription".to_string(),
-            provider_type: ProviderType::Hosted,
+            provider_type: ProviderType::Generic,
             default_base_urls: vec![],
             supported_api_types: vec![ApiType::OpenAI],
             default_function_endpoints: Self::default_function_endpoints(),

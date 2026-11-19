@@ -1,6 +1,6 @@
 // Standard
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
@@ -210,8 +210,8 @@ pub(crate) async fn run_command(
         // This must only fire under WSL -- on native Windows the working_dir
         // set above is already a proper Windows path and must not be replaced.
         #[cfg(windows)]
-        if crate::config::Config::is_wsl() {
-            if let Some(drive) = binary_fallback.parent().and_then(|p| {
+        if crate::config::Config::is_wsl()
+            && let Some(drive) = binary_fallback.parent().and_then(|p| {
                 p.to_str().and_then(|s| {
                     let chars: Vec<char> = s.chars().collect();
                     if chars.len() >= 2 && chars[1] == ':' {
@@ -220,9 +220,9 @@ pub(crate) async fn run_command(
                         None
                     }
                 })
-            }) {
-                spawn_cmd.current_dir(drive);
-            }
+            })
+        {
+            spawn_cmd.current_dir(drive);
         }
 
         let mut child = match spawn_cmd.spawn() {
@@ -233,14 +233,8 @@ pub(crate) async fn run_command(
                 if let Some(193) = e.raw_os_error() {
                     let mut shell = std::process::Command::new("cmd.exe");
                     shell.arg("/C");
-                    // Build the full command string for cmd.exe
-                    let mut cmd_str = String::new();
-                    cmd_str.push_str(&binary_fallback.to_string_lossy());
-                    for arg in &args_fallback {
-                        cmd_str.push(' ');
-                        cmd_str.push_str(arg);
-                    }
-                    shell.arg(&cmd_str);
+                    let cmd_str = windows_cmd_line(&binary_fallback, &args_fallback);
+                    std::os::windows::process::CommandExt::raw_arg(&mut shell, &cmd_str);
                     for binding in &overlay_fallback {
                         shell.env(&binding.key, &binding.value);
                     }
@@ -316,8 +310,8 @@ pub(crate) async fn run_command_captured(
             // This must only fire under WSL -- on native Windows the working_dir
             // set above is already a proper Windows path and must not be replaced.
             #[cfg(windows)]
-            if crate::config::Config::is_wsl() {
-                if let Some(drive) = binary_fallback.parent().and_then(|p| {
+            if crate::config::Config::is_wsl()
+                && let Some(drive) = binary_fallback.parent().and_then(|p| {
                     p.to_str().and_then(|s| {
                         let chars: Vec<char> = s.chars().collect();
                         if chars.len() >= 2 && chars[1] == ':' {
@@ -326,9 +320,9 @@ pub(crate) async fn run_command_captured(
                             None
                         }
                     })
-                }) {
-                    spawn_cmd.current_dir(drive);
-                }
+                })
+            {
+                spawn_cmd.current_dir(drive);
             }
 
             let output = match spawn_cmd.output() {
@@ -339,14 +333,8 @@ pub(crate) async fn run_command_captured(
                     if let Some(193) = e.raw_os_error() {
                         let mut shell = std::process::Command::new("cmd.exe");
                         shell.arg("/C");
-                        // Build the full command string for cmd.exe
-                        let mut cmd_str = String::new();
-                        cmd_str.push_str(&binary_fallback.to_string_lossy());
-                        for arg in &args_fallback {
-                            cmd_str.push(' ');
-                            cmd_str.push_str(arg);
-                        }
-                        shell.arg(&cmd_str);
+                        let cmd_str = windows_cmd_line(&binary_fallback, &args_fallback);
+                        std::os::windows::process::CommandExt::raw_arg(&mut shell, &cmd_str);
                         for binding in &overlay_fallback {
                             shell.env(&binding.key, &binding.value);
                         }
@@ -633,6 +621,78 @@ pub(crate) async fn resolve_and_bind(
 
 /*-- private --*/
 
+/// Build the command line passed to `cmd.exe /C` by the Windows fallback in
+/// `run_command` and `run_command_captured`.
+///
+/// Each argument is quoted with the Windows argv rules, so the target program
+/// splits the line back into the original arguments. Every cmd.exe
+/// metacharacter in the result, `"` included, is then prefixed with `^`.
+/// cmd.exe removes each `^` and treats the next character as literal text, so
+/// `&`, `|`, `<`, `>` and `%` in values such as Claude Code's `--agents`
+/// payload reach the target program unchanged. Escaping `"` keeps cmd.exe out
+/// of quoted regions, where it would keep the `^` characters.
+///
+/// The result must be passed with `CommandExt::raw_arg`: `Command::arg` would
+/// quote it a second time.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_cmd_line(binary: &Path, args: &[String]) -> String {
+    let mut values = Vec::with_capacity(args.len() + 1);
+    values.push(quote_windows_arg(&binary.to_string_lossy()));
+    values.extend(args.iter().map(|arg| quote_windows_arg(arg)));
+    escape_cmd_metachars(&values.join(" "))
+}
+
+/// Quote one argument with the rules the Microsoft C runtime uses to split a
+/// command line into `argv`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn escape_cmd_metachars(line: &str) -> String {
+    let mut escaped = String::with_capacity(line.len() * 2);
+    for ch in line.chars() {
+        if is_cmd_metachar(ch) {
+            escaped.push('^');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_cmd_metachar(ch: char) -> bool {
+    matches!(
+        ch,
+        '(' | ')' | '%' | '!' | '^' | '"' | '<' | '>' | '&' | '|'
+    )
+}
+
 define_factory!(Launcher, LauncherMetadata, LauncherFactory);
 
 /*-- tests --*/
@@ -884,6 +944,75 @@ pub(crate) mod tests {
         assert!(status.success());
     }
 
+    /// Undo cmd.exe caret escaping; fails on any metacharacter cmd.exe would act on.
+    fn cmd_unescape(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '^' {
+                out.push(chars.next().expect("dangling caret"));
+            } else {
+                assert!(!is_cmd_metachar(ch), "unescaped {ch:?} in {line}");
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn windows_cmd_fallback_quotes_json_arguments_as_single_values() {
+        let command = windows_cmd_line(
+            &PathBuf::from(r"C:\Program Files\Claude\claude.exe"),
+            &[
+                "--agents".to_string(),
+                r#"{"reviewer":{"description":"Reviews code","prompt":"Say \"hi\""}}"#.to_string(),
+                "--help".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            cmd_unescape(&command),
+            r#""C:\Program Files\Claude\claude.exe" --agents "{\"reviewer\":{\"description\":\"Reviews code\",\"prompt\":\"Say \\\"hi\\\"\"}}" --help"#
+        );
+    }
+
+    #[test]
+    fn windows_cmd_fallback_escapes_cmd_metachars_in_agent_prompt() {
+        let prompt = r#"{"a":{"prompt":"x & del y | more < in > out %PATH% !v! ^ (z)"}}"#;
+        let command = windows_cmd_line(
+            &PathBuf::from(r"C:\bin\claude"),
+            &["--agents".to_string(), prompt.to_string()],
+        );
+
+        assert_eq!(
+            cmd_unescape(&command),
+            format!(r"C:\bin\claude --agents {}", quote_windows_arg(prompt))
+        );
+    }
+
+    #[test]
+    fn windows_cmd_fallback_escapes_metachars_in_unquoted_arguments() {
+        let command = windows_cmd_line(&PathBuf::from(r"C:\bin\claude"), &["a&b|c".to_string()]);
+
+        assert_eq!(command, r"C:\bin\claude a^&b^|c");
+    }
+
+    #[test]
+    fn quote_windows_arg_follows_argv_rules() {
+        let cases = [
+            ("plain", "plain"),
+            ("", r#""""#),
+            ("two words", r#""two words""#),
+            (r#"say "hi""#, r#""say \"hi\"""#),
+            (r"C:\dir with space\", r#""C:\dir with space\\""#),
+            (r#"back\"quote"#, r#""back\\\"quote""#),
+            (r"no\quote\here", r"no\quote\here"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(quote_windows_arg(input), expected, "input: {input}");
+        }
+    }
+
     #[cfg(unix)]
     fn live_ctx() -> LaunchContext {
         LaunchContext {
@@ -998,6 +1127,7 @@ pub(crate) mod tests {
         config.providers.insert(
             "ollama".to_string(),
             ProviderConfig {
+                hardware: Default::default(),
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),

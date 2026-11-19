@@ -93,6 +93,7 @@ mod tests {
                 provider_id: "ollama".to_string(),
                 provider_type: "ollama".to_string(),
                 config: serde_json::json!({}),
+                hardware: None,
             },
         );
         for id in ["b-model", "a-model"] {

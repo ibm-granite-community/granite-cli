@@ -50,8 +50,9 @@ Two terms are used throughout:
   llama.cpp on a Spark.
 - **Hosted provider**: a third-party service such as OpenRouter
   (`ProviderType::Hosted`), whose hardware the user does not know. An
-  openai-compatible provider is not treated as hosted: it usually points at
-  a server the user runs, such as vLLM.
+  openai-compatible provider is generic (`ProviderType::Generic`): it speaks
+  an API that many servers offer, and usually points at a server the user
+  runs, such as vLLM. It is not treated as hosted.
 
 ## Use Cases
 
@@ -433,8 +434,10 @@ for its type.
 
 `provider setup` asks for the link. It offers the local hardware profile, the
 configured ones, "not specified", and "create new profile…", which runs the
-same steps as `hardware setup` and links the result. The two commands can
-therefore be used in either order.
+same steps as `hardware setup` and links the result. If the id typed belongs
+to an existing profile and the user declines to replace it, `provider setup`
+stops with an error and saves nothing. The two commands can therefore be used
+in either order.
 
 ```
 $ granite-cli provider setup
@@ -470,10 +473,26 @@ fit.
 `hardware remove` lists the providers that use a hardware profile before
 removing it.
 
-The setup wizard asks which hardware each provider it adds runs on as soon as
-the providers are chosen, before it ranks models for them, and offers "create
-new profile…" there. Today the wizard only finds providers at their default
-local addresses, so this matters once the wizard can add a provider by hand.
+Right after the launchers, the setup wizard asks which hardware to run
+models on, offering "create new profile…", and the host name or IP address
+of that hardware. The host defaults to `localhost`, or to the host of a
+provider already linked to that profile. The wizard then looks for providers
+of the types the user runs at that host, on their default ports, and for
+hosted providers at their own addresses, and ranks models on that hardware
+in the formats the providers found can run. Capabilities, models, providers
+and variants follow. Each provider the wizard adds of a type the user runs
+is linked to that hardware and saved with the address it was found at. The
+host itself is not saved anywhere else. A provider on another host, or on a
+port other than its default, is added with "Configure a different
+provider…".
+
+```
+$ granite-cli setup
+...
+? Hardware to run models on: spark
+? Host name or IP address of that hardware: spark.lan
+Looking for providers on spark.lan...
+```
 
 ### How setup and recommend estimate fit
 
@@ -1043,7 +1062,7 @@ one to `local`.
 - `src/commands/provider.rs`
 - `src/providers/base.rs` (`ProviderType::Hosted`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1060,8 +1079,10 @@ checked against the context that fits on that hardware. Variants with no fit
 available are not selected automatically; when a recommended capability does
 not resolve, `setup --auto` names it once, with them grouped by model and
 provider, and a note. `setup --auto` and the wizard share this logic. The
-wizard asks which hardware each provider it adds runs on before it ranks
-models, offering "create new profile…". Before it ranks models it offers to
+wizard asks which hardware to run models on and its host before it ranks
+models, offering "create new profile…", looks for providers at that host,
+and links each provider it adds of a type the user runs to that hardware,
+with the address it was found at. Before it ranks models it offers to
 repair each configured provider's broken link, and its variant list names
 the hardware profile when it is not `local`. A model that fits as well on several providers is bound
 to one on `local`.
@@ -1072,14 +1093,21 @@ a size and a provider without a hardware profile each named and not selected;
 the variant a model is bound to coming from the provider it fits best on, and
 from the provider on `local` on a tie; a capability recommended by two
 launchers named once; the wizard's repair of a broken link; the wizard
-ranking models for the hardware chosen for a new provider; and the
+recording the hardware named and returning the host, offering the host of a
+provider already on that hardware, and asking again for a value that is not
+a host; default base URLs moved to the host named; a new provider of a type
+the user runs linked to the hardware named, and a hosted one not; models
+ranked on the hardware named; a provider the wizard adds saved with that
+link and the address found, and one `setup --auto` adds with its type's
+default link; and the
 existing setup tests passing with every provider on `local`.
 
 **Relevant Context**
 - `src/commands/setup.rs` (`resolve_model_set`, `rank_variants_among`,
-  `run_auto_with_hardware`, `select_variants`)
+  `run_auto_with_hardware`, `select_variants`, `select_target`,
+  `discover_providers`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -1114,4 +1142,4 @@ otherwise.
 - `src/utils/ui/setup_pane.rs`
 - `docs/specs/0021-tui-catalog-list-toggle.md`
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
