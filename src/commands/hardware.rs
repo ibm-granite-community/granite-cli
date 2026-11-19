@@ -204,7 +204,8 @@ impl HardwareCommands {
     }
 
     /// Asks which host a provider of `provider_type` runs on: `local`,
-    /// another configured host, or "not specified". `current` is offered
+    /// another configured host, a new host made with the `host setup`
+    /// steps, or "not specified". `current` is offered
     /// first when the provider is being reconfigured; otherwise `local` for a
     /// provider the user runs and "not specified" for a hosted one.
     pub(crate) fn choose_link(
@@ -422,13 +423,25 @@ impl HardwareCommands {
             ));
             links.push(HostLink::Host(id));
         }
-        links.push(HostLink::Unspecified);
+        items.push("create new host…".to_string());
         items.push("not specified (a hosted service; fit cannot be estimated)".to_string());
-        let default_index = links.iter().position(|l| *l == default).unwrap_or(0);
+        let create = links.len();
+        links.push(HostLink::Unspecified);
+        let default_index = match links.iter().position(|l| *l == default) {
+            Some(i) if i == create => i + 1,
+            Some(i) => i,
+            None => 0,
+        };
         let picked = ctx
             .ui
             .select("Host this provider runs on", &items, default_index)?;
-        Ok(links[picked].clone())
+        match picked.cmp(&create) {
+            std::cmp::Ordering::Less => Ok(links[picked].clone()),
+            std::cmp::Ordering::Equal => {
+                Ok(HostLink::Host(crate::commands::HostCommands::create(ctx)?))
+            }
+            std::cmp::Ordering::Greater => Ok(HostLink::Unspecified),
+        }
     }
 
     /// Asks `question` with the choices of [`Self::choose_target`], and
@@ -630,6 +643,7 @@ impl HardwareCommands {
                     id.clone(),
                     hardware.hardware_type.clone(),
                     memory,
+                    hosts_using(ctx, id).join(", "),
                     providers_on(ctx, id).join(", "),
                     problem.unwrap_or_else(|| notes(hardware, unused)),
                 ]
@@ -640,7 +654,7 @@ impl HardwareCommands {
                 "Configured Hardware ({})",
                 count(rows.len(), "profile", "profiles")
             ),
-            &["ID", "TYPE", "MEMORY", "PROVIDERS", "NOTES"],
+            &["ID", "TYPE", "MEMORY", "HOSTS", "PROVIDERS", "NOTES"],
             &rows,
         );
     }
@@ -797,6 +811,19 @@ fn setup_command(id: &str) -> String {
              --memory <GB>"
         ),
     }
+}
+
+/// The hosts that list hardware profile `id`, sorted, with `local` for the
+/// `local` profile before the `local` host is saved.
+fn hosts_using(ctx: &AppContext, id: &str) -> Vec<String> {
+    let config = ctx.config();
+    let mut ids: Vec<String> = config.hosts.keys().cloned().collect();
+    if !ids.iter().any(|h| h == LOCAL_HOST_ID) {
+        ids.push(LOCAL_HOST_ID.to_string());
+    }
+    ids.retain(|host| config.host_hardware(host).iter().any(|h| h == id));
+    ids.sort();
+    ids
 }
 
 /// See [`HardwareCommands::providers_on`].
@@ -1315,13 +1342,14 @@ mod tests {
                 "local",
                 "local",
                 "unified 29.2 GB",
+                "local",
                 "ollama",
                 "auto-detected"
             ]
         );
         assert_eq!(
             rows[1],
-            vec!["spark", "dgx-spark", "unified 128.0 GB", "", ""]
+            vec!["spark", "dgx-spark", "unified 128.0 GB", "", "", ""]
         );
     }
 
@@ -1983,7 +2011,7 @@ mod tests {
         let tables = ui.tables.borrow();
         let (title, _, rows) = &tables[0];
         assert_eq!(title, "Configured Hardware (1 profile)");
-        assert_eq!(rows[0][4], "auto; detected unified 38.9 GB (not used)");
+        assert_eq!(rows[0][5], "auto; detected unified 38.9 GB (not used)");
         let details = ui.details.borrow();
         let detected = details[0].1.iter().find(|(k, _)| k == "Detected").unwrap();
         assert_eq!(detected.1, "unified 38.9 GB (not used)");
@@ -2515,6 +2543,7 @@ mod tests {
             vec![
                 "local (this machine, local (unified 29.2 GB))".to_string(),
                 "pgx (pgx.lan, spark (unified 128.0 GB))".to_string(),
+                "create new host…".to_string(),
                 "not specified (a hosted service; fit cannot be estimated)".to_string(),
             ]
         );
@@ -2711,8 +2740,10 @@ mod tests {
 
         let tables = ui.tables.borrow();
         let rows = &tables[0].2;
-        assert_eq!(rows[0][3], "ollama");
-        assert_eq!(rows[1][3], "llamacpp-spark");
+        assert_eq!(rows[0][3], "local");
+        assert_eq!(rows[0][4], "ollama");
+        assert_eq!(rows[1][3], "pgx");
+        assert_eq!(rows[1][4], "llamacpp-spark");
         let details = ui.details.borrow();
         let providers = details[0]
             .1

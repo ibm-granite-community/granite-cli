@@ -3043,6 +3043,41 @@ mod tests {
     }
 
     #[test]
+    fn the_providers_column_names_the_providers_on_hosts_with_the_profile() {
+        let mut config = config_with_provider("ollama", "ollama", serde_json::json!({}));
+        config.hardware.insert(
+            "spark".to_string(),
+            crate::config::HardwareConfig::catalog("spark", "dgx-spark", 128.0),
+        );
+        config.hosts.insert(
+            "pgx".to_string(),
+            crate::config::HostConfig {
+                host_id: "pgx".to_string(),
+                address: "pgx.lan".to_string(),
+                hardware: vec!["spark".to_string()],
+            },
+        );
+        config.providers.insert(
+            "llama-cpp-pgx".to_string(),
+            crate::config::ProviderConfig {
+                host: Some(crate::config::host::HostLink::Host("pgx".to_string())),
+                provider_id: "llama-cpp-pgx".to_string(),
+                provider_type: "llama-cpp".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        let ctx = ctx_with_config(config);
+        let spark = ctx.hardware_profile("spark").unwrap();
+
+        ModelCommands::recommend(&ctx, None, &[], false, "spark", &spark).unwrap();
+
+        let tables = tables!(ctx);
+        let (_, _, rows) = &tables[0];
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|r| r[5] == "llama-cpp-pgx"), "{rows:?}");
+    }
+
+    #[test]
     fn variants_are_chosen_from_the_providers_on_the_hardware() {
         let mut config = config_with_provider("llama-cpp", "llama-cpp", serde_json::json!({}));
         config.providers.insert(

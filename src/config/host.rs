@@ -78,6 +78,47 @@ pub(crate) fn free_id(id: &str, config: &Config) -> String {
         .expect("an unbounded range has a free id")
 }
 
+/// `url` with its host part replaced by `address`, keeping scheme, port and
+/// path. `None` when `url` does not parse or cannot take that host.
+pub(crate) fn url_at(url: &str, address: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    parsed.set_host(Some(address)).ok()?;
+    // `Url` adds a trailing slash to a bare origin; keep the original form.
+    let mut moved = parsed.to_string();
+    if !url.ends_with('/') && moved.ends_with('/') {
+        moved.pop();
+    }
+    Some(moved)
+}
+
+/// The host part of `url`, without brackets for an IPv6 address. `None`
+/// when `url` does not parse or has no host.
+pub(crate) fn url_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    Some(match parsed.host()? {
+        url::Host::Ipv6(ip) => ip.to_string(),
+        host => host.to_string(),
+    })
+}
+
+/// Whether `a` and `b` name the same machine as far as granite-cli can tell
+/// without a lookup: equal ignoring case and IPv6 brackets, or both a name
+/// for this machine (`localhost`, `127.0.0.1`, `::1`).
+pub(crate) fn same_address(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase()
+    };
+    let loopback = |s: &str| {
+        s == LOCAL_ADDRESS
+            || s.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    let (a, b) = (norm(a), norm(b));
+    a == b || (loopback(&a) && loopback(&b))
+}
+
 /// Which host a provider runs on. Saved as a string: `local`, `unspecified`,
 /// or a host id.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -221,6 +262,40 @@ mod tests {
             },
         );
         assert_eq!(free_id("pgx", &config), "pgx-2");
+    }
+
+    #[test]
+    fn a_url_moves_to_another_address_keeping_port_and_path() {
+        assert_eq!(
+            url_at("http://localhost:8080", "pgx.lan").as_deref(),
+            Some("http://pgx.lan:8080")
+        );
+        assert_eq!(
+            url_at("http://localhost:1234/v1", "10.0.0.7").as_deref(),
+            Some("http://10.0.0.7:1234/v1")
+        );
+        assert_eq!(
+            url_at("http://localhost:8080", "[fe80::1]").as_deref(),
+            Some("http://[fe80::1]:8080")
+        );
+        assert_eq!(url_at("not a url", "pgx.lan"), None);
+    }
+
+    #[test]
+    fn addresses_are_the_same_ignoring_case_brackets_and_loopback_names() {
+        assert!(same_address("PGX.lan", "pgx.lan"));
+        assert!(same_address("localhost", "127.0.0.1"));
+        assert!(same_address("::1", "localhost"));
+        assert!(same_address("[fe80::1]", "fe80::1"));
+        assert!(!same_address("pgx.lan", "10.0.0.12"));
+        assert_eq!(
+            url_host("http://[fe80::1]:8080").as_deref(),
+            Some("fe80::1")
+        );
+        assert_eq!(
+            url_host("http://pgx.lan:9797/v1").as_deref(),
+            Some("pgx.lan")
+        );
     }
 
     #[test]

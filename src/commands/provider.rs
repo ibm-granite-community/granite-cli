@@ -101,6 +101,10 @@ impl ProviderCommands {
                         .cloned()
                         .into_iter()
                         .chain(legacy_link_note(cfg))
+                        .chain(
+                            address_mismatch(ctx, cfg)
+                                .map(|note| ctx.ui.warn_mark(&format!("⚠ {note}"))),
+                        )
                         .collect::<Vec<_>>()
                         .join("; "),
                 ]
@@ -191,10 +195,20 @@ impl ProviderCommands {
         ctx.ui
             .info(&format!("Type: {}", provider_def.provider_type));
 
-        // Get a name for this instance
-        let instance_id = match instance_id {
-            Some(instance_id_arg) => instance_id_arg.to_string(),
-            _ => ctx.ui.text("Instance name: ", provider_type)?,
+        // Get a name for this instance. Without one, the host is asked
+        // first, so the name can default to `<type>-<host>` for a provider
+        // on another machine.
+        let (instance_id, asked_host) = match instance_id {
+            Some(instance_id_arg) => (instance_id_arg.to_string(), None),
+            None => {
+                let host =
+                    crate::commands::HardwareCommands::choose_link(ctx, provider_type, None)?;
+                let default = match &host {
+                    crate::config::host::HostLink::Host(id) => format!("{provider_type}-{id}"),
+                    _ => provider_type.to_string(),
+                };
+                (ctx.ui.text("Instance name: ", &default)?, Some(host))
+            }
         };
 
         if !provider_def.authentication.is_empty() {
@@ -225,13 +239,46 @@ impl ProviderCommands {
             .ok_or_else(|| {
                 anyhow::anyhow!("No config schema registered for provider type '{provider_type}'")
             })?;
-        let defaults = prompt_defaults(provider_type, existing_config);
-
+        let mut defaults = prompt_defaults(provider_type, existing_config);
         let current_link = existing_config.and_then(|c| c.host.clone());
 
+        // The host before the settings, so the endpoint can default to the
+        // type's default URL at the host's address. A provider that stays on
+        // its host keeps its own endpoint as the default.
+        let host = match asked_host {
+            Some(host) => host,
+            None => crate::commands::HardwareCommands::choose_link(
+                ctx,
+                provider_type,
+                current_link.clone(),
+            )?,
+        };
+        let address = match &host {
+            crate::config::host::HostLink::Host(id) => {
+                ctx.config().get_host(id).map(|h| h.address.clone())
+            }
+            crate::config::host::HostLink::Local => Some(
+                ctx.config()
+                    .get_host(crate::config::host::LOCAL_HOST_ID)
+                    .map_or_else(
+                        || crate::config::host::LOCAL_ADDRESS.to_string(),
+                        |h| h.address.clone(),
+                    ),
+            ),
+            crate::config::host::HostLink::Unspecified => None,
+        };
+        if let Some(address) = address
+            && current_link.as_ref() != Some(&host)
+            && let Some(url) = ctx
+                .default_base_urls(provider_type)
+                .first()
+                .and_then(|url| crate::config::host::url_at(url, &address))
+            && let Some(fields) = defaults.as_object_mut()
+        {
+            fields.insert("base_url".to_string(), url.into());
+        }
+
         let config = prompt_from_schema(&*ctx.ui, &schema, &defaults)?;
-        let host =
-            crate::commands::HardwareCommands::choose_link(ctx, provider_type, current_link)?;
 
         let host_note = host.host_id().unwrap_or("not specified").to_string();
         let provider_config = crate::config::ProviderConfig {
@@ -531,6 +578,9 @@ impl ProviderCommands {
                     if let Some(note) = legacy_link_note(cfg) {
                         instance_fields.push(("Note", note));
                     }
+                    if let Some(note) = address_mismatch(ctx, cfg) {
+                        ctx.ui.warn(&format!("Provider '{id}': {note}"));
+                    }
 
                     ctx.ui.detail(id, &instance_fields);
                 }
@@ -580,6 +630,34 @@ fn host_label(ctx: &crate::AppContext, cfg: &crate::config::ProviderConfig) -> S
         Some(HostLink::Unspecified) => ctx.ui.warn_mark("⚠ not specified"),
         Some(link) => link.host_id().unwrap_or_default().to_string(),
     }
+}
+
+/// When the host part of the provider's base URL is not its host's address,
+/// says so. The provider may reach the machine through another name, so
+/// this is a note, not an error. `None` for a provider with no saved link,
+/// no host, a host that is not configured, or no base URL.
+fn address_mismatch(
+    ctx: &crate::AppContext,
+    cfg: &crate::config::ProviderConfig,
+) -> Option<String> {
+    use crate::config::host::{HostLink, LOCAL_ADDRESS, LOCAL_HOST_ID, same_address, url_host};
+    let (host_id, address) = match cfg.host.as_ref()? {
+        HostLink::Local => (
+            LOCAL_HOST_ID.to_string(),
+            ctx.config()
+                .get_host(LOCAL_HOST_ID)
+                .map_or_else(|| LOCAL_ADDRESS.to_string(), |h| h.address.clone()),
+        ),
+        HostLink::Host(id) => (id.clone(), ctx.config().get_host(id)?.address.clone()),
+        HostLink::Unspecified => return None,
+    };
+    let in_url = url_host(cfg.config.get("base_url")?.as_str()?)?;
+    if same_address(&in_url, &address) {
+        return None;
+    }
+    Some(format!(
+        "base URL uses {in_url}, host '{host_id}' is at {address}"
+    ))
 }
 
 /// For a provider saved before links existed, the command that sets its
@@ -1074,6 +1152,219 @@ mod tests {
         assert_eq!(
             ctx.config().get_provider("vllm-lab").unwrap().host,
             Some(HostLink::Host("spark".to_string()))
+        );
+    }
+
+    /// An interactive context with `local` saved, so no question detects
+    /// the machine, and host `box` at `127.0.0.1`. llama-cpp's default URL
+    /// is a closed port, so the health check after setup fails at once.
+    async fn ctx_with_box() -> (crate::AppContext, Arc<CaptureUi>, String) {
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = crate::AppContext::new(Config::new().unwrap(), ui.clone());
+        ctx.ensure_local_host(|| {
+            crate::utils::hardware::HardwareProfile::with_memory(
+                crate::utils::hardware::Memory::System { ram_gb: 32.0 },
+            )
+        })
+        .unwrap();
+        ctx.config_mut()
+            .insert_host(
+                "box",
+                crate::config::HostConfig {
+                    host_id: "box".to_string(),
+                    address: "127.0.0.1".to_string(),
+                    hardware: Vec::new(),
+                },
+            )
+            .unwrap();
+        let closed = crate::utils::test_support::closed_base_url().await;
+        let port = closed.rsplit(':').next().unwrap().to_string();
+        ctx.set_default_base_urls("llama-cpp", vec![format!("http://localhost:{port}")]);
+        (ctx, ui, port)
+    }
+
+    #[tokio::test]
+    async fn setup_links_to_a_configured_host_with_the_endpoint_at_its_address() {
+        use crate::config::host::HostLink;
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, ui, port) = ctx_with_box().await;
+        ui.select_answers.borrow_mut().push_back(1); // box
+
+        ProviderCommands::setup(&mut ctx, "llama-cpp", Some("llama-cpp-box"), false)
+            .await
+            .unwrap();
+
+        let provider = ctx.config().get_provider("llama-cpp-box").unwrap();
+        assert_eq!(provider.host, Some(HostLink::Host("box".to_string())));
+        assert_eq!(
+            provider.config["base_url"],
+            format!("http://127.0.0.1:{port}")
+        );
+        let (question, items, _) = &ui.select_prompts.borrow()[0];
+        assert_eq!(question, "Host this provider runs on");
+        assert_eq!(
+            items.len(),
+            4,
+            "local, box, create, not specified: {items:?}"
+        );
+        assert!(
+            ui.infos
+                .borrow()
+                .iter()
+                .any(|m| m.contains("'llama-cpp-box' configured successfully (host: box)"))
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_can_create_a_host_and_put_the_endpoint_at_its_address() {
+        use crate::config::host::HostLink;
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, ui, port) = ctx_with_box().await;
+        ctx.config_mut().remove_host("box").unwrap();
+        // "create new host…", then "unknown" hardware: no profile other
+        // than `local` is configured, so the items are create and unknown.
+        ui.select_answers.borrow_mut().extend([1, 1]);
+        // The address; the id takes its default.
+        ui.text_answers
+            .borrow_mut()
+            .push_back("127.0.0.1".to_string());
+
+        ProviderCommands::setup(&mut ctx, "llama-cpp", Some("lab"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ctx.config().get_host("host"),
+            Some(&crate::config::HostConfig {
+                host_id: "host".to_string(),
+                address: "127.0.0.1".to_string(),
+                hardware: Vec::new(),
+            })
+        );
+        let provider = ctx.config().get_provider("lab").unwrap();
+        assert_eq!(provider.host, Some(HostLink::Host("host".to_string())));
+        assert_eq!(
+            provider.config["base_url"],
+            format!("http://127.0.0.1:{port}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_stays_on_its_host_keeps_its_endpoint_and_one_that_moves_does_not() {
+        use crate::config::host::HostLink;
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, ui, port) = ctx_with_box().await;
+        let own = "http://127.0.0.1:1".to_string();
+        ctx.config_mut().providers.insert(
+            "lab".to_string(),
+            ProviderConfig {
+                provider_id: "lab".to_string(),
+                provider_type: "llama-cpp".to_string(),
+                config: serde_json::json!({ "base_url": own }),
+                host: Some(HostLink::Host("box".to_string())),
+            },
+        );
+        let endpoint_default = |ui: &CaptureUi| {
+            ui.text_prompts
+                .borrow()
+                .iter()
+                .find(|(prompt, _)| prompt.contains("base_url") || prompt.contains("Base URL"))
+                .map(|(_, default)| default.clone())
+        };
+
+        // Stays on box: its own endpoint is offered.
+        ui.select_answers.borrow_mut().push_back(1);
+        ProviderCommands::setup(&mut ctx, "llama-cpp", Some("lab"), true)
+            .await
+            .unwrap();
+        assert_eq!(endpoint_default(&ui).as_deref(), Some(own.as_str()));
+
+        // Moves to local: the type's default URL at localhost.
+        ui.text_prompts.borrow_mut().clear();
+        ui.select_answers.borrow_mut().push_back(0);
+        ProviderCommands::setup(&mut ctx, "llama-cpp", Some("lab"), true)
+            .await
+            .unwrap();
+        let expected = format!("http://localhost:{port}");
+        assert_eq!(endpoint_default(&ui).as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            ctx.config().get_provider("lab").unwrap().host,
+            Some(HostLink::Local)
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_name_the_host_is_asked_first_and_names_the_provider() {
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, ui, _) = ctx_with_box().await;
+        ui.select_answers.borrow_mut().push_back(1); // box
+
+        ProviderCommands::setup(&mut ctx, "llama-cpp", None, false)
+            .await
+            .unwrap();
+
+        let texts = ui.text_prompts.borrow();
+        assert_eq!(
+            texts[0],
+            ("Instance name: ".to_string(), "llama-cpp-box".to_string())
+        );
+        assert!(ctx.config().get_provider("llama-cpp-box").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_base_url_at_another_address_than_the_host_s_is_noted() {
+        use crate::config::host::HostLink;
+        let _home = crate::config::TestConfigHome::new();
+        let (mut ctx, ui, _) = ctx_with_box().await;
+        for (id, url, host) in [
+            (
+                "moved",
+                "http://10.0.0.9:8080",
+                HostLink::Host("box".to_string()),
+            ),
+            (
+                "same",
+                "http://127.0.0.1:8080",
+                HostLink::Host("box".to_string()),
+            ),
+            ("loopback", "http://[::1]:11434", HostLink::Local),
+        ] {
+            ctx.config_mut().providers.insert(
+                id.to_string(),
+                ProviderConfig {
+                    provider_id: id.to_string(),
+                    provider_type: "llama-cpp".to_string(),
+                    config: serde_json::json!({ "base_url": url }),
+                    host: Some(host),
+                },
+            );
+        }
+
+        ProviderCommands::list(&ctx).unwrap();
+        ProviderCommands::info_detail(&ctx, "moved").unwrap();
+
+        let tables = ui.tables.borrow();
+        let notes = |id: &str| {
+            tables[0]
+                .2
+                .iter()
+                .find(|r| r[0] == id)
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            notes("moved"),
+            "⚠ base URL uses 10.0.0.9, host 'box' is at 127.0.0.1"
+        );
+        assert_eq!(notes("same"), "");
+        assert_eq!(notes("loopback"), "");
+        assert_eq!(
+            *ui.warns.borrow(),
+            vec![
+                "Provider 'moved': base URL uses 10.0.0.9, host 'box' is at 127.0.0.1".to_string()
+            ]
         );
     }
 

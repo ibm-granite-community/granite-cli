@@ -1161,7 +1161,7 @@ PROVIDERS column through hosts.
   `setup`)
 - `src/commands/hardware.rs`, `src/commands/model.rs` (`recommend`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 

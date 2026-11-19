@@ -448,9 +448,7 @@ impl Fix {
             _ => None,
         };
         Some(Self {
-            // A host has no setup command to rerun yet; removal is its fix.
-            can_reconfigure: kind != RefKind::Host
-                && !matches!(error.problem, Problem::UnknownType { .. }),
+            can_reconfigure: !matches!(error.problem, Problem::UnknownType { .. }),
             reset,
             type_name,
             disable: disable_target(error, kind, &id, root, config),
@@ -707,8 +705,8 @@ async fn reconfigure(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
         RefKind::Capability => CapabilityCommands::setup(ctx, type_name, id, true).await,
         RefKind::Model => ModelCommands::setup(ctx, type_name, id, true).await,
         RefKind::Provider => ProviderCommands::setup(ctx, type_name, id, true).await,
-        // `Fix::for_error` offers no reconfiguring for a host.
-        RefKind::Host => Ok(()),
+        // What can be wrong with a host is a device it lists.
+        RefKind::Host => crate::commands::HostCommands::reconfigure_devices(ctx, &fix.id),
         RefKind::Hardware => {
             use crate::config::hardware::LOCAL_HARDWARE_ID;
             let args = crate::commands::hardware::HardwareSetupArgs {
@@ -1564,6 +1562,81 @@ mod tests {
             ctx.config().get_hardware("card"),
             Some(&HardwareConfig::catalog("card", "nvidia-rtx-4090", 24.0))
         );
+    }
+
+    #[tokio::test]
+    async fn a_provider_whose_host_is_gone_is_offered_reconfiguring() {
+        let mut ctx = crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()));
+        ctx.config_mut().providers.insert(
+            "vllm-lab".to_string(),
+            ProviderConfig {
+                host: Some(crate::config::host::HostLink::Host("gone".to_string())),
+                provider_id: "vllm-lab".to_string(),
+                provider_type: "openai-compatible".to_string(),
+                config: serde_json::json!({ "base_url": "http://lab:8000" }),
+            },
+        );
+        answer(&ctx, &[2]); // reconfigure, remove, decline: decline
+
+        remediate(
+            &mut ctx,
+            RefKind::Provider,
+            "vllm-lab",
+            OnDecline::Skip,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let prompts = prompts(&ctx);
+        assert!(
+            prompts[0].1[0].starts_with("Reconfigure provider 'vllm-lab'"),
+            "{prompts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_listing_a_missing_profile_can_have_its_devices_asked_again() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()));
+        ctx.config_mut().hosts.insert(
+            "lab".to_string(),
+            crate::config::HostConfig {
+                host_id: "lab".to_string(),
+                address: "lab.lan".to_string(),
+                hardware: vec!["gone".to_string()],
+            },
+        );
+        ctx.config_mut().providers.insert(
+            "vllm-lab".to_string(),
+            ProviderConfig {
+                host: Some(crate::config::host::HostLink::Host("lab".to_string())),
+                provider_id: "vllm-lab".to_string(),
+                provider_type: "openai-compatible".to_string(),
+                config: serde_json::json!({ "base_url": "http://lab.lan:8000" }),
+            },
+        );
+        // Reconfigure host 'lab'; then "unknown" of create and unknown.
+        answer(&ctx, &[0, 1]);
+
+        let outcome = remediate(
+            &mut ctx,
+            RefKind::Provider,
+            "vllm-lab",
+            OnDecline::Skip,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Clean);
+        let prompts = prompts(&ctx);
+        assert!(
+            prompts[0].1[0].starts_with("Reconfigure host 'lab'"),
+            "{prompts:?}"
+        );
+        assert_eq!(prompts[1].0, "Hardware on lab.lan");
+        assert!(ctx.config().get_host("lab").unwrap().hardware.is_empty());
     }
 
     #[tokio::test]

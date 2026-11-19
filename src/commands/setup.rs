@@ -1181,18 +1181,10 @@ where
 /// or whose host cannot be `host`, is left out.
 fn base_urls_at(base_urls: &[String], host: &str) -> Vec<String> {
     let mut at: Vec<String> = Vec::new();
-    for base_url in base_urls {
-        let Ok(mut url) = url::Url::parse(base_url) else {
-            continue;
-        };
-        if url.set_host(Some(host)).is_err() {
-            continue;
-        }
-        // `Url` adds a trailing slash to a bare origin; the defaults have none.
-        let mut moved = url.to_string();
-        if !base_url.ends_with('/') && moved.ends_with('/') {
-            moved.pop();
-        }
+    for moved in base_urls
+        .iter()
+        .filter_map(|url| crate::config::host::url_at(url, host))
+    {
         if !at.contains(&moved) {
             at.push(moved);
         }
@@ -6472,6 +6464,7 @@ mod tests {
 
     #[test]
     fn the_wizard_links_to_the_host_at_the_address_named() {
+        let _home = crate::config::TestConfigHome::new();
         use crate::config::host::HostLink;
         let (mut ctx, capture, _) = wizard_with_llama_cpp_found();
         capture.select_answers.borrow_mut().push_back(1); // spark
@@ -6492,6 +6485,7 @@ mod tests {
 
     #[test]
     fn an_address_of_a_host_with_other_hardware_links_to_that_host_with_a_warning() {
+        let _home = crate::config::TestConfigHome::new();
         use crate::config::host::HostLink;
         let (mut ctx, capture, _) = wizard_with_llama_cpp_found();
         capture.select_answers.borrow_mut().push_back(1); // spark
@@ -6550,6 +6544,7 @@ mod tests {
 
     #[test]
     fn the_wizard_asks_again_for_a_host_that_is_not_one() {
+        let _home = crate::config::TestConfigHome::new();
         let (mut ctx, capture, _) = wizard_with_llama_cpp_found();
         capture.select_answers.borrow_mut().push_back(0); // local
         capture
