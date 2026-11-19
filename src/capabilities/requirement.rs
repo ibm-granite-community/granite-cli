@@ -332,6 +332,8 @@ mod tests {
             default_base_urls: vec!["http://localhost".to_string()],
             supported_api_types: api_types,
             default_function_endpoints,
+            splits_across_devices: false,
+            device_overhead_gb: crate::providers::DEFAULT_DEVICE_OVERHEAD_GB,
             supported_formats: vec![],
             authentication: vec![],
             tags: vec![],

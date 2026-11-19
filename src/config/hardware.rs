@@ -21,6 +21,30 @@ use crate::utils::hardware_catalog;
 /// granite-cli runs on.
 pub(crate) const LOCAL_HARDWARE_ID: &str = "local";
 
+/// The id of the `n`-th device of this machine, counting from 1: `local`,
+/// then `local-2`, `local-3` and so on.
+pub(crate) fn local_device_id(n: usize) -> String {
+    if n <= 1 {
+        LOCAL_HARDWARE_ID.to_string()
+    } else {
+        format!("{LOCAL_HARDWARE_ID}-{n}")
+    }
+}
+
+/// Whether `config` is a device of this machine that detection wrote and
+/// keeps: an id `local-<n>`, of type `local`, in auto mode. A profile the
+/// user made or edited by hand is not.
+pub(crate) fn is_detected_device(config: &HardwareConfig) -> bool {
+    let numbered = config
+        .hardware_id
+        .strip_prefix(&format!("{LOCAL_HARDWARE_ID}-"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    numbered
+        && config
+            .local_settings()
+            .is_some_and(|l| l.mode == LocalMode::Auto)
+}
+
 /// The type of a hardware profile whose figures the user typed.
 pub(crate) const CUSTOM_HARDWARE_TYPE: &str = "custom";
 
@@ -98,6 +122,15 @@ impl HardwareConfig {
             profile: saved_figures(found),
             detected: None,
         })
+    }
+
+    /// A profile for a device of this machine other than the first, saved
+    /// as `local-<n>`, holding the figures detection `found`, in auto mode.
+    pub(crate) fn local_device(n: usize, found: HardwareProfile) -> Self {
+        Self {
+            hardware_id: local_device_id(n),
+            ..Self::local_from_detection(found)
+        }
     }
 
     /// A `local` profile holding `settings`.

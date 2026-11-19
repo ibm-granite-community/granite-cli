@@ -636,6 +636,8 @@ impl HasProviderMetadata for LlamaCppProvider {
             ],
             supported_api_types: vec![ApiType::OpenAI, ApiType::Anthropic],
             default_function_endpoints: Self::default_function_endpoints(),
+            splits_across_devices: true,
+            device_overhead_gb: crate::providers::DEFAULT_DEVICE_OVERHEAD_GB,
             supported_formats: vec![ModelFormat::GGUF],
             authentication: vec![AuthType::None, AuthType::BearerToken],
             tags: vec![

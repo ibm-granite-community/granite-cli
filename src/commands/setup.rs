@@ -1429,9 +1429,9 @@ fn admits_variant(
                 .any(|p| p.matches(&variant.precision)))
 }
 
-/// The hardware profile `provider_id` runs on, which fit is estimated
-/// against: what its link names when it is configured, otherwise the default
-/// for its type, since that is the link setup gives it. `local` is the
+/// The figures fit is estimated on for `provider_id`: its host's devices,
+/// as the provider uses them (see `AppContext::host_fit_profile`), through
+/// its link when it is configured, otherwise the link setup gives it. `local` is the
 /// profile the run already read. An error, with the reason, when the
 /// provider has no hardware profile or its figures cannot be looked up, so
 /// fit cannot be estimated for it.
@@ -1440,10 +1440,20 @@ fn provider_hardware(
     local: &HardwareProfile,
     ctx: &crate::AppContext,
 ) -> std::result::Result<HardwareProfile, String> {
-    use crate::config::host::HostLink;
+    use crate::config::host::{HostLink, LOCAL_HOST_ID};
+    let using = match ctx.config().get_provider(provider_id) {
+        Some(pc) => crate::providers::DeviceUse::of(&pc.provider_type, &pc.config),
+        None => crate::providers::DeviceUse::of(provider_id, &serde_json::Value::Null),
+    };
     match provider_link(provider_id, ctx) {
+        // With one device, `local` is the figures this run read, which may
+        // be a detection the user kept for this run only. With several, fit
+        // uses the saved figures of every device.
+        HostLink::Local if ctx.config().host_hardware(LOCAL_HOST_ID).len() > 1 => {
+            ctx.host_fit_profile(LOCAL_HOST_ID, using)
+        }
         HostLink::Local => Ok(local.clone()),
-        HostLink::Host(id) => ctx.host_profile(&id),
+        HostLink::Host(id) => ctx.host_fit_profile(&id, using),
         HostLink::Unspecified => Err(format!("no host for '{provider_id}'")),
     }
 }
@@ -6662,6 +6672,36 @@ mod tests {
         let (model_id, _) = resolve_model_set(&set, &small_local(), &ids, &on_spark)
             .expect("granite-4.2-30b fits on the Spark");
         assert_eq!(model_id, "granite-4.2-30b");
+    }
+
+    #[test]
+    fn on_a_local_host_with_two_cards_a_provider_that_splits_uses_both() {
+        use crate::config::host::HostLink;
+        let _home = crate::config::TestConfigHome::new();
+        let card = || {
+            HardwareProfile::with_memory(crate::utils::hardware::Memory::Discrete {
+                vram_gb: 24.0,
+                ram_gb: Some(64.0),
+            })
+        };
+        let mut ctx = ctx_with_linked_providers(&[
+            ("llama-cpp", "llama-cpp", HostLink::Local),
+            ("vllm", "openai-compatible", HostLink::Local),
+        ]);
+        ctx.set_other_gpus(vec![card()]);
+        ctx.ensure_local_host(card).unwrap();
+        let local = ctx.hardware_profile("local").unwrap();
+
+        let usable = |id: &str| {
+            provider_hardware(id, &local, &ctx)
+                .unwrap()
+                .usable_memory_gb()
+        };
+
+        assert_eq!(usable("llama-cpp"), 2.0 * 16.0 - 1.0);
+        assert_eq!(usable("vllm"), 16.0);
+        // A type found in this run, not configured yet, gets its defaults.
+        assert_eq!(usable("ollama"), 2.0 * 16.0 - 1.0);
     }
 
     #[test]

@@ -314,9 +314,15 @@ enum ModelSubcommands {
         #[arg(long)]
         wide: bool,
 
-        /// Hardware profile to estimate fit against (see `hardware list`)
+        /// Hardware profile to estimate fit against, as one device (see
+        /// `hardware list`)
         #[arg(long, default_value = "local")]
         hardware: String,
+
+        /// Host to estimate fit on, for each provider there, on as many of its
+        /// devices as the provider uses (see `host list`)
+        #[arg(long, conflicts_with_all = ["hardware", "providers"])]
+        host: Option<String>,
     },
 
     /// Show detailed model information
@@ -928,8 +934,15 @@ async fn run_model_command(ctx: &mut AppContext, subcmd: ModelSubcommands) -> an
             providers,
             wide,
             hardware,
+            host,
         } => {
             let can_prompt = HardwareCommands::can_prompt(ctx);
+            if let Some(host) = host {
+                if host == config::host::LOCAL_HOST_ID {
+                    HardwareCommands::local_for_fit(ctx, can_prompt)?;
+                }
+                return ModelCommands::recommend_on_host(ctx, r#type, wide, &host);
+            }
             let (hardware, profile) =
                 HardwareCommands::profile_for_fit(ctx, &hardware, can_prompt)?;
             ModelCommands::recommend(ctx, r#type, &providers, wide, &hardware, &profile)

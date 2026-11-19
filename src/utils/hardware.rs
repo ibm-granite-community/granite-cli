@@ -145,13 +145,16 @@ impl HardwareProfile {
     }
 
     pub(crate) fn detect() -> Self {
-        Self::from_findings(Findings {
-            os: std::env::consts::OS.to_string(),
-            cpu_cores: num_cpus::get() as u32,
-            cpu_arch: std::env::consts::ARCH.to_string(),
-            total_ram_bytes: total_memory_bytes(),
-            gpu: probe_gpu(),
-        })
+        Self::from_findings(Self::probe())
+    }
+
+    /// Every device detection finds on this machine, the one [`Self::detect`]
+    /// returns first. A machine with several NVIDIA, AMD or DXGI cards has one
+    /// profile per card; a Mac, a machine with unified memory or no GPU has
+    /// one.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn detect_devices() -> Vec<Self> {
+        Self::devices_from_findings(Self::probe())
     }
 
     pub(crate) fn memory_kind(&self) -> MemoryKind {
@@ -274,13 +277,18 @@ struct Findings {
     cpu_cores: u32,
     cpu_arch: String,
     total_ram_bytes: u64,
-    gpu: Option<GpuFinding>,
+    /// Every GPU found, the one setup uses first.
+    gpus: Vec<GpuFinding>,
 }
 
 struct GpuFinding {
     vendor: String,
     memory: GpuMemory,
 }
+
+/// The memory, in GB, a GPU after the first needs to count as a device of
+/// its own.
+const MIN_EXTRA_DEVICE_GB: f64 = 2.0;
 
 /// How a GPU reported its memory.
 enum GpuMemory {
@@ -299,9 +307,52 @@ enum GpuMemory {
 }
 
 impl HardwareProfile {
-    fn from_findings(findings: Findings) -> Self {
+    fn probe() -> Findings {
+        Findings {
+            os: std::env::consts::OS.to_string(),
+            cpu_cores: num_cpus::get() as u32,
+            cpu_arch: std::env::consts::ARCH.to_string(),
+            total_ram_bytes: total_memory_bytes(),
+            gpus: probe_gpus(),
+        }
+    }
+
+    /// The first device of `findings`: its first GPU, or system memory when
+    /// there is none.
+    fn from_findings(mut findings: Findings) -> Self {
+        let first = (!findings.gpus.is_empty()).then(|| findings.gpus.remove(0));
+        Self::from_gpu(&findings, first)
+    }
+
+    /// One profile per device of `findings`. A GPU after the first is a
+    /// device of its own when it and the first have discrete memory; any
+    /// other finding is one device, as [`Self::from_findings`] reads it.
+    fn devices_from_findings(mut findings: Findings) -> Vec<Self> {
+        let gpus = std::mem::take(&mut findings.gpus);
+        let mut gpus = gpus.into_iter();
+        let first = Self::from_gpu(&findings, gpus.next());
+        if first.memory_kind() != MemoryKind::Discrete {
+            return vec![first];
+        }
+        let mut devices = vec![first];
+        for gpu in gpus {
+            let device = Self::from_gpu(&findings, Some(gpu));
+            // An integrated GPU next to a card, which DXGI and sysfs list
+            // with a few hundred MB of its own, holds no model.
+            let large_enough = device
+                .memory
+                .vram_gb()
+                .is_some_and(|gb| gb >= MIN_EXTRA_DEVICE_GB);
+            if device.memory_kind() == MemoryKind::Discrete && large_enough {
+                devices.push(device);
+            }
+        }
+        devices
+    }
+
+    fn from_gpu(findings: &Findings, gpu: Option<GpuFinding>) -> Self {
         let ram_gb = bytes_to_gb(findings.total_ram_bytes);
-        let (gpu_vendor, memory) = match findings.gpu {
+        let (gpu_vendor, memory) = match gpu {
             None => (None, Memory::System { ram_gb }),
             Some(GpuFinding { vendor, memory }) => {
                 let memory = match memory {
@@ -328,35 +379,44 @@ impl HardwareProfile {
         let mut profile = Self::with_memory(memory);
         profile.gpu_vendor = gpu_vendor;
         profile.machine = MachineInfo {
-            os: findings.os,
+            os: findings.os.clone(),
             cpu_cores: Some(findings.cpu_cores),
-            cpu_arch: findings.cpu_arch,
+            cpu_arch: findings.cpu_arch.clone(),
         };
         profile
     }
 }
 
-fn probe_gpu() -> Option<GpuFinding> {
-    if let Some(finding) = gpu::detect_nvidia() {
-        return Some(finding);
+/// Every GPU of the first vendor that has one, in the order the vendor's
+/// interface lists them.
+fn probe_gpus() -> Vec<GpuFinding> {
+    let nvidia = gpu::detect_nvidia();
+    if !nvidia.is_empty() {
+        return nvidia;
     }
 
     #[cfg(target_os = "macos")]
     if let Some(finding) = gpu::detect_apple() {
-        return Some(finding);
+        return vec![finding];
     }
 
     #[cfg(target_os = "linux")]
-    if let Some(finding) = gpu::detect_amd_linux() {
-        return Some(finding);
+    {
+        let amd = gpu::detect_amd_linux();
+        if !amd.is_empty() {
+            return amd;
+        }
     }
 
     #[cfg(target_os = "windows")]
-    if let Some(finding) = gpu::detect_dxgi() {
-        return Some(finding);
+    {
+        let dxgi = gpu::detect_dxgi();
+        if !dxgi.is_empty() {
+            return dxgi;
+        }
     }
 
-    None
+    Vec::new()
 }
 
 fn total_memory_bytes() -> u64 {
@@ -379,23 +439,32 @@ fn bytes_to_gb(bytes: u64) -> f64 {
 mod gpu {
     use super::{GpuFinding, GpuMemory};
 
-    pub(crate) fn detect_nvidia() -> Option<GpuFinding> {
+    /// Every device NVML lists, by index.
+    pub(crate) fn detect_nvidia() -> Vec<GpuFinding> {
         use nvml_wrapper::error::NvmlError;
 
-        let nvml = nvml_wrapper::Nvml::init().ok()?;
-        let device = nvml.device_by_index(0).ok()?;
-        let memory = match device.memory_info() {
-            Ok(info) => GpuMemory::Dedicated(info.total),
-            // Coherent-memory superchips (e.g. Grace Blackwell GB10) have no
-            // discrete framebuffer -- NVML reports NotSupported because the GPU
-            // shares system RAM over NVLink-C2C instead of owning dedicated VRAM.
-            Err(NvmlError::NotSupported) => GpuMemory::SharedWithSystem,
-            Err(_) => GpuMemory::Unknown,
+        let Ok(nvml) = nvml_wrapper::Nvml::init() else {
+            return Vec::new();
         };
-        Some(GpuFinding {
-            vendor: "NVIDIA".to_string(),
-            memory,
-        })
+        let count = nvml.device_count().unwrap_or(0);
+        (0..count)
+            .filter_map(|index| nvml.device_by_index(index).ok())
+            .map(|device| {
+                let memory = match device.memory_info() {
+                    Ok(info) => GpuMemory::Dedicated(info.total),
+                    // Coherent-memory superchips (e.g. Grace Blackwell GB10)
+                    // have no discrete framebuffer -- NVML reports
+                    // NotSupported because the GPU shares system RAM over
+                    // NVLink-C2C instead of owning dedicated VRAM.
+                    Err(NvmlError::NotSupported) => GpuMemory::SharedWithSystem,
+                    Err(_) => GpuMemory::Unknown,
+                };
+                GpuFinding {
+                    vendor: "NVIDIA".to_string(),
+                    memory,
+                }
+            })
+            .collect()
     }
 
     #[cfg(target_os = "macos")]
@@ -413,12 +482,18 @@ mod gpu {
         })
     }
 
+    /// Every AMD card in sysfs that states its VRAM, in card order.
     #[cfg(target_os = "linux")]
-    pub(crate) fn detect_amd_linux() -> Option<GpuFinding> {
+    pub(crate) fn detect_amd_linux() -> Vec<GpuFinding> {
         const AMD_VENDOR_ID: &str = "0x1002";
 
-        let drm_dir = std::fs::read_dir("/sys/class/drm").ok()?;
-        for entry in drm_dir.flatten() {
+        let Ok(drm_dir) = std::fs::read_dir("/sys/class/drm") else {
+            return Vec::new();
+        };
+        let mut entries: Vec<std::fs::DirEntry> = drm_dir.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        let mut found = Vec::new();
+        for entry in entries {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.starts_with("card")
@@ -436,27 +511,30 @@ mod gpu {
             if let Ok(raw) = std::fs::read_to_string(device_dir.join("mem_info_vram_total"))
                 && let Ok(bytes) = raw.trim().parse::<u64>()
             {
-                return Some(GpuFinding {
+                found.push(GpuFinding {
                     vendor: "AMD".to_string(),
                     memory: GpuMemory::Dedicated(bytes),
                 });
             }
         }
-        None
+        found
     }
 
+    /// Every hardware adapter DXGI lists, the one with the most dedicated
+    /// memory first.
     #[cfg(target_os = "windows")]
-    pub(crate) fn detect_dxgi() -> Option<GpuFinding> {
+    pub(crate) fn detect_dxgi() -> Vec<GpuFinding> {
         use windows::Win32::Graphics::Dxgi::{
             CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
         };
 
+        let mut found: Vec<(String, u64)> = Vec::new();
         // SAFETY: DXGI enumeration APIs are called per their documented contract;
-        // failures are surfaced as `None` rather than unwound.
+        // failures end the enumeration rather than unwind.
         unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-
-            let mut best: Option<(String, u64)> = None;
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+                return Vec::new();
+            };
             let mut index = 0u32;
             while let Ok(adapter) = factory.EnumAdapters1(index) {
                 index += 1;
@@ -466,26 +544,26 @@ mod gpu {
                 if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
                     continue;
                 }
-
-                let vram = desc.DedicatedVideoMemory as u64;
-                if best.as_ref().is_none_or(|(_, best_vram)| vram > *best_vram) {
-                    let name_len = desc.Description.iter().take_while(|&&c| c != 0).count();
-                    let name = String::from_utf16_lossy(&desc.Description[..name_len]);
-                    let vendor = match desc.VendorId {
-                        0x10DE => "NVIDIA".to_string(),
-                        0x1002 | 0x1022 => "AMD".to_string(),
-                        0x8086 => "Intel".to_string(),
-                        _ => name,
-                    };
-                    best = Some((vendor, vram));
-                }
+                let name_len = desc.Description.iter().take_while(|&&c| c != 0).count();
+                let name = String::from_utf16_lossy(&desc.Description[..name_len]);
+                let vendor = match desc.VendorId {
+                    0x10DE => "NVIDIA".to_string(),
+                    0x1002 | 0x1022 => "AMD".to_string(),
+                    0x8086 => "Intel".to_string(),
+                    _ => name,
+                };
+                found.push((vendor, desc.DedicatedVideoMemory as u64));
             }
-
-            best.map(|(vendor, vram)| GpuFinding {
+        }
+        // Stable, so adapters with the same memory keep DXGI's order.
+        found.sort_by(|a, b| b.1.cmp(&a.1));
+        found
+            .into_iter()
+            .map(|(vendor, vram)| GpuFinding {
                 vendor,
                 memory: GpuMemory::Dedicated(vram),
             })
-        }
+            .collect()
     }
 }
 
@@ -503,8 +581,76 @@ mod tests {
             cpu_cores: 8,
             cpu_arch: "test-arch".to_string(),
             total_ram_bytes: total_ram_gb * GIB,
-            gpu,
+            gpus: gpu.into_iter().collect(),
         }
+    }
+
+    fn findings_with(total_ram_gb: u64, gpus: Vec<Option<GpuFinding>>) -> Findings {
+        Findings {
+            gpus: gpus.into_iter().flatten().collect(),
+            ..findings(total_ram_gb, None)
+        }
+    }
+
+    // -- several devices ----------------------------------------------------------
+
+    #[test]
+    fn detection_two_gpus_two_local_devices() {
+        let devices = HardwareProfile::devices_from_findings(findings_with(
+            128,
+            vec![
+                gpu("NVIDIA", GpuMemory::Dedicated(24 * GIB)),
+                gpu("NVIDIA", GpuMemory::Dedicated(24 * GIB)),
+            ],
+        ));
+        assert_eq!(devices.len(), 2);
+        for device in &devices {
+            assert_eq!(device.memory, discrete(24.0).memory);
+            assert_eq!(device.gpu_vendor.as_deref(), Some("NVIDIA"));
+        }
+    }
+
+    #[test]
+    fn one_gpu_unified_memory_or_none_is_one_device() {
+        let one = findings(64, gpu("NVIDIA", GpuMemory::Dedicated(24 * GIB)));
+        let unified = findings_with(
+            128,
+            vec![
+                gpu("NVIDIA", GpuMemory::SharedWithSystem),
+                gpu("NVIDIA", GpuMemory::SharedWithSystem),
+            ],
+        );
+        for f in [one, unified, findings(64, None)] {
+            assert_eq!(HardwareProfile::devices_from_findings(f).len(), 1);
+        }
+    }
+
+    #[test]
+    fn an_integrated_gpu_next_to_a_card_is_not_a_device() {
+        let devices = HardwareProfile::devices_from_findings(findings_with(
+            64,
+            vec![
+                gpu("NVIDIA", GpuMemory::Dedicated(24 * GIB)),
+                gpu("Intel", GpuMemory::Dedicated(GIB / 2)),
+            ],
+        ));
+        assert_eq!(devices.len(), 1);
+    }
+
+    #[test]
+    fn the_first_device_is_the_one_detect_returns() {
+        let two = || {
+            findings_with(
+                128,
+                vec![
+                    gpu("NVIDIA", GpuMemory::Dedicated(24 * GIB)),
+                    gpu("NVIDIA", GpuMemory::Dedicated(12 * GIB)),
+                ],
+            )
+        };
+        let devices = HardwareProfile::devices_from_findings(two());
+        assert_eq!(devices[0], HardwareProfile::from_findings(two()));
+        assert_eq!(devices[1].memory, discrete(12.0).memory);
     }
 
     fn gpu(vendor: &str, memory: GpuMemory) -> Option<GpuFinding> {

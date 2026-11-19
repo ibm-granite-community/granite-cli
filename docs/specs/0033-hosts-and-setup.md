@@ -1203,7 +1203,7 @@ through findings, not through the machine the tests run on.
 - `src/providers/base.rs` (provider metadata, `can_run_model`)
 - `src/commands/hardware.rs` (`local_for_fit`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 

@@ -49,11 +49,16 @@ if grep -q '^address: spark.lan$' "$GRANITE_CLI_HOME/hosts/spark.yaml"; then
     pass "spark's address is taken from the base URLs"
 else fail "spark's address: $(cat "$GRANITE_CLI_HOME/hosts/spark.yaml")"; fi
 
-step "model recommend --hardware lists the providers on hosts with that profile"
+step "estimates on a converted host are those of its hardware profile"
 gcli model recommend --hardware spark -o json
 expect_rc 0
+by_hardware=$(json '[col("ID"), col("VARIANT")] | transpose | sort')
 expect_json 'col("PROVIDERS") | map(split(", ")) | add | unique == ["llama-cpp-spark", "ollama-spark"]' \
-    "the providers on the converted host"
+    "--hardware spark lists the providers on hosts with that profile"
+gcli model recommend --host spark -o json
+expect_rc 0
+expect_json "([col(\"ID\"), col(\"VARIANT\")] | transpose | sort) == $by_hardware" \
+    "--host spark recommends the same models and variants"
 
 step "a link that is not a plain id is reported and left alone"
 fresh

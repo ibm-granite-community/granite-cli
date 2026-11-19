@@ -6,8 +6,6 @@
 # shellcheck source=tests/e2e/lib.sh
 . "$(dirname "$0")/../lib.sh"
 
-skip "spec 0033 sub-task 4"
-
 # The rows of the first table as objects keyed by header.
 # shellcheck disable=SC2016 # jq variables
 ROWS='(table as $t | $t.rows | map([$t.headers, .] | transpose | map({(.[0]): .[1]}) | add))'

@@ -289,6 +289,69 @@ impl HardwareCommands {
         detect: impl FnOnce() -> HardwareProfile,
         can_prompt: bool,
     ) -> Result<Option<HardwareProfile>> {
+        let unused = Self::compare_local_profile(ctx, detect, can_prompt)?;
+        Self::compare_local_devices(ctx, can_prompt)?;
+        Ok(unused)
+    }
+
+    /// Compares the devices of this machine after the first, which the
+    /// `local` host lists as `local-2` and so on, with the ones detection
+    /// finds. A difference, such as a GPU added or removed, is never saved
+    /// on its own: an interactive run asks, and any other run keeps the
+    /// saved devices and warns on stderr.
+    fn compare_local_devices(ctx: &mut AppContext, can_prompt: bool) -> Result<()> {
+        // Only the devices detection wrote: a profile the user listed on
+        // `local`, or edited by hand, is theirs.
+        let saved: Vec<HardwareProfile> = ctx
+            .detected_local_devices()
+            .iter()
+            .filter_map(|id| ctx.hardware_profile(id).ok())
+            .collect();
+        let detected: Vec<HardwareProfile> =
+            ctx.other_gpus().into_iter().map(saved_figures).collect();
+        let same = saved.len() == detected.len()
+            && saved.iter().zip(&detected).all(|(a, b)| a.same_memory(b));
+        if same {
+            return Ok(());
+        }
+        let describe = |devices: &[HardwareProfile]| {
+            if devices.is_empty() {
+                "none".to_string()
+            } else {
+                devices
+                    .iter()
+                    .map(HardwareProfile::memory_summary)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        };
+        let (stored, found) = (describe(&saved), describe(&detected));
+        if !can_prompt {
+            ctx.ui.warn_stderr(&format!(
+                "The other GPUs of this machine differ from host '{LOCAL_HOST_ID}' (stored \
+                 {stored}, detected {found}). Using the stored devices. Run `granite-cli setup` \
+                 in a terminal to update."
+            ));
+            return Ok(());
+        }
+        ctx.ui.warn(&format!(
+            "The other GPUs of this machine differ from host '{LOCAL_HOST_ID}':\n    stored    \
+             {stored}\n    detected  {found}"
+        ));
+        if ctx.ui.confirm(
+            &format!("Update host '{LOCAL_HOST_ID}' to the detected devices?"),
+            true,
+        )? {
+            ctx.set_local_devices(detected)?;
+        }
+        Ok(())
+    }
+
+    fn compare_local_profile(
+        ctx: &mut AppContext,
+        detect: impl FnOnce() -> HardwareProfile,
+        can_prompt: bool,
+    ) -> Result<Option<HardwareProfile>> {
         let Some(saved) = ctx.config().get_hardware(LOCAL_HARDWARE_ID) else {
             ctx.ensure_local_host(detect)?;
             return Ok(None);
@@ -2483,6 +2546,75 @@ mod tests {
                 .is_err()
         );
         assert!(ctx.config().get_hardware("dgx-spark").is_none());
+    }
+
+    // -- the other devices of this machine -----------------------------------------
+
+    fn card_24() -> HardwareProfile {
+        HardwareProfile::with_memory(Memory::Discrete {
+            vram_gb: 24.0,
+            ram_gb: Some(64.0),
+        })
+    }
+
+    #[test]
+    fn the_check_asks_when_a_gpu_is_added_and_saves_it_when_told_to() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, card_24());
+        assert_eq!(ctx.config().host_hardware(LOCAL_HOST_ID), vec!["local"]);
+        ctx.set_other_gpus(vec![card_24()]);
+        ui.confirm_answers.borrow_mut().push_back(true);
+
+        HardwareCommands::check_local(&mut ctx, card_24, true).unwrap();
+
+        assert_eq!(
+            ui.confirm_prompts.borrow()[0].0,
+            "Update host 'local' to the detected devices?"
+        );
+        assert_eq!(
+            ctx.config().host_hardware(LOCAL_HOST_ID),
+            vec!["local", "local-2"]
+        );
+    }
+
+    #[test]
+    fn the_check_asks_when_a_gpu_is_removed_and_keeps_the_devices_when_it_cannot_ask() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, card_24());
+        ctx.set_local_devices(vec![card_24()]).unwrap();
+        ctx.set_other_gpus(Vec::new());
+
+        HardwareCommands::check_local(&mut ctx, card_24, false).unwrap();
+        assert_eq!(
+            ctx.config().host_hardware(LOCAL_HOST_ID),
+            vec!["local", "local-2"]
+        );
+        assert!(
+            ui.stderr_warns.borrow()[0].starts_with("The other GPUs of this machine differ"),
+            "{:?}",
+            ui.stderr_warns.borrow()
+        );
+
+        ui.confirm_answers.borrow_mut().push_back(true);
+        HardwareCommands::check_local(&mut ctx, card_24, true).unwrap();
+        assert_eq!(ctx.config().host_hardware(LOCAL_HOST_ID), vec!["local"]);
+        assert!(ctx.config().get_hardware("local-2").is_none());
+    }
+
+    #[test]
+    fn the_check_says_nothing_when_the_devices_match() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx_with_local(&ui, card_24());
+        ctx.set_other_gpus(vec![card_24()]);
+        ctx.set_local_devices(vec![card_24()]).unwrap();
+
+        HardwareCommands::check_local(&mut ctx, card_24, true).unwrap();
+
+        assert!(ui.confirm_prompts.borrow().is_empty());
+        assert!(ui.warns.borrow().is_empty());
     }
 
     // -- linking providers ----------------------------------------------------------

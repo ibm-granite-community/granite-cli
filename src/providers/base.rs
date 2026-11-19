@@ -309,6 +309,54 @@ pub struct ProviderMetadata {
     pub(crate) supported_formats: Vec<ModelFormat>,
     pub(crate) authentication: Vec<AuthType>,
     pub(crate) tags: Vec<String>,
+
+    /// Whether a server of this type splits a model across the devices of
+    /// one machine by default, so fit on a host with several devices uses
+    /// their combined memory. A provider's `splits_across_devices` setting
+    /// replaces it.
+    pub(crate) splits_across_devices: bool,
+    /// The memory, in GB, a server of this type loses on each device after
+    /// the first when it splits a model: compute buffers and layers that do
+    /// not divide evenly. A provider's `device_overhead_gb` setting replaces
+    /// it.
+    pub(crate) device_overhead_gb: f64,
+}
+
+/// What `device_overhead_gb` is for every provider type unless a provider
+/// sets it. llama.cpp load logs show 0.3 to 0.6 GB of compute buffer per
+/// device; 1 GB keeps the estimate on the low side.
+pub(crate) const DEFAULT_DEVICE_OVERHEAD_GB: f64 = 1.0;
+
+/// How a provider uses the devices of its host: whether it splits a model
+/// across them, and the memory it loses on each device after the first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DeviceUse {
+    pub(crate) splits: bool,
+    pub(crate) overhead_gb: f64,
+}
+
+impl DeviceUse {
+    /// The defaults of `provider_type`, replaced by `splits_across_devices`
+    /// and `device_overhead_gb` in the provider's `config` when it sets
+    /// them. A type the registry does not know does not split.
+    pub(crate) fn of(provider_type: &str, config: &serde_json::Value) -> Self {
+        let (splits, overhead_gb) = crate::providers::PROVIDER_REGISTRY
+            .get(provider_type)
+            .map_or((false, DEFAULT_DEVICE_OVERHEAD_GB), |m| {
+                (m.splits_across_devices, m.device_overhead_gb)
+            });
+        Self {
+            splits: config
+                .get("splits_across_devices")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(splits),
+            overhead_gb: config
+                .get("device_overhead_gb")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|gb| gb.is_finite() && *gb >= 0.0)
+                .unwrap_or(overhead_gb),
+        }
+    }
 }
 
 impl ProviderMetadata {
@@ -602,6 +650,8 @@ mod tests {
             default_base_urls: vec!["http://localhost:11434".to_string()],
             supported_api_types: vec![ApiType::Ollama],
             default_function_endpoints: HashMap::new(),
+            splits_across_devices: false,
+            device_overhead_gb: crate::providers::DEFAULT_DEVICE_OVERHEAD_GB,
             supported_formats: vec![],
             authentication: vec![],
             tags: vec!["local".to_string(), "gguf".to_string()],
@@ -611,5 +661,45 @@ mod tests {
         assert!(fields.contains(&"Local Ollama server"));
         assert!(fields.contains(&"local"));
         assert!(fields.contains(&"gguf"));
+    }
+    #[test]
+    fn device_use_defaults_come_from_the_type_and_settings_replace_them() {
+        let none = serde_json::json!({});
+        for (provider_type, splits) in [
+            ("llama-cpp", true),
+            ("ollama", true),
+            ("lm-studio", true),
+            ("openai-compatible", false),
+            ("openrouter", false),
+        ] {
+            assert_eq!(
+                DeviceUse::of(provider_type, &none),
+                DeviceUse {
+                    splits,
+                    overhead_gb: DEFAULT_DEVICE_OVERHEAD_GB,
+                },
+                "{provider_type}"
+            );
+        }
+        let set = serde_json::json!({
+            "splits_across_devices": true,
+            "device_overhead_gb": 0.5,
+        });
+        assert_eq!(
+            DeviceUse::of("openai-compatible", &set),
+            DeviceUse {
+                splits: true,
+                overhead_gb: 0.5,
+            }
+        );
+        let off = serde_json::json!({ "splits_across_devices": false, "device_overhead_gb": -1 });
+        assert_eq!(
+            DeviceUse::of("llama-cpp", &off),
+            DeviceUse {
+                splits: false,
+                overhead_gb: DEFAULT_DEVICE_OVERHEAD_GB,
+            },
+            "a negative overhead is ignored"
+        );
     }
 }

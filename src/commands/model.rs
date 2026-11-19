@@ -544,6 +544,155 @@ impl ModelCommands {
         Ok(())
     }
 
+    /// `model recommend --host <id>`: for each provider on the host, the
+    /// models that fit on the memory it can use there (see
+    /// `AppContext::host_fit_profile`). Providers that use the host the same
+    /// way share rows; the FIT column says on which devices, such as
+    /// "Full on box (2 × 24 GB)". A host with no providers is estimated on
+    /// its largest device for every configured provider. A host whose
+    /// hardware is not known has no estimate.
+    pub(crate) fn recommend_on_host(
+        ctx: &crate::AppContext,
+        filter_type: Option<ModelType>,
+        wide: bool,
+        host_id: &str,
+    ) -> Result<()> {
+        use crate::providers::DeviceUse;
+        let config = ctx.config();
+        if host_id != crate::config::host::LOCAL_HOST_ID && config.get_host(host_id).is_none() {
+            let mut ids: Vec<&str> = config.hosts.keys().map(String::as_str).collect();
+            ids.sort();
+            anyhow::bail!(
+                "host '{host_id}' is not configured; configured: {}",
+                if ids.is_empty() {
+                    "none".to_string()
+                } else {
+                    ids.join(", ")
+                }
+            );
+        }
+        let devices = match ctx.host_devices(host_id) {
+            Ok(devices) => devices,
+            Err(reason) => {
+                ctx.ui.info(&format!(
+                    "Recommendations for host '{host_id}': fit not available: {reason}."
+                ));
+                return Ok(());
+            }
+        };
+        let source = ctx.sources().providers();
+        let instances = source.instances();
+        let on_host: Vec<NamedProvider> = instances
+            .iter()
+            .filter(|(id, _)| {
+                config
+                    .get_provider(id)
+                    .is_some_and(|p| p.host_link().host_id() == Some(host_id))
+            })
+            .cloned()
+            .collect();
+
+        // Providers grouped by how they use the devices; on one device every
+        // provider uses it the same way.
+        let mut groups: Vec<(DeviceUse, Vec<NamedProvider>)> = Vec::new();
+        for (id, provider) in &on_host {
+            let pc = config.get_provider(id).expect("an instance is configured");
+            let mut using = DeviceUse::of(&pc.provider_type, &pc.config);
+            if devices.len() == 1 || !using.splits {
+                using = DeviceUse {
+                    splits: false,
+                    overhead_gb: 0.0,
+                };
+            }
+            match groups.iter_mut().find(|(u, _)| *u == using) {
+                Some((_, members)) => members.push((id.clone(), provider.clone())),
+                None => groups.push((using, vec![(id.clone(), provider.clone())])),
+            }
+        }
+        groups.sort_by_key(|(using, _)| !using.splits);
+
+        let fit_column = if wide { 6 } else { 4 };
+        let mut table_rows: Vec<Vec<String>> = Vec::new();
+        if groups.is_empty() {
+            let profile = ctx.host_profile(host_id).map_err(anyhow::Error::msg)?;
+            let all: Vec<&dyn Provider> = instances.iter().map(|(_, p)| &**p).collect();
+            let mut rows = Self::recommend_rows(
+                filter_type.as_ref(),
+                Some(&all),
+                &[],
+                wide,
+                ctx.ui.as_ref(),
+                &profile,
+            );
+            for row in &mut rows {
+                row[fit_column] = format!(
+                    "{} on {host_id} ({})",
+                    row[fit_column],
+                    devices_label(&devices, false)
+                );
+                *row.last_mut().unwrap() = "none linked".to_string();
+            }
+            table_rows.extend(rows);
+        }
+        for (using, members) in &groups {
+            let profile = match ctx.host_fit_profile(host_id, *using) {
+                Ok(profile) => profile,
+                Err(reason) => {
+                    let ids: Vec<&str> = members.iter().map(|(id, _)| id.as_str()).collect();
+                    ctx.ui
+                        .warn(&format!("{}: fit not available: {reason}.", ids.join(", ")));
+                    continue;
+                }
+            };
+            let filter: Vec<&dyn Provider> = members.iter().map(|(_, p)| &**p).collect();
+            let mut rows = Self::recommend_rows(
+                filter_type.as_ref(),
+                Some(&filter),
+                members,
+                wide,
+                ctx.ui.as_ref(),
+                &profile,
+            );
+            for row in &mut rows {
+                row[fit_column] = format!(
+                    "{} on {host_id} ({})",
+                    row[fit_column],
+                    devices_label(&devices, using.splits)
+                );
+            }
+            table_rows.extend(rows);
+        }
+        if table_rows.is_empty() {
+            ctx.ui.info(&format!(
+                "No models fit host '{host_id}' and the providers on it."
+            ));
+            return Ok(());
+        }
+        let headers: &[&str] = if wide {
+            &[
+                "ID",
+                "FAMILY",
+                "SIZE",
+                "CONTEXT",
+                "VARIANT",
+                "TYPE",
+                "FIT",
+                "PROVIDERS",
+            ]
+        } else {
+            &["ID", "SIZE", "VARIANT", "TYPE", "FIT", "PROVIDERS"]
+        };
+        ctx.ui.table(
+            &format!(
+                "Recommended Models for host '{host_id}' ({} rows)",
+                table_rows.len()
+            ),
+            headers,
+            &table_rows,
+        );
+        Ok(())
+    }
+
     /// Rows for the model catalog table: [id, family, size, context, type].
     /// Shared by the CLI command and the TUI.
     fn catalog_rows(filter_type: Option<&ModelType>) -> Vec<Vec<String>> {
@@ -1255,6 +1404,36 @@ async fn ensure_model_pulled(
 
 /*-- private ---------------------------------------------------------------------*/
 
+/// A configured provider and its id, as the provider source lists them.
+type NamedProvider = (String, std::sync::Arc<dyn Provider>);
+
+/// The memory of `devices` as `model recommend --host` names it: every
+/// device, "2 × 24 GB" or "24 GB + 12 GB", when `together`, otherwise the
+/// largest one, "24 GB".
+fn devices_label(devices: &[HardwareProfile], together: bool) -> String {
+    let gb = |p: &HardwareProfile| {
+        let figure = p.memory.model_memory_gb();
+        if figure.fract() == 0.0 {
+            format!("{figure:.0} GB")
+        } else {
+            format!("{figure:.1} GB")
+        }
+    };
+    if !together || devices.len() == 1 {
+        let largest = devices
+            .iter()
+            .max_by(|a, b| a.usable_memory_gb().total_cmp(&b.usable_memory_gb()))
+            .expect("a host with devices has a largest one");
+        return gb(largest);
+    }
+    let labels: Vec<String> = devices.iter().map(gb).collect();
+    if labels.iter().all(|l| *l == labels[0]) {
+        format!("{} × {}", labels.len(), labels[0])
+    } else {
+        labels.join(" + ")
+    }
+}
+
 /// Orders `recommend` rows, each paired with its variant size in GB, by
 /// size, largest first. MODEL_REGISTRY.entries() comes in no fixed order, so
 /// rows with the same size are ordered by model id, the first column.
@@ -1675,6 +1854,8 @@ mod tests {
             default_base_urls: vec!["http://localhost".to_string()],
             supported_api_types: vec![],
             default_function_endpoints: std::collections::HashMap::new(),
+            splits_across_devices: false,
+            device_overhead_gb: crate::providers::DEFAULT_DEVICE_OVERHEAD_GB,
             supported_formats: formats,
             authentication: vec![],
             tags: vec![],
@@ -3075,6 +3256,156 @@ mod tests {
         let (_, _, rows) = &tables[0];
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|r| r[5] == "llama-cpp-pgx"), "{rows:?}");
+    }
+
+    /// The ids and FIT cells of the first table.
+    fn fits(ctx: &crate::AppContext) -> Vec<(String, String)> {
+        let tables = tables!(ctx);
+        tables[0]
+            .2
+            .iter()
+            .map(|r| (r[0].clone(), r[4].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn recommend_on_local_two_devices() {
+        let _home = crate::config::TestConfigHome::new();
+        let card = || {
+            HardwareProfile::with_memory(crate::utils::hardware::Memory::Discrete {
+                vram_gb: 24.0,
+                ram_gb: Some(64.0),
+            })
+        };
+        let config = config_with_provider("ollama", "ollama", serde_json::json!({}));
+        let mut ctx = ctx_with_config(config);
+        ctx.set_other_gpus(vec![card()]);
+        ctx.ensure_local_host(card).unwrap();
+
+        ModelCommands::recommend_on_host(&ctx, None, false, "local").unwrap();
+        let two = fits(&ctx);
+        let one_card = ctx.hardware_profile("local").unwrap();
+        let ctx_one = {
+            let config = config_with_provider("ollama", "ollama", serde_json::json!({}));
+            ctx_with_config(config)
+        };
+        ModelCommands::recommend(&ctx_one, None, &[], false, "local", &one_card).unwrap();
+        let one = fits(&ctx_one);
+
+        assert!(
+            two.iter()
+                .all(|(_, fit)| fit.ends_with(" on local (2 × 24 GB)")),
+            "{two:?}"
+        );
+        let fitting = |rows: &[(String, String)]| -> std::collections::HashSet<String> {
+            rows.iter()
+                .filter(|(_, fit)| fit.starts_with("Full"))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        assert!(
+            fitting(&two).is_superset(&fitting(&one)) && fitting(&two).len() > fitting(&one).len(),
+            "a model that needs more than one card fits on both"
+        );
+    }
+
+    #[test]
+    fn recommend_on_a_host_estimates_each_provider_on_the_devices_it_uses() {
+        let mut config = config_with_provider("llama-cpp-box", "llama-cpp", serde_json::json!({}));
+        config.hardware.insert(
+            "card".to_string(),
+            crate::config::HardwareConfig::catalog("card", "nvidia-rtx-4090", 24.0),
+        );
+        config.hosts.insert(
+            "box".to_string(),
+            crate::config::HostConfig {
+                host_id: "box".to_string(),
+                address: "box.lan".to_string(),
+                hardware: vec!["card".to_string(), "card".to_string()],
+            },
+        );
+        for (id, provider_config) in [
+            ("llama-cpp-box", serde_json::json!({})),
+            (
+                "openai-box",
+                serde_json::json!({ "base_url": "http://box.lan:8000/v1" }),
+            ),
+            (
+                "vllm-box",
+                serde_json::json!({ "base_url": "http://box.lan:8001/v1", "splits_across_devices": true }),
+            ),
+        ] {
+            let provider_type = if id == "llama-cpp-box" {
+                "llama-cpp"
+            } else {
+                "openai-compatible"
+            };
+            config.providers.insert(
+                id.to_string(),
+                crate::config::ProviderConfig {
+                    host: Some(crate::config::host::HostLink::Host("box".to_string())),
+                    provider_id: id.to_string(),
+                    provider_type: provider_type.to_string(),
+                    config: provider_config,
+                },
+            );
+        }
+        let ctx = ctx_with_config(config);
+
+        ModelCommands::recommend_on_host(&ctx, None, false, "box").unwrap();
+
+        let tables = tables!(ctx);
+        let (title, _, rows) = &tables[0];
+        assert!(
+            title.starts_with("Recommended Models for host 'box'"),
+            "{title}"
+        );
+        let fit_for = |provider: &str| -> Vec<String> {
+            rows.iter()
+                .filter(|r| r[5].split(", ").any(|p| p == provider))
+                .map(|r| r[4].clone())
+                .collect()
+        };
+        for (provider, label) in [
+            ("llama-cpp-box", " on box (2 × 24 GB)"),
+            ("vllm-box", " on box (2 × 24 GB)"),
+            ("openai-box", " on box (24 GB)"),
+        ] {
+            let fits = fit_for(provider);
+            assert!(!fits.is_empty(), "{provider}: {rows:?}");
+            assert!(
+                fits.iter().all(|f| f.ends_with(label)),
+                "{provider}: {fits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recommend_on_a_host_with_unknown_hardware_or_none_configured() {
+        let mut config = Config::default();
+        config.hosts.insert(
+            "lab".to_string(),
+            crate::config::HostConfig {
+                host_id: "lab".to_string(),
+                address: "lab.lan".to_string(),
+                hardware: Vec::new(),
+            },
+        );
+        let ctx = ctx_with_config(config);
+
+        ModelCommands::recommend_on_host(&ctx, None, false, "lab").unwrap();
+        let err = ModelCommands::recommend_on_host(&ctx, None, false, "nope").unwrap_err();
+
+        assert!(tables!(ctx).is_empty());
+        assert!(
+            infos!(ctx)[0].contains("fit not available: the hardware of host 'lab' is not known"),
+            "{:?}",
+            infos!(ctx)
+        );
+        assert_eq!(
+            err.to_string(),
+            "host 'nope' is not configured; configured: lab"
+        );
     }
 
     #[test]

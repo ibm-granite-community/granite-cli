@@ -293,6 +293,8 @@ impl HasProviderMetadata for OpenAIProvider {
             default_base_urls: vec![],
             supported_api_types: vec![ApiType::OpenAI],
             default_function_endpoints: Self::default_function_endpoints(),
+            splits_across_devices: false,
+            device_overhead_gb: crate::providers::DEFAULT_DEVICE_OVERHEAD_GB,
             supported_formats: vec![
                 ModelFormat::Safetensors,
                 ModelFormat::GGUF,

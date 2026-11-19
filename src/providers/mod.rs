@@ -167,8 +167,8 @@ pub(crate) fn discovery_enabled(config: &serde_json::Value) -> bool {
 
 mod base;
 pub(crate) use base::{
-    ApiEndpoint, ApiType, HealthStatus, ModelFormat, Provider, ProviderError, ProviderMetadata,
-    ProviderModel, ProviderType, PullResult,
+    ApiEndpoint, ApiType, DEFAULT_DEVICE_OVERHEAD_GB, DeviceUse, HealthStatus, ModelFormat,
+    Provider, ProviderError, ProviderMetadata, ProviderModel, ProviderType, PullResult,
 };
 
 mod openai;
