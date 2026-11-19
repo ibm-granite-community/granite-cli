@@ -140,11 +140,10 @@ pub(crate) fn plan(
     }
 }
 
-/*-- private ------------------------------------------------------------------*/
-
 /// The configured entry for a newly discovered model, with the defaults the
-/// import path documents. `discovered` is what makes it managed by sync.
-fn discovered_model_config(
+/// import path documents. `discovered` is what makes it managed by sync. The
+/// setup wizard reads it to check a served model against a capability.
+pub(crate) fn discovered_model_config(
     provider_id: &str,
     provider_type: &str,
     model: &ProviderModel,
@@ -193,6 +192,8 @@ fn discovered_model_config(
         config: serde_json::to_value(config).unwrap_or_default(),
     }
 }
+
+/*-- private ------------------------------------------------------------------*/
 
 /// The natural wire id when free, otherwise `<provider>/<wire>` and then a
 /// numeric suffix. Deterministic for a given configuration.
