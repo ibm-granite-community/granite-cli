@@ -169,6 +169,24 @@ When `HF_TOKEN` belongs to an account with org access, the collections API surfa
 ./scripts/06-generate-yaml.sh data/models.json | tee data/models-preview.yaml
 ```
 
+### Scheduled Check
+
+`.github/workflows/models-update.yaml` runs the update daily against `main`
+and checks whether `resources/models.yaml` changed. A run whose only change is
+the `# Generated:` timestamp passes; any other change fails the run and keeps
+the diff as the `models-update-patch` artifact. To turn a failure into a PR:
+
+```bash
+gh run download <run-id> -n models-update-patch
+git apply models.yaml.patch
+# review (Phase 2 above) and run `cargo build` (Phase 3) before committing
+```
+
+The workflow reads an optional `HF_TOKEN` repository secret. Without it the
+HuggingFace requests are unauthenticated and more likely to be rate limited;
+re-run the job or dispatch it from the Actions tab with a larger
+`request_delay` input if that happens.
+
 ## Troubleshooting
 
 ### Issue: Script fails with "jq: command not found"
