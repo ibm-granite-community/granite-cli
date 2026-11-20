@@ -1,0 +1,119 @@
+name: Models update
+
+# Regenerates resources/models.yaml from HuggingFace, Ollama and LM Studio
+# once a day and compares it with the copy on main. A run that only moves the
+# "# Generated:" timestamp passes. Any other change fails the run and leaves
+# the diff as the "models-update-patch" artifact, to be applied in a PR:
+#
+#   gh run download <run-id> -n models-update-patch
+#   git apply models.yaml.patch
+#
+# The update itself is driven by .agents/skills/update-models; review the
+# patch with review-models.py, and run a cargo build before merging, because
+# models.yaml is compiled into the static catalog.
+
+on:
+  schedule:
+    - cron: "43 5 * * *" # daily, off the hour to avoid the busiest slot
+  workflow_dispatch:
+    inputs:
+      request_delay:
+        description: Seconds to wait between HuggingFace API requests
+        default: "1"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Regenerate resources/models.yaml
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      # jq reads the API responses. scripts/06-validate-yaml.sh uses PyYAML
+      # for the deep validation and silently skips it when the import fails,
+      # so install it rather than depend on what the runner image ships.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3-yaml
+
+      - name: Update models
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          REQUEST_DELAY: ${{ inputs.request_delay || '1' }}
+        run: |
+          # An unset secret arrives as an empty string, and hf-curl.sh treats a
+          # set-but-empty HF_TOKEN as a bearer token, which HuggingFace rejects
+          # as unauthenticated. Clear it so the request goes out without auth.
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::warning::HF_TOKEN is not set; HuggingFace requests are unauthenticated and may be rate limited."
+            unset HF_TOKEN
+          fi
+          export HF_REQUEST_DELAY="$REQUEST_DELAY"
+          .agents/skills/update-models/run-update.sh
+
+      # -I ignores a hunk whose changed lines all match "# Generated: ...", so
+      # a run that only refreshed the timestamp leaves git diff empty.
+      - name: Check for a real delta
+        id: delta
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if git diff --quiet -I '^# Generated: ' -- resources/models.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Model catalog is up to date"
+              echo
+              echo "Regenerating \`resources/models.yaml\` changed nothing but the timestamp."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git diff --no-color -- resources/models.yaml > models.yaml.patch
+          {
+            echo "### Model catalog changed"
+            echo
+            echo '```'
+            git diff --stat -- resources/models.yaml
+            echo '```'
+            echo
+            echo "Download the patch and open a PR:"
+            echo
+            echo '```sh'
+            echo "gh run download $RUN_ID -n models-update-patch"
+            echo "git apply models.yaml.patch"
+            echo '```'
+            echo
+            echo "Review the change with \`.agents/skills/update-models/review-models.py\`"
+            echo "and run \`cargo build\`: models.yaml is compiled into the catalog."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload models.yaml patch
+        if: steps.delta.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: models-update-patch
+          path: models.yaml.patch
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail on a real delta
+        if: steps.delta.outputs.changed == 'true'
+        run: |
+          echo "::error title=resources/models.yaml is out of date::The regenerated catalog differs from main. Download the models-update-patch artifact, apply it and open a PR."
+          exit 1
