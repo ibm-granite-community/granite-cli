@@ -1127,93 +1127,64 @@ impl ModelCommands {
     /// Deletes the model's config file and removes it from the in-memory
     /// config. After this call `model list` will no longer show the entry.
     ///
-    /// `policy` controls what happens to dependents: `Cascade` removes them
-    /// too, `Refuse` aborts, `Leave` strands them. `None` asks interactively
-    /// or leaves in non-interactive sessions.
+    /// `policy` controls what happens to dependents, as
+    /// [`remove_with_dependents`](crate::commands::shared::remediation::remove_with_dependents)
+    /// describes.
     pub(crate) fn remove(
         ctx: &mut crate::AppContext,
         model_id: &str,
         policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
     ) -> Result<()> {
-        Self::remove_checked(ctx, model_id, policy, true)
-    }
-
-    /// [`Self::remove`] for a model discovered by a provider that is being
-    /// removed. The model skips the discovery check: no sync can add it back
-    /// once its provider is gone.
-    pub(crate) fn remove_with_provider(
-        ctx: &mut crate::AppContext,
-        model_id: &str,
-        policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
-    ) -> Result<()> {
-        Self::remove_checked(ctx, model_id, policy, false)
-    }
-
-    fn remove_checked(
-        ctx: &mut crate::AppContext,
-        model_id: &str,
-        policy: Option<crate::commands::shared::remediation::DependentsPolicy>,
-        check_discovery: bool,
-    ) -> Result<()> {
         if ctx.config().get_model(model_id).is_none() {
             anyhow::bail!("No model configured with id '{model_id}'. Nothing to remove.");
         }
 
-        // A discovery-managed model belongs to its provider while that
-        // provider's discovery is on: removing it here would only be undone
-        // by the next sync. Turning discovery off, or naming the discovered
-        // policy, is the explicit escape hatch. If the provider cannot be
-        // built, no sync can re-add the model, so allow the removal there too.
-        let remove_discovered = !check_discovery
-            || matches!(
-                policy,
-                Some(crate::commands::shared::remediation::DependentsPolicy::Discovered)
-            );
-        let discovered = ctx
-            .config()
-            .get_model(model_id)
-            .and_then(|config| config.discovered.clone());
-        if let Some(discovered) = discovered {
-            let discovery_on = ctx
-                .sources()
-                .providers()
-                .upstream(&discovered.provider_id)
-                .map(|provider| provider.discover_models())
-                .unwrap_or(false);
-            if discovery_on && !remove_discovered {
-                let provider = &discovered.provider_id;
-                anyhow::bail!(
-                    "Model '{model_id}' was discovered from provider '{provider}', which has \
-                     discovery on, so the next sync would add it back.\n  \
-                     To remove only this model, turn discovery off with \
-                     `granite-cli provider setup {provider}`, then remove it.\n  \
-                     To remove the provider and all its models: \
-                     `granite-cli provider remove {provider} --dependents cascade`."
-                );
-            }
+        // Naming the discovered policy is the explicit escape hatch.
+        if !matches!(
+            policy,
+            Some(crate::commands::shared::remediation::DependentsPolicy::Discovered)
+        ) {
+            Self::refuse_while_discovery_on(ctx, model_id)?;
         }
 
-        // Anything pointing at it would be stranded by this removal.
-        match crate::commands::shared::remediation::confirm_removal(
+        crate::commands::shared::remediation::remove_with_dependents(
             ctx,
             RefKind::Model,
             model_id,
             policy,
-        )? {
-            crate::commands::shared::remediation::Removal::Cancel => {
-                ctx.ui.info(&format!("Keeping model '{model_id}'."));
-                return Ok(());
-            }
-            crate::commands::shared::remediation::Removal::Proceed { with } => {
-                crate::commands::shared::remediation::remove_all(ctx, &with, policy)?;
-            }
-        }
+        )
+    }
 
-        if let Err(e) = ctx.config_mut().remove_model(model_id) {
-            ctx.ui
-                .warn(&format!("failed to persist model removal: {e}"));
+    /// Fails when `model_id` was discovered by a provider whose discovery is
+    /// on. Such a model belongs to its provider: removing it would only be
+    /// undone by the next sync. Turning discovery off is the way out. If the
+    /// provider cannot be built, no sync can re-add the model, so the removal
+    /// is allowed.
+    pub(crate) fn refuse_while_discovery_on(ctx: &crate::AppContext, model_id: &str) -> Result<()> {
+        let Some(discovered) = ctx
+            .config()
+            .get_model(model_id)
+            .and_then(|config| config.discovered.clone())
+        else {
+            return Ok(());
+        };
+        let discovery_on = ctx
+            .sources()
+            .providers()
+            .upstream(&discovered.provider_id)
+            .map(|provider| provider.discover_models())
+            .unwrap_or(false);
+        if discovery_on {
+            let provider = &discovered.provider_id;
+            anyhow::bail!(
+                "Model '{model_id}' was discovered from provider '{provider}', which has \
+                 discovery on, so the next sync would add it back.\n  \
+                 To remove only this model, turn discovery off with \
+                 `granite-cli provider setup {provider}`, then remove it.\n  \
+                 To remove the provider and all its models: \
+                 `granite-cli provider remove {provider} --dependents cascade`."
+            );
         }
-        ctx.ui.info(&format!("Model '{model_id}' removed."));
         Ok(())
     }
 

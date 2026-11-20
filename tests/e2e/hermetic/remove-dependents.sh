@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # `model remove` with and without `--dependents refuse|leave|cascade` on a
-# model that a capability uses, and `provider remove --dependents cascade` on
-# a provider with discovered models.
+# model that a capability uses, and `provider remove --dependents
+# cascade|discovered` on a provider with discovered models.
 # shellcheck source=tests/e2e/lib.sh
 . "$(dirname "$0")/../lib.sh"
 
@@ -16,7 +16,8 @@ step "--dependents leave: removes the model, the capability is left with a note"
 use_fixture basic
 gcli model remove granite-4.2-3b --dependents leave -o json
 expect_rc 0
-expect_json 'messages("warn") | any(contains("will break"))' "warns about what breaks"
+expect_json 'messages("warn") == ["These stay, and will not work until fixed:"]' "one warning heads what breaks"
+expect_json 'messages("info") | any(. == "  - capability '"'sub-agent-explore'"': its model '"'granite-4.2-3b'"' is removed")' "names the capability and why it breaks"
 expect_no_file "$M/granite-4.2-3b.yaml"
 expect_file "$C/sub-agent-explore.yaml"
 gcli capability list -o json
@@ -66,5 +67,28 @@ expect_no_file "$P/ollama.yaml"
 expect_no_file "$M/discovered-unknown-context.yaml"
 expect_no_file "$M/granite-4.2-3b.yaml"
 expect_no_file "$M/granite-4.2-8b.yaml"
+expect_json 'messages("info") | map(select(startswith("Removing "))) == ["Removing provider '"'ollama'"' and what depends on it:"]' "prints one plan for the whole chain"
+expect_json 'messages("warn") == []' "breaks nothing"
+
+step "provider remove --dependents discovered: one plan, with what stays and why"
+use_fixture model-provider
+printf 'provider_id: ollama\ntype: ollama\nconfig:\n  base_url: http://127.0.0.1:9\n  discover_models: true\n' >"$P/ollama.yaml"
+gcli provider remove ollama --dependents discovered -o json
+expect_rc 0
+expect_no_file "$P/ollama.yaml"
+expect_no_file "$M/discovered-unknown-context.yaml"
+expect_file "$M/granite-4.2-3b.yaml"
+expect_file "$M/granite-4.2-8b.yaml"
+expect_file "$C/model-provider.yaml"
+expect_json 'messages("info") | map(select(startswith("Removing "))) == ["Removing provider '"'ollama'"' and the models discovered from it:"]' "prints one plan for the whole chain"
+expect_json 'messages("warn") == ["These stay, and will not work until fixed:"]' "one warning heads what breaks"
+expect_json 'messages("info") | map(select(startswith("  - "))) | sort == [
+  "  - capability '"'model-provider'"': its model '"'discovered-unknown-context'"' is removed",
+  "  - model '"'discovered-unknown-context'"'",
+  "  - model '"'granite-4.2-3b'"': its provider '"'ollama'"' is removed",
+  "  - model '"'granite-4.2-8b'"': its provider '"'ollama'"' is removed"
+]' "lists what is removed, and what stays with the reason"
+expect_json 'messages("info") | any(contains("granite-cli model setup") and contains("granite-cli capability setup"))' "names a fix command for each kind left broken"
+expect_json 'messages("info") | any(contains("launcher setup")) | not' "names no fix command for a kind nothing broke"
 
 finish

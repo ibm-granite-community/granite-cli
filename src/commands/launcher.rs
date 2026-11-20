@@ -379,28 +379,12 @@ impl LauncherCommands {
             anyhow::bail!("No launcher configured with id '{launcher_id}'. Nothing to remove.");
         }
 
-        // Anything pointing at it would be stranded by this removal.
-        match crate::commands::shared::remediation::confirm_removal(
+        crate::commands::shared::remediation::remove_with_dependents(
             ctx,
             RefKind::Launcher,
             launcher_id,
             policy,
-        )? {
-            crate::commands::shared::remediation::Removal::Cancel => {
-                ctx.ui.info(&format!("Keeping launcher '{launcher_id}'."));
-                return Ok(());
-            }
-            crate::commands::shared::remediation::Removal::Proceed { with } => {
-                crate::commands::shared::remediation::remove_all(ctx, &with, policy)?;
-            }
-        }
-
-        if let Err(e) = ctx.config_mut().remove_launcher(launcher_id) {
-            ctx.ui
-                .warn(&format!("failed to persist launcher removal: {e}"));
-        }
-        ctx.ui.info(&format!("Launcher '{launcher_id}' removed."));
-        Ok(())
+        )
     }
 }
 

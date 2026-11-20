@@ -427,7 +427,6 @@ impl HardwareCommands {
         id: &str,
         policy: Option<DependentsPolicy>,
     ) -> Result<()> {
-        use crate::commands::shared::remediation::{Removal, confirm_removal, remove_all};
         use crate::config::validation::RefKind;
 
         if ctx.config().get_hardware(id).is_none() {
@@ -436,15 +435,12 @@ impl HardwareCommands {
         if id == LOCAL_HARDWARE_ID {
             bail!("hardware profile '{id}' describes this machine and cannot be removed");
         }
-        match confirm_removal(ctx, RefKind::Hardware, id, policy)? {
-            Removal::Cancel => {
-                ctx.ui.info(&format!("Keeping hardware profile '{id}'."));
-                return Ok(());
-            }
-            Removal::Proceed { with } => remove_all(ctx, &with, policy)?,
-        }
-        ctx.config_mut().remove_hardware(id)?;
-        ctx.ui.info(&format!("Hardware profile '{id}' removed."));
+        crate::commands::shared::remediation::remove_with_dependents(
+            ctx,
+            RefKind::Hardware,
+            id,
+            policy,
+        )?;
         Ok(())
     }
 
@@ -2563,12 +2559,10 @@ mod tests {
 
         assert_eq!(
             ui.warns.borrow()[0],
-            "Removing hardware profile 'spark' will break:"
+            "Other instances depend on hardware profile 'spark':"
         );
-        assert_eq!(
-            ui.infos.borrow()[0],
-            "  - provider 'llamacpp-spark' (llama-cpp)"
-        );
+        assert_eq!(ui.infos.borrow()[0], "  - provider 'llamacpp-spark'");
+        assert_eq!(ui.infos.borrow()[1], "Keeping hardware profile 'spark'.");
         assert!(ctx.config().get_hardware("spark").is_some());
     }
 

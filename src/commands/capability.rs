@@ -591,30 +591,12 @@ impl CapabilityCommands {
             anyhow::bail!("No capability configured with id '{capability_id}'. Nothing to remove.");
         }
 
-        // Anything pointing at it would be stranded by this removal.
-        match crate::commands::shared::remediation::confirm_removal(
+        crate::commands::shared::remediation::remove_with_dependents(
             ctx,
             RefKind::Capability,
             capability_id,
             policy,
-        )? {
-            crate::commands::shared::remediation::Removal::Cancel => {
-                ctx.ui
-                    .info(&format!("Keeping capability '{capability_id}'."));
-                return Ok(());
-            }
-            crate::commands::shared::remediation::Removal::Proceed { with } => {
-                crate::commands::shared::remediation::remove_all(ctx, &with, policy)?;
-            }
-        }
-
-        if let Err(e) = ctx.config_mut().remove_capability(capability_id) {
-            ctx.ui
-                .warn(&format!("failed to persist capability removal: {e}"));
-        }
-        ctx.ui
-            .info(&format!("Capability '{capability_id}' removed."));
-        Ok(())
+        )
     }
 }
 
