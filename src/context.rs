@@ -115,8 +115,10 @@ impl AppContext {
     }
 
     /// Writes the `local` hardware profile from `detect` when there is none,
-    /// and says so in one line. Does nothing when `local` exists. `detect` is
-    /// a parameter so tests never read the machine they run on.
+    /// and says so in one line. Does nothing when `local` exists. When the
+    /// detected figures cannot form a valid profile, warns and leaves `local`
+    /// unset rather than failing the command. `detect` is a parameter so tests
+    /// never read the machine they run on.
     pub(crate) fn ensure_local_hardware(
         &mut self,
         detect: impl FnOnce() -> HardwareProfile,
@@ -125,10 +127,17 @@ impl AppContext {
             return Ok(());
         }
         let local = HardwareConfig::local_from_detection(detect());
-        let summary = local
-            .profile()
-            .map_err(anyhow::Error::msg)?
-            .memory_summary();
+        let summary = match local.profile() {
+            Ok(profile) => profile.memory_summary(),
+            Err(e) => {
+                self.ui.warn_stderr(&format!(
+                    "Could not save hardware profile '{LOCAL_HARDWARE_ID}': {e}.\nRun \
+                     `granite-cli hardware setup local --manual` to enter this machine's \
+                     figures."
+                ));
+                return Ok(());
+            }
+        };
         self.config_mut()
             .insert_hardware(LOCAL_HARDWARE_ID, local)?;
         self.ui.info_stderr(&format!(
@@ -202,6 +211,30 @@ mod tests {
 
         assert!(ui.stderr_infos.borrow().is_empty());
         assert_eq!(ctx.hardware_profile(LOCAL_HARDWARE_ID), Ok(detected()));
+    }
+
+    #[test]
+    fn an_unreadable_detection_does_not_save_a_profile_with_no_figures() {
+        let _home = TestConfigHome::new();
+        let ui = Arc::new(CaptureUi::default());
+        let mut ctx = ctx(ui.clone());
+
+        ctx.ensure_local_hardware(|| {
+            HardwareProfile::with_memory(crate::utils::hardware::Memory::System { ram_gb: 0.0 })
+        })
+        .unwrap();
+
+        assert!(ctx.config().get_hardware(LOCAL_HARDWARE_ID).is_none());
+        let warnings = ui.stderr_warns.borrow();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("ram_gb must be positive, got 0"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("granite-cli hardware setup local --manual"),
+            "{warnings:?}"
+        );
     }
 
     #[test]
