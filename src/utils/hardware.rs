@@ -348,9 +348,29 @@ fn probe_gpu() -> Option<GpuFinding> {
 }
 
 fn total_memory_bytes() -> u64 {
-    sys_info::mem_info()
-        .map(|info| info.total * 1024)
-        .unwrap_or(0)
+    match sys_info::mem_info() {
+        Ok(info) if info.total > 0 => info.total * 1024,
+        // Android is `target_os = "android"`, which `sys_info` does not
+        // support, so read the file it would have read on Linux. The same
+        // fallback covers a system where `sys_info` reports no memory.
+        _ => proc_meminfo_total_bytes().unwrap_or(0),
+    }
+}
+
+/// Total system memory from `/proc/meminfo`, in bytes, or `None` when the
+/// file is missing or has no readable `MemTotal` line. The file reports
+/// `MemTotal` in kibibytes.
+fn proc_meminfo_total_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo_total_bytes(&meminfo)
+}
+
+fn meminfo_total_bytes(meminfo: &str) -> Option<u64> {
+    let line = meminfo
+        .lines()
+        .find(|line| line.trim_start().starts_with("MemTotal:"))?;
+    let kb = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(kb * 1024)
 }
 
 fn bytes_to_gb(bytes: u64) -> f64 {
@@ -644,6 +664,26 @@ mod tests {
             negative.check_figures().unwrap_err(),
             "ram_gb must be positive, got -1"
         );
+    }
+
+    // -- reading system RAM from /proc/meminfo -------------------------------
+
+    #[test]
+    fn meminfo_total_is_read_in_bytes_from_the_kibibyte_figure() {
+        let meminfo = "MemTotal:       11351464 kB\nMemFree:          567952 kB\n";
+        assert_eq!(meminfo_total_bytes(meminfo), Some(11351464 * 1024));
+    }
+
+    #[test]
+    fn meminfo_without_a_readable_total_gives_none() {
+        for meminfo in [
+            "MemFree: 567952 kB\n",
+            "MemTotal:\n",
+            "MemTotal: not-a-number kB\n",
+            "",
+        ] {
+            assert_eq!(meminfo_total_bytes(meminfo), None, "read: {meminfo:?}");
+        }
     }
 
     // -- mapping findings to a profile, one case per platform -----------------
